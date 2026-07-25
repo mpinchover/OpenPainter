@@ -28,7 +28,13 @@ from core.edge_wear import (  # noqa: E402
 from core.export import export_maps, export_textured_obj  # noqa: E402
 from core.mesh_io import _fbx_unit_scale, load_mesh  # noqa: E402
 from core.params import BakeParams, EdgeWearParams, UnwrapParams  # noqa: E402
-from core.uv_unwrap import UnwrapResult, unwrap  # noqa: E402
+from core.uv_unwrap import (  # noqa: E402
+    SourceUVError,
+    UnwrapResult,
+    source_uv_layout,
+    source_uvs,
+    unwrap,
+)
 
 ASSETS = ROOT / "assets"
 
@@ -78,8 +84,47 @@ def test_ascii_fbx_unit_scale_is_read(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# unwrap
+# the atlas the bake renders into
 # --------------------------------------------------------------------------
+
+def test_uv_seams_survive_import(tmp_path):
+    """An OBJ's UV splits must reach the bake -- they are the atlas layout."""
+    box = trimesh.creation.box().unwrap()
+    path = tmp_path / "uvbox.obj"
+    box.export(path)
+
+    mesh, info = load_mesh(path)
+    assert info.has_uvs
+    assert source_uvs(mesh) is not None
+    # Welding must not collapse the seam splits back onto the 8 cube corners.
+    assert len(mesh.vertices) > 8
+    # It is still a sealed cube underneath, and the note must not claim otherwise.
+    assert info.watertight
+    assert not any("watertight" in note for note in info.notes)
+
+
+def test_source_uv_layout_passes_the_mesh_through(tmp_path):
+    box = trimesh.creation.box().unwrap()
+    path = tmp_path / "uvbox.obj"
+    box.export(path)
+    mesh, _ = load_mesh(path)
+
+    result = source_uv_layout(mesh, 512)
+
+    assert result.source == "source"
+    assert np.array_equal(result.faces, mesh.faces)
+    assert np.allclose(result.uvs, mesh.visual.uv, atol=1e-6)
+    assert np.array_equal(result.vmapping, np.arange(len(mesh.vertices)))
+    # Six flat cube faces, each its own island once the seams split the corners.
+    assert result.chart_count == 6
+    assert 0.0 < result.utilization <= 1.0
+    assert np.allclose(np.linalg.norm(result.normals, axis=1), 1.0, atol=1e-5)
+
+
+def test_source_uv_layout_refuses_a_mesh_without_uvs(bracket):
+    with pytest.raises(SourceUVError, match="no UV map"):
+        source_uv_layout(bracket, 512)
+
 
 def test_unwrap_produces_valid_atlas(bracket):
     result = unwrap(bracket, UnwrapParams(), 512)

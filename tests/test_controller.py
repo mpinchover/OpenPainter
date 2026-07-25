@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import trimesh
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -38,6 +39,19 @@ def ctx():
 
 @pytest.fixture
 def controller(ctx):
+    # The sample assets carry no UVs, so unwrap once here to stand in for a mesh
+    # exported out of Blender with its own UV map -- that is what the controller
+    # bakes into by default.
+    mesh, _ = load_mesh(ASSETS / "sample.obj")
+    controller = BakeController(ctx)
+    controller.bake_params.resolution = 128
+    controller.set_mesh(mesh.unwrap())
+    yield controller
+    controller.release()
+
+
+@pytest.fixture
+def uvless_controller(ctx):
     mesh, _ = load_mesh(ASSETS / "sample.obj")
     controller = BakeController(ctx)
     controller.bake_params.resolution = 128
@@ -83,6 +97,69 @@ def test_full_bake_produces_the_maps(controller):
     assert inside.min() >= -1e-4 and inside.max() <= 1.0 + 1e-4
 
     assert set(controller.timings) == set(ALL_STAGES)
+
+
+def test_the_default_bake_uses_the_meshs_own_uvs(controller):
+    """No reindexing: the atlas is the source layout, vertex for vertex."""
+    assert controller.unwrap_params.use_source_uvs
+    controller.request_bake()
+    run_to_completion(controller)
+
+    result = controller.unwrap_result
+    assert result.source == "source"
+    assert len(result.vertices) == len(controller.mesh.vertices)
+    assert np.array_equal(result.faces, controller.mesh.faces)
+    assert np.allclose(result.uvs, controller.mesh.visual.uv, atol=1e-6)
+    assert np.array_equal(result.vmapping, np.arange(len(controller.mesh.vertices)))
+
+
+def test_source_uvs_bake_normals_stay_smooth_across_seams(controller):
+    """A UV seam on a smooth surface must not read as a crease.
+
+    Vertices split for UVs sit at one position, so their normals have to match;
+    if they did not, the bake would draw a wear line down every seam.
+    """
+    controller.request_bake()
+    run_to_completion(controller)
+
+    mesh = controller.mesh
+    normals = controller.unwrap_result.normals
+    _, inverse = trimesh.grouping.unique_rows(mesh.vertices)
+    for group in range(inverse.max() + 1):
+        members = normals[inverse == group]
+        if len(members) > 1:
+            assert np.allclose(members, members[0], atol=1e-5)
+
+
+def test_source_uvs_are_required_by_default(uvless_controller):
+    """A mesh with no UVs fails loudly rather than silently inventing an atlas."""
+    uvless_controller.request_bake()
+    while uvless_controller.running:
+        uvless_controller.pump()
+        time.sleep(0.001)
+
+    assert uvless_controller.error is not None
+    assert "no UV map" in uvless_controller.error
+    assert uvless_controller.curvature_map is None
+
+
+def test_xatlas_fallback_still_bakes_a_uvless_mesh(uvless_controller):
+    uvless_controller.unwrap_params.use_source_uvs = False
+    uvless_controller.request_bake()
+    run_to_completion(uvless_controller)
+
+    assert uvless_controller.unwrap_result.source == "xatlas"
+    assert uvless_controller.curvature_map is not None
+    assert uvless_controller.curvature_map.max() > 0.0
+
+
+def test_toggling_the_uv_source_reruns_everything(controller):
+    controller.request_bake()
+    run_to_completion(controller)
+    assert controller.pending_stages() == []
+
+    controller.unwrap_params.use_source_uvs = False
+    assert controller.pending_stages() == ALL_STAGES
 
 
 def test_nothing_to_do_after_a_clean_bake(controller):

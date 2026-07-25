@@ -25,7 +25,7 @@ import trimesh
 from .baking import GBuffer, UVSpaceBaker, dilate
 from .edge_wear import normalize_position
 from .params import BakeParams, UnwrapParams
-from .uv_unwrap import UnwrapResult, unwrap
+from .uv_unwrap import UnwrapResult, source_uv_layout, unwrap
 
 STAGES = ("unwrap", "curvature", "post")
 
@@ -124,8 +124,11 @@ class BakeController:
         keys = self._keys()
         stale = set(self.pending_stages())
 
+        unwrap_label = (
+            "Reading source UVs" if self.unwrap_params.use_source_uvs else "Unwrapping UVs"
+        )
         definitions = {
-            "unwrap": ("Unwrapping UVs", False, self._run_unwrap),
+            "unwrap": (unwrap_label, False, self._run_unwrap),
             "curvature": ("Baking curvature", True, self._run_curvature),
             "post": ("Padding seams", False, self._run_post),
         }
@@ -140,9 +143,13 @@ class BakeController:
 
     def _run_unwrap(self) -> None:
         assert self.mesh is not None
-        self.unwrap_result = unwrap(
-            self.mesh, self.unwrap_params, self.bake_params.resolution
-        )
+        resolution = self.bake_params.resolution
+        if self.unwrap_params.use_source_uvs:
+            # No charting and no reindexing -- bake into the layout the artist
+            # authored, so the PNG applies to their mesh and not to ours.
+            self.unwrap_result = source_uv_layout(self.mesh, resolution)
+        else:
+            self.unwrap_result = unwrap(self.mesh, self.unwrap_params, resolution)
 
     def _run_curvature(self) -> None:
         assert self.unwrap_result is not None

@@ -197,6 +197,8 @@ class MeshMapApp(mglw.WindowConfig):
     initial_mesh: Optional[str] = None
     initial_z_up: bool = False
     initial_resolution: int = 1024
+    #: False bakes into the mesh's own UVs; True lets xatlas invent an atlas.
+    initial_auto_unwrap: bool = False
     initial_ui_scale: float = 1.35
     #: True when --ui-scale was passed, so it overrides the saved preference.
     initial_ui_scale_explicit: bool = False
@@ -210,6 +212,7 @@ class MeshMapApp(mglw.WindowConfig):
 
         self.controller = BakeController(self.ctx)
         self.controller.bake_params.resolution = int(self.initial_resolution)
+        self.controller.unwrap_params.use_source_uvs = not self.initial_auto_unwrap
         self.wear_params = EdgeWearParams()
         self.mesh_info: Optional[MeshInfo] = None
         self.mesh: Optional[trimesh.Trimesh] = None

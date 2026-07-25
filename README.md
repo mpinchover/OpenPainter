@@ -1,9 +1,9 @@
 # MeshMap — ArmorPaint's EdgeWear001, standalone
 
 A port of ArmorPaint's procedural edge wear (Browser → Cloud → Materials →
-Procedural → **EdgeWear001**) as a standalone desktop app. Import an un-UV'd FBX,
-auto-unwrap it, bake the curvature, tune the wear live on the model, and export
-the mask as a texture or a textured OBJ ready to import into Blender.
+Procedural → **EdgeWear001**) as a standalone desktop app. Import a UV-mapped
+FBX, bake the curvature into its UV layout, tune the wear live on the model, and
+export the mask as a texture you can drop straight onto the original mesh.
 
 Same algorithm, same parameters, same shipped defaults.
 
@@ -12,18 +12,34 @@ cd meshmap && source myenv/bin/activate
 python main.py                       # empty, then drag an FBX onto the window
 python main.py cube.fbx              # load on startup
 python main.py cube.fbx --resolution 2048 --z-up
+python main.py cube.fbx --auto-unwrap   # for a mesh with no UVs at all
 python main.py --ui-scale 1.8        # bigger panel and text
 ```
 
 Press **B** to bake, drag the *Edge wear* sliders, press **E** to export.
 
-For Blender, click **Export textured OBJ for Blender**. MeshMap writes the
-auto-unwrapped `.obj`, its `.mtl`, `edge_wear.png`, and `curvature.png` into the
-same output folder. Keep those files together; importing the OBJ into Blender
-loads the edge-wear image as the material's diffuse texture automatically.
-FBX unit metadata is baked into the OBJ vertex coordinates, so a Blender FBX
-round-trip retains the source object's physical size even though OBJ itself is
-unitless.
+### UV your mesh in Blender first
+
+MeshMap bakes into **the UV map already on the mesh**. Unwrap in Blender before
+exporting (UV Editing workspace, or `U` → Smart UV Project); the FBX exporter
+always includes UV layers, so nothing else is needed. Then `edge_wear.png`
+applies directly to your original mesh — plug it into a `Mix Color` factor or
+into Roughness, and set the image's **Color Space to Non-Color**, because it is
+a mask and not a colour.
+
+`--auto-unwrap` (or *Bake into source UVs* in Advanced bake settings) turns that
+off and lets xatlas invent an atlas instead. Only reach for it on a mesh with no
+UVs, and understand what you get: the atlas fits nothing but the triangulated
+OBJ this app exports, so the texture is meaningless on your original mesh. Two
+things get lost on that route — the quad topology, because trimesh and Assimp
+both represent triangles only, and any correspondence to your own UVs.
+
+For that route, click **Export textured OBJ for Blender**. MeshMap writes the
+`.obj`, its `.mtl`, `edge_wear.png`, and `curvature.png` into the same output
+folder. Keep those files together; importing the OBJ into Blender loads the
+edge-wear image as the material's diffuse texture automatically. FBX unit
+metadata is baked into the OBJ vertex coordinates, so a Blender FBX round-trip
+retains the source object's physical size even though OBJ itself is unitless.
 
 | Key | Action |
 | --- | --- |
@@ -219,10 +235,11 @@ edge-detection method, because this one genuinely cannot see them.
 FBX / OBJ / GLB
       │
       ▼  core/mesh_io.py      trimesh natively, else the assimp CLI via .glb
-   validate ─ triangulate ─ weld ─ repair winding
+   validate ─ triangulate ─ weld (never across a UV seam) ─ repair winding
       │
-      ▼  core/uv_unwrap.py    xatlas: charts, packing, seam splitting
-   per-vertex UVs + vmapping back to the original vertices
+      ▼  core/uv_unwrap.py    the mesh's own UV map, vertex for vertex
+   (or --auto-unwrap: xatlas charts, packs and splits a new atlas,
+    handing back a vmapping to the original vertices)
       │
       ▼  core/baking.py       ══ GL, on the render thread ══
    rasterise in UV space ──▶ position / normal / curvature
@@ -375,7 +392,7 @@ same shaders, same ImGui panel — and writes the maps plus viewport renders.
 main.py                  entry point, argument parsing, --selftest
 core/
   mesh_io.py             import, backend selection, triangulate/weld/repair
-  uv_unwrap.py           xatlas wrapper, carries vmapping through
+  uv_unwrap.py           source UV layout, or the xatlas fallback + vmapping
   baking.py              the UV-space curvature bake, the 95% blur, dilation
   pipeline.py            stage keying, CPU/GL split, threading, cancel
   edge_wear.py           the EdgeWear001 graph and tex_noise, in numpy

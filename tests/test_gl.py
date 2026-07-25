@@ -181,6 +181,32 @@ def test_smoothing_does_not_shift_the_overall_level(ramp_baker):
     )
 
 
+def test_source_uvs_bake_where_they_say(ctx):
+    """A UV island in one corner must bake into that corner, not a flipped one.
+
+    The V convention has to survive Blender -> FBX -> Assimp -> glTF -> trimesh
+    -> bake -> PNG. Getting it wrong anywhere flips the texture vertically in
+    Blender, so pin the low corner of UV space to the low rows of the array.
+    """
+    baker = UVSpaceBaker(ctx)
+    try:
+        # One quad occupying u,v in 0..0.25 -- the bottom-left of the atlas.
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype="f4")
+        uvs = np.array([[0, 0], [0.25, 0], [0.25, 0.25], [0, 0.25]], dtype="f4")
+        normals = np.tile([0.0, 0.0, 1.0], (4, 1)).astype("f4")
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype="u4")
+
+        baker.upload(vertices, normals, uvs, faces)
+        gbuffer = baker.rasterize(RESOLUTION, BakeParams(smooth=0))
+    finally:
+        baker.release()
+
+    quarter = RESOLUTION // 4
+    assert gbuffer.mask[: quarter - 1, : quarter - 1].all(), "low UVs -> low rows"
+    assert not gbuffer.mask[quarter + 1 :, :].any(), "nothing above v=0.25"
+    assert not gbuffer.mask[:, quarter + 1 :].any(), "nothing right of u=0.25"
+
+
 # --------------------------------------------------------------------------
 # real geometry
 # --------------------------------------------------------------------------

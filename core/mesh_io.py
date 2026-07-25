@@ -27,6 +27,7 @@ import numpy as np
 import trimesh
 
 from .params import MeshInfo
+from .uv_unwrap import source_uvs
 
 #: Formats trimesh parses on its own, no Assimp round-trip needed.
 NATIVE_SUFFIXES = {
@@ -160,18 +161,33 @@ def _load_via_pyassimp(path: Path) -> trimesh.Trimesh:
     with pyassimp.load(str(path), processing=flags) as scene:
         if not scene.meshes:
             raise MeshLoadError(f"pyassimp found no meshes in {path.name}")
-        parts = [
-            trimesh.Trimesh(
-                vertices=np.asarray(m.vertices, dtype=np.float64),
-                faces=np.asarray(m.faces, dtype=np.int64),
-                process=False,
-            )
-            for m in scene.meshes
-            if len(m.faces)
-        ]
+        parts = [_from_assimp_mesh(m) for m in scene.meshes if len(m.faces)]
     if not parts:
         raise MeshLoadError(f"pyassimp found no faces in {path.name}")
     return trimesh.util.concatenate(parts)
+
+
+def _from_assimp_mesh(mesh) -> trimesh.Trimesh:
+    """Wrap one Assimp mesh, keeping the first UV channel if it has one.
+
+    Assimp exposes up to eight UV channels; Blender writes the active UV map
+    first, and that is the one the bake targets. The UVs have to survive import
+    or there is nothing to bake into -- see :mod:`core.uv_unwrap`.
+    """
+    visual = None
+    channels = getattr(mesh, "texturecoords", None)
+    if channels is not None and len(channels):
+        uv = np.asarray(channels[0], dtype=np.float64)
+        # Assimp always stores 3D texture coordinates; W is 0 for a 2D map.
+        if uv.ndim == 2 and uv.shape[0] == len(mesh.vertices) and uv.shape[1] >= 2:
+            visual = trimesh.visual.TextureVisuals(uv=uv[:, :2])
+
+    return trimesh.Trimesh(
+        vertices=np.asarray(mesh.vertices, dtype=np.float64),
+        faces=np.asarray(mesh.faces, dtype=np.int64),
+        visual=visual,
+        process=False,
+    )
 
 
 def _load_via_assimp_cli(path: Path) -> trimesh.Trimesh:
@@ -224,6 +240,12 @@ def prepare_mesh(mesh: trimesh.Trimesh, notes: list[str]) -> trimesh.Trimesh:
     # here: the curvature bake differentiates the *interpolated* normal, so a
     # flat-shaded mesh whose normals are constant per face would differentiate
     # to zero and bake pure black. Welding is what gives it something to see.
+    #
+    # It deliberately stops short of welding across a UV seam (trimesh defaults
+    # to merge_tex=False), because those splits are the atlas layout and we bake
+    # into it as authored. Normals stay continuous there anyway --
+    # :func:`core.uv_unwrap._welded_vertex_normals` re-welds by position for
+    # normals only.
     mesh.merge_vertices()
     mesh.update_faces(mesh.nondegenerate_faces())
     mesh.update_faces(mesh.unique_faces())
@@ -240,17 +262,41 @@ def prepare_mesh(mesh: trimesh.Trimesh, notes: list[str]) -> trimesh.Trimesh:
 
     # Consistent winding matters: AO fires rays along the vertex normal, and a
     # flipped island would bake occlusion from inside the mesh.
+    #
+    # Watertightness has to be judged on the position-welded topology: every UV
+    # seam is a vertex split, so a perfectly sealed textured mesh reads as full
+    # of holes if you ask the split vertex set. Winding is safe to fix in place
+    # because rotating a face's indices leaves its per-vertex UVs alone.
+    watertight = bool(is_watertight(mesh))
     try:
         trimesh.repair.fix_winding(mesh)
-        if mesh.is_watertight:
+        if watertight:
             trimesh.repair.fix_inversion(mesh)
     except Exception as exc:  # pragma: no cover - repair is best-effort
         notes.append(f"Normal repair skipped: {exc}")
 
-    if not mesh.is_watertight:
+    if not watertight:
         notes.append("Mesh is not watertight - AO may leak through open edges")
 
     return mesh
+
+
+def is_watertight(mesh: trimesh.Trimesh) -> bool:
+    """Watertightness of the geometry, ignoring vertex splits made for UVs."""
+    if mesh.is_watertight:
+        return True
+    if source_uvs(mesh) is None:
+        return False
+
+    unique, inverse = trimesh.grouping.unique_rows(mesh.vertices)
+    if len(unique) == len(mesh.vertices):
+        return False
+    welded = trimesh.Trimesh(
+        vertices=np.asarray(mesh.vertices)[unique],
+        faces=inverse[np.asarray(mesh.faces)],
+        process=False,
+    )
+    return bool(welded.is_watertight)
 
 
 def _axis_fix(mesh: trimesh.Trimesh, z_up: bool) -> None:
@@ -299,6 +345,16 @@ def load_mesh(path: str | Path, *, z_up: bool = False) -> tuple[trimesh.Trimesh,
     # thread rather than lazily from inside a bake worker.
     _ = mesh.vertex_normals
 
+    uvs = source_uvs(mesh)
+    if uvs is None:
+        notes.append("No UV map in the file - unwrap in Blender to bake into your own UVs")
+    else:
+        outside = int((uvs < -1e-4).any(axis=1).sum() + (uvs > 1.0 + 1e-4).any(axis=1).sum())
+        if outside:
+            notes.append(
+                f"{outside} UVs fall outside 0..1 - anything off the atlas bakes empty"
+            )
+
     info = MeshInfo(
         path=str(path),
         backend=backend,
@@ -306,7 +362,8 @@ def load_mesh(path: str | Path, *, z_up: bool = False) -> tuple[trimesh.Trimesh,
         faces=len(mesh.faces),
         extents=tuple(float(v) for v in mesh.extents),
         scale=float(np.linalg.norm(mesh.extents)),
-        watertight=bool(mesh.is_watertight),
+        watertight=is_watertight(mesh),
+        has_uvs=uvs is not None,
         notes=notes,
     )
 

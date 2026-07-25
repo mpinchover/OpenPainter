@@ -87,7 +87,8 @@ def _draw_parameters(app: "MeshMapApp") -> None:
             f"{Path(info.path).name}\n"
             f"{info.vertices:,} verts  {info.faces:,} tris  via {info.backend}\n"
             f"size {info.extents[0]:.3g} x {info.extents[1]:.3g} x {info.extents[2]:.3g}"
-            f"  (diagonal {info.scale:.3g})",
+            f"  (diagonal {info.scale:.3g})\n"
+            f"UV map: {'yes' if info.has_uvs else 'none'}",
         )
         for note in info.notes:
             imgui.text_colored(WARN_COLOR, f"! {note}")
@@ -158,12 +159,24 @@ def _draw_parameters(app: "MeshMapApp") -> None:
         _tooltip("Pads chart borders outward so bilinear filtering never samples empty gutter.")
 
         unwrap_params = controller.unwrap_params
+        _, unwrap_params.use_source_uvs = imgui.checkbox(
+            "Bake into source UVs", unwrap_params.use_source_uvs
+        )
+        _tooltip(
+            "Bake into the UV map already on the mesh, so the PNG drops straight\n"
+            "onto the model you exported from Blender. Turn this off only for a\n"
+            "mesh with no UVs -- xatlas then packs a throwaway atlas that fits\n"
+            "nothing but the triangulated OBJ this app writes."
+        )
+
+        imgui.begin_disabled(unwrap_params.use_source_uvs)
         _, unwrap_params.padding = imgui.slider_int("Atlas padding", unwrap_params.padding, 0, 16)
         _, unwrap_params.normal_deviation_weight = imgui.slider_float(
             "Seam eagerness", unwrap_params.normal_deviation_weight, 0.5, 8.0
         )
         _tooltip("How readily xatlas cuts a seam where the surface bends.")
         _, unwrap_params.brute_force = imgui.checkbox("Brute-force packing", unwrap_params.brute_force)
+        imgui.end_disabled()
 
     _draw_bake_controls(app)
 
@@ -308,9 +321,11 @@ def _draw_map_inspector(app: "MeshMapApp") -> None:
                 gbuffer = app.controller.gbuffer
                 result = app.controller.unwrap_result
                 charts = result.chart_count if result else 0
+                origin = "source UVs" if result and result.source == "source" else "xatlas"
                 imgui.text_colored(
                     MUTED_COLOR,
-                    f"{charts} charts, {gbuffer.coverage * 100:.1f}% texel coverage",
+                    f"{charts} charts, {gbuffer.coverage * 100:.1f}% texel coverage "
+                    f"({origin})",
                 )
 
     imgui.end()

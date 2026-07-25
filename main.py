@@ -39,6 +39,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Initial bake resolution (default: 1024).",
     )
     parser.add_argument(
+        "--auto-unwrap",
+        action="store_true",
+        help="Let xatlas generate a fresh atlas instead of baking into the "
+             "mesh's own UV map. Only for a mesh with no UVs -- the resulting "
+             "texture fits the exported OBJ, not your original mesh.",
+    )
+    parser.add_argument(
         "--ui-scale",
         type=float,
         default=None,
@@ -68,6 +75,7 @@ def run_selftest(args: argparse.Namespace) -> int:
     MeshMapApp.initial_mesh = args.mesh
     MeshMapApp.initial_z_up = args.z_up
     MeshMapApp.initial_resolution = args.resolution
+    MeshMapApp.initial_auto_unwrap = args.auto_unwrap
     if args.ui_scale is not None:
         MeshMapApp.initial_ui_scale = args.ui_scale
         MeshMapApp.initial_ui_scale_explicit = True
@@ -128,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     MeshMapApp.initial_mesh = args.mesh
     MeshMapApp.initial_z_up = args.z_up
     MeshMapApp.initial_resolution = args.resolution
+    MeshMapApp.initial_auto_unwrap = args.auto_unwrap
     if args.ui_scale is not None:
         MeshMapApp.initial_ui_scale = args.ui_scale
         MeshMapApp.initial_ui_scale_explicit = True

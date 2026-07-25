@@ -35,7 +35,16 @@ AXIS_VECTORS = (
 
 @dataclass
 class UnwrapParams:
-    """One-time setup options for the xatlas auto-unwrap."""
+    """Where the bake's atlas comes from, plus xatlas' packing options."""
+
+    use_source_uvs: bool = True
+    """Bake into the mesh's own UV map instead of generating a new atlas.
+
+    On by default, and the setting you want for a Blender round-trip: the PNG
+    then applies directly to the mesh you exported. Every option below is dead
+    while this is on -- they configure the xatlas fallback, whose atlas fits
+    nothing but the triangulated OBJ this app writes.
+    """
 
     padding: int = 4
     """Texels of gutter left between charts. Must exceed the dilation radius."""
@@ -51,6 +60,7 @@ class UnwrapParams:
 
     def key(self) -> tuple:
         return (
+            self.use_source_uvs,
             self.padding,
             self.brute_force,
             self.max_chart_area,
@@ -156,4 +166,6 @@ class MeshInfo:
     extents: tuple[float, float, float] = (0.0, 0.0, 0.0)
     scale: float = 1.0
     watertight: bool = False
+    has_uvs: bool = False
+    """Whether the source file carried a UV map we can bake into."""
     notes: list[str] = field(default_factory=list)
