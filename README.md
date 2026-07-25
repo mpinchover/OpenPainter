@@ -21,6 +21,9 @@ For Blender, click **Export textured OBJ for Blender**. MeshMap writes the
 auto-unwrapped `.obj`, its `.mtl`, `edge_wear.png`, and `curvature.png` into the
 same output folder. Keep those files together; importing the OBJ into Blender
 loads the edge-wear image as the material's diffuse texture automatically.
+FBX unit metadata is baked into the OBJ vertex coordinates, so a Blender FBX
+round-trip retains the source object's physical size even though OBJ itself is
+unitless.
 
 | Key | Action |
 | --- | --- |

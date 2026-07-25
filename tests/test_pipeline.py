@@ -26,7 +26,7 @@ from core.edge_wear import (  # noqa: E402
     tex_noise_fbm,
 )
 from core.export import export_maps, export_textured_obj  # noqa: E402
-from core.mesh_io import load_mesh  # noqa: E402
+from core.mesh_io import _fbx_unit_scale, load_mesh  # noqa: E402
 from core.params import BakeParams, EdgeWearParams, UnwrapParams  # noqa: E402
 from core.uv_unwrap import UnwrapResult, unwrap  # noqa: E402
 
@@ -44,7 +44,7 @@ def bracket() -> trimesh.Trimesh:
 # --------------------------------------------------------------------------
 
 def test_fbx_import_matches_obj(bracket):
-    """The Assimp round-trip must not change the geometry."""
+    """The FBX's centimeter metadata is converted to Blender-style metres."""
     fbx = ASSETS / "sample.fbx"
     if not fbx.exists():
         pytest.skip("no FBX asset (assimp CLI unavailable when assets were built)")
@@ -53,7 +53,12 @@ def test_fbx_import_matches_obj(bracket):
     assert info.backend in ("assimp-cli", "pyassimp")
     assert len(from_fbx.vertices) == len(bracket.vertices)
     assert len(from_fbx.faces) == len(bracket.faces)
-    assert np.allclose(from_fbx.extents, bracket.extents, atol=1e-4)
+    unit_scale = _fbx_unit_scale(fbx)
+    assert np.allclose(
+        from_fbx.extents,
+        bracket.extents * (unit_scale / 100.0),
+        atol=1e-4,
+    )
 
 
 def test_import_welds_and_reports(bracket):
@@ -61,6 +66,15 @@ def test_import_welds_and_reports(bracket):
     assert len(bracket.faces) > 0
     unique = np.unique(np.round(bracket.vertices, 6), axis=0)
     assert len(unique) == len(bracket.vertices)
+
+
+def test_ascii_fbx_unit_scale_is_read(tmp_path):
+    path = tmp_path / "units.fbx"
+    path.write_text(
+        '; FBX 7.4.0 project file\n'
+        'P: "UnitScaleFactor", "double", "Number", "",100\n'
+    )
+    assert _fbx_unit_scale(path) == 100.0
 
 
 # --------------------------------------------------------------------------

@@ -18,6 +18,7 @@ assimp`` / ``apt install assimp-utils``. See the README.
 from __future__ import annotations
 
 import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -46,6 +47,94 @@ _ASSIMP_SEARCH_PATHS = (
 
 class MeshLoadError(RuntimeError):
     """Raised when no import backend could produce usable geometry."""
+
+
+def _fbx_unit_scale(path: Path) -> float:
+    """Return the FBX file-unit size relative to its numeric coordinates.
+
+    FBX records ``UnitScaleFactor`` as the number of centimeters represented by
+    one coordinate unit. Assimp preserves the geometry numbers but OBJ has no
+    corresponding metadata, so we bake ``UnitScaleFactor / 100`` into vertices
+    to express the exported OBJ in Blender's metre-based coordinate convention.
+    """
+    data = path.read_bytes()
+
+    # ASCII FBX (the number is the final property on the P record).
+    if not data.startswith(b"Kaydara FBX Binary"):
+        import re  # noqa: PLC0415
+
+        match = re.search(
+            rb'P:\s*"UnitScaleFactor"[^\r\n]*,\s*([-+0-9.eE]+)\s*(?:\r?\n|$)',
+            data,
+        )
+        return float(match.group(1)) if match else 1.0
+
+    version = struct.unpack_from("<I", data, 23)[0]
+    wide = version >= 7500
+    header = 25
+    header_size = 25 if wide else 13
+
+    def read_node(offset: int) -> tuple[int, str, list[object]]:
+        if wide:
+            end, count, prop_len = struct.unpack_from("<QQQ", data, offset)
+            name_len = data[offset + 24]
+        else:
+            end, count, prop_len = struct.unpack_from("<III", data, offset)
+            name_len = data[offset + 12]
+        if end == 0:
+            return 0, "", []
+        cursor = offset + header_size
+        name = data[cursor:cursor + name_len].decode("utf-8", "replace")
+        cursor += name_len
+        props: list[object] = []
+        for _ in range(count):
+            kind = chr(data[cursor])
+            cursor += 1
+            formats = {
+                "Y": ("<h", 2), "C": ("<?", 1), "I": ("<i", 4),
+                "F": ("<f", 4), "D": ("<d", 8), "L": ("<q", 8),
+            }
+            if kind in formats:
+                fmt, size = formats[kind]
+                props.append(struct.unpack_from(fmt, data, cursor)[0])
+                cursor += size
+            elif kind in ("S", "R"):
+                size = struct.unpack_from("<I", data, cursor)[0]
+                cursor += 4
+                raw = data[cursor:cursor + size]
+                props.append(raw.decode("utf-8", "replace") if kind == "S" else raw)
+                cursor += size
+            elif kind.lower() in ("f", "d", "l", "i", "b", "c"):
+                length, encoding, compressed = struct.unpack_from("<III", data, cursor)
+                cursor += 12 + compressed
+                props.append(None)
+            else:
+                return int(end), name, props
+        return int(end), name, props
+
+    stack = [header]
+    while stack:
+        offset = stack.pop()
+        while offset + header_size <= len(data):
+            end, name, props = read_node(offset)
+            if not end:
+                break
+            if name == "P" and props and props[0] == "UnitScaleFactor":
+                numeric = [value for value in props[1:] if isinstance(value, (int, float))]
+                return float(numeric[-1]) if numeric else 1.0
+
+            # Children start immediately after this node's properties.
+            if wide:
+                count, prop_len = struct.unpack_from("<QQ", data, offset + 8)
+                name_len = data[offset + 24]
+            else:
+                count, prop_len = struct.unpack_from("<II", data, offset + 4)
+                name_len = data[offset + 12]
+            child = offset + header_size + name_len + int(prop_len)
+            if child + header_size < end:
+                stack.append(child)
+            offset = end
+    return 1.0
 
 
 def find_assimp_cli() -> str | None:
@@ -192,6 +281,16 @@ def load_mesh(path: str | Path, *, z_up: bool = False) -> tuple[trimesh.Trimesh,
             notes.append(f"pyassimp unavailable ({type(exc).__name__}), using assimp CLI")
             mesh = _load_via_assimp_cli(path)
             backend = "assimp-cli"
+
+    if suffix == ".fbx":
+        unit_scale = _fbx_unit_scale(path)
+        if np.isfinite(unit_scale) and unit_scale > 0.0:
+            scale_to_metres = unit_scale / 100.0
+            if not np.isclose(scale_to_metres, 1.0):
+                mesh.apply_scale(scale_to_metres)
+                notes.append(
+                    f"Converted FBX units to metres (x{scale_to_metres:g})"
+                )
 
     _axis_fix(mesh, z_up)
     mesh = prepare_mesh(mesh, notes)
