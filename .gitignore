@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+myenv/
+output/
+.pytest_cache/
+imgui.ini
+myenv

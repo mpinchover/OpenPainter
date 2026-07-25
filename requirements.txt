@@ -1,0 +1,25 @@
+# Core stack
+numpy>=1.26
+Pillow>=10.0
+scipy>=1.11
+
+# Mesh import (FBX goes through Assimp -- see README for the system dependency)
+trimesh>=4.0
+
+# Automatic UV unwrapping
+xatlas>=0.0.9
+
+# Window, viewport, orbit camera, GL bindings
+moderngl>=5.10
+moderngl-window>=3.0
+glfw>=2.6
+
+# Slider / parameter UI (also provides portable_file_dialogs)
+imgui_bundle>=1.6
+
+# Accelerated ray casting for the AO bake. trimesh picks this up automatically.
+embreex>=2.17
+
+# Optional: the ctypes Assimp wrapper. Broken on Python 3.12+ (it imports the
+# removed distutils module), which is why mesh_io falls back to the assimp CLI.
+# pyassimp>=5.2
