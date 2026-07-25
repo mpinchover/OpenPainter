@@ -154,6 +154,54 @@ def _draw_parameters(app: "MeshMapApp") -> None:
         "edges facing that way wear. Use it for gravity-driven scuffing."
     )
 
+    # -- bevel ------------------------------------------------------------
+    imgui.separator_text("Bevel  (re-bake required)")
+    bevel = controller.bevel_params
+    _, bevel.enabled = imgui.checkbox("Bevel sharp edges", bevel.enabled)
+    _tooltip(
+        "Blender's Bevel modifier, approximated: replaces sharp edges with a\n"
+        "narrow strip before baking. A perfectly sharp edge has no width for\n"
+        "the curvature bake to put a gradient in, so without this the gradient\n"
+        "smears across whole faces and they bake grey instead of the edge\n"
+        "baking white. The bevel is never exported -- it inherits your UVs, so\n"
+        "the texture still fits your original unbeveled mesh."
+    )
+
+    imgui.begin_disabled(not bevel.enabled)
+    _, bevel.amount = imgui.slider_float(
+        "Amount (m)", bevel.amount, 0.0001, 0.05, "%.4f", imgui.SliderFlags_.logarithmic
+    )
+    _tooltip(
+        "Blender's Amount under the Offset width type: how far the new boundary\n"
+        "edge sits from the original edge. 0.001 (1 mm) is the subtle bevel that\n"
+        "catches a highlight without reading as visibly rounded."
+    )
+    _, bevel.segments = imgui.slider_int("Segments", bevel.segments, 1, 8)
+    _tooltip(
+        "Subdivisions across the bevel. 1 is a flat chamfer, 2-3 lightly\n"
+        "rounded, more is smoother but adds geometry."
+    )
+    _, bevel.angle = imgui.slider_float("Angle", bevel.angle, 1.0, 180.0, "%.0f deg")
+    _tooltip(
+        "Limit Method: Angle. Only edges whose two faces diverge by more than\n"
+        "this get beveled, so box corners qualify and coplanar edges splitting\n"
+        "a flat surface are left alone. 30 degrees is Blender's usual choice."
+    )
+
+    # A bevel narrower than a texel falls between samples and bakes nothing, so
+    # say how wide this one lands rather than let it silently do nothing.
+    if info is not None and info.uv_density > 0.0:
+        texels = bevel.amount * info.uv_density * bake.resolution
+        if texels < 2.0:
+            imgui.text_colored(
+                WARN_COLOR,
+                f"! {texels:.1f} texels wide - too thin to bake, raise Amount "
+                f"or the resolution",
+            )
+        else:
+            imgui.text_colored(MUTED_COLOR, f"{texels:.1f} texels wide in the atlas")
+    imgui.end_disabled()
+
     if imgui.collapsing_header("Advanced bake settings"):
         _, bake.dilation = imgui.slider_int("Seam padding (texels)", bake.dilation, 0, 16)
         _tooltip("Pads chart borders outward so bilinear filtering never samples empty gutter.")

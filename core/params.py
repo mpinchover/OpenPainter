@@ -34,6 +34,41 @@ AXIS_VECTORS = (
 
 
 @dataclass
+class BevelParams:
+    """Blender's Bevel modifier, as far as :mod:`core.bevel` reproduces it.
+
+    Fixed to the configuration these three knobs belong to: Affect = Edges,
+    Width Type = Offset, Limit Method = Angle, Miter Outer/Inner = Sharp, Clamp
+    Overlap off, Loop Slide on. The bevel is geometry for the bake only -- it
+    never reaches the exported texture, which still addresses the original
+    unbeveled mesh through its own UVs.
+    """
+
+    enabled: bool = False
+
+    amount: float = 0.001
+    """Blender's Amount, in metres, under the Offset width type: the distance
+    from the original edge to each new boundary edge. 1 mm is the subtle bevel
+    that lets an edge catch a highlight without reading as rounded."""
+
+    segments: int = 3
+    """Subdivisions across the bevel. 1 is a flat chamfer, 2-3 lightly rounded,
+    more is smoother at the cost of geometry."""
+
+    angle: float = 30.0
+    """Degrees. Edges whose two faces diverge by more than this get beveled, so
+    box corners qualify while coplanar edges splitting a flat surface do not."""
+
+    def key(self) -> tuple:
+        return (
+            self.enabled,
+            round(self.amount, 9),
+            self.segments,
+            round(self.angle, 4),
+        )
+
+
+@dataclass
 class UnwrapParams:
     """Where the bake's atlas comes from, plus xatlas' packing options."""
 
@@ -168,4 +203,7 @@ class MeshInfo:
     watertight: bool = False
     has_uvs: bool = False
     """Whether the source file carried a UV map we can bake into."""
+    uv_density: float = 0.0
+    """UV units per metre of surface. Times the resolution gives texels per
+    metre, which is what decides whether a bevel is wide enough to bake."""
     notes: list[str] = field(default_factory=list)

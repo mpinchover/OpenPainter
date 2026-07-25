@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.baking import dilate  # noqa: E402
+from core.bevel import bevel  # noqa: E402
 from core.edge_wear import (  # noqa: E402
     edge_wear,
     normalize_position,
@@ -27,13 +28,15 @@ from core.edge_wear import (  # noqa: E402
 )
 from core.export import export_maps, export_textured_obj  # noqa: E402
 from core.mesh_io import _fbx_unit_scale, load_mesh  # noqa: E402
-from core.params import BakeParams, EdgeWearParams, UnwrapParams  # noqa: E402
+from core.params import BakeParams, BevelParams, EdgeWearParams, UnwrapParams  # noqa: E402
 from core.uv_unwrap import (  # noqa: E402
     SourceUVError,
+    _welded_vertex_normals,
     UnwrapResult,
     source_uv_layout,
     source_uvs,
     unwrap,
+    uv_density,
 )
 
 ASSETS = ROOT / "assets"
@@ -81,6 +84,152 @@ def test_ascii_fbx_unit_scale_is_read(tmp_path):
         'P: "UnitScaleFactor", "double", "Number", "",100\n'
     )
     assert _fbx_unit_scale(path) == 100.0
+
+
+# --------------------------------------------------------------------------
+# bevel
+# --------------------------------------------------------------------------
+
+CUBE_AXES = np.array(
+    [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]], dtype=float
+)
+
+
+@pytest.fixture
+def cube() -> trimesh.Trimesh:
+    return trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+
+
+def test_bevel_is_a_no_op_when_off(cube):
+    for params in (
+        BevelParams(enabled=False),
+        BevelParams(enabled=True, amount=0.0),
+        BevelParams(enabled=True, angle=179.0),  # nothing is that sharp
+    ):
+        assert bevel(cube, params) is cube
+
+
+def test_bevel_keeps_the_solid_closed(cube):
+    for segments in (1, 2, 3, 6):
+        result = bevel(cube, BevelParams(enabled=True, amount=0.05, segments=segments))
+        assert result.is_watertight, f"segments={segments} left holes"
+        assert result.is_winding_consistent
+        assert result.volume < cube.volume, "a bevel only removes material"
+        # Nothing may poke outside the original solid.
+        assert np.abs(result.vertices).max() <= 1.0 + 1e-9
+
+
+def test_bevel_offset_width_matches_blender(cube):
+    """Offset width: each new boundary edge sits `amount` from the original.
+
+    On a cube that means the six original faces survive as squares inset by
+    `amount` on every side, so their total area pins the convention exactly.
+    """
+    amount = 0.05
+    result = bevel(cube, BevelParams(enabled=True, amount=amount, segments=3))
+    flat = (result.face_normals @ CUBE_AXES.T).max(axis=1) > 1.0 - 1e-9
+    assert np.isclose(result.area_faces[flat].sum(), 6 * (2.0 - 2 * amount) ** 2, rtol=1e-9)
+
+
+def test_bevel_volume_converges_on_the_circular_profile(cube):
+    """More segments must approach the true rounded edge from below."""
+    volumes = [
+        bevel(cube, BevelParams(enabled=True, amount=0.05, segments=s)).volume
+        for s in (2, 3, 6, 10)
+    ]
+    assert volumes == sorted(volumes), "a finer arc encloses more"
+    # 12 edges of a quarter-circle fillet, ignoring the eight corner patches.
+    exact = 8.0 - 12 * (0.05**2) * (1 - np.pi / 4) * (2.0 - 2 * 0.05)
+    assert volumes[-1] == pytest.approx(exact, rel=2e-3)
+
+
+def test_one_segment_is_a_flat_chamfer(cube):
+    """Blender's 1-segment bevel is a chamfer, so the strips must be planar."""
+    result = bevel(cube, BevelParams(enabled=True, amount=0.05, segments=1))
+    # A cube chamfer has 6 axis faces + 12 edge planes + 8 corners = 26 planes.
+    planes = np.unique(np.round(result.face_normals, 6), axis=0)
+    assert len(planes) == 26
+
+
+def test_bevel_only_touches_edges_sharper_than_the_angle():
+    """A coplanar edge splitting a flat surface must be left alone."""
+    # Two triangles forming a flat square: the shared diagonal is 0 degrees.
+    flat = trimesh.Trimesh(
+        vertices=[[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
+        faces=[[0, 1, 2], [0, 2, 3]],
+        process=False,
+    )
+    assert bevel(flat, BevelParams(enabled=True, amount=0.01, angle=30.0)) is flat
+
+
+def test_bevel_confines_the_normal_gradient_to_the_strip(cube):
+    """The whole reason the bevel exists.
+
+    Without it, welding averages the 90-degree corner normals across the entire
+    face and the bake lights the face up. With it, the big faces must come out
+    flat to within a rounding error so they bake black.
+    """
+    before = _welded_vertex_normals(cube)[cube.faces]
+    flat_normals = np.repeat(cube.face_normals[:, None, :], 3, axis=1)
+    deviation = np.degrees(
+        np.arccos(np.clip(np.einsum("fij,fij->fi", before, flat_normals), -1, 1))
+    )
+    assert deviation.max() > 45.0, "unbeveled, the gradient covers whole faces"
+
+    result = bevel(cube, BevelParams(enabled=True, amount=0.001, segments=3))
+    after = _welded_vertex_normals(result)[result.faces]
+    flat = (result.face_normals @ CUBE_AXES.T).max(axis=1) > 1.0 - 1e-9
+    face_normals = np.repeat(result.face_normals[:, None, :], 3, axis=1)
+    deviation = np.degrees(
+        np.arccos(np.clip(np.einsum("fij,fij->fi", after, face_normals), -1, 1))
+    )
+    assert deviation[flat].max() < 0.5, "the big faces must stay flat"
+    assert deviation[~flat].max() > 45.0, "the strip carries the whole transition"
+
+
+def test_uv_density_predicts_the_bevel_width(tmp_path):
+    """The width a bevel lands at in the atlas, which is what decides if it bakes.
+
+    A bevel thinner than a texel falls between samples and leaves nothing
+    behind, so the UI warns using this number. Pin it against a cube whose
+    density is computable by hand.
+    """
+    box = trimesh.creation.box(extents=(2.0, 2.0, 2.0)).unwrap()
+    path = tmp_path / "uvbox.obj"
+    box.export(path)
+    mesh, info = load_mesh(path)
+
+    # Six 2x2 faces packed into the unit square: the atlas covers a bit under
+    # 1 UV unit over 24 m2 of surface, so density is a shade under 1/sqrt(24).
+    assert info.uv_density == pytest.approx(uv_density(mesh))
+    assert 0.9 / np.sqrt(24.0) < info.uv_density <= 1.0 / np.sqrt(24.0)
+
+    # 1 mm on a 2 m cube at 1024 is far below a texel; 10 mm clears it.
+    assert 0.001 * info.uv_density * 1024 < 1.0
+    assert 0.010 * info.uv_density * 1024 > 2.0
+
+
+def test_bevel_carries_uvs_into_the_island_rim(tmp_path):
+    """New geometry must land inside the original UV islands, not beyond them.
+
+    The bevel is baked but never exported, so its UVs have to fall within the
+    layout the original mesh already addresses -- otherwise the wear would bake
+    into a gutter no texel of the real mesh ever samples.
+    """
+    box = trimesh.creation.box(extents=(2.0, 2.0, 2.0)).unwrap()
+    path = tmp_path / "uvbox.obj"
+    box.export(path)
+    mesh, _ = load_mesh(path)
+    before = source_uvs(mesh)
+
+    result = bevel(mesh, BevelParams(enabled=True, amount=0.02, segments=3))
+    after = source_uvs(result)
+
+    assert after is not None, "the bevel must not drop the UV map"
+    assert len(result.vertices) > len(mesh.vertices)
+    # The atlas must not grow: every new UV lies inside the original footprint.
+    assert after.min() >= before.min() - 1e-6
+    assert after.max() <= before.max() + 1e-6
 
 
 # --------------------------------------------------------------------------

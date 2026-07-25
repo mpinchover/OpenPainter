@@ -25,6 +25,9 @@ from core.pipeline import STAGES, BakeController  # noqa: E402
 
 ASSETS = ROOT / "assets"
 ALL_STAGES = list(STAGES)
+#: Everything the bevel feeds. Bevel geometry depends only on the mesh and
+#: its own parameters, so resolution and atlas changes leave it alone.
+AFTER_BEVEL = [stage for stage in STAGES if stage != "bevel"]
 
 
 @pytest.fixture(scope="module")
@@ -159,7 +162,7 @@ def test_toggling_the_uv_source_reruns_everything(controller):
     assert controller.pending_stages() == []
 
     controller.unwrap_params.use_source_uvs = False
-    assert controller.pending_stages() == ALL_STAGES
+    assert controller.pending_stages() == AFTER_BEVEL
 
 
 def test_nothing_to_do_after_a_clean_bake(controller):
@@ -222,7 +225,7 @@ def test_resolution_change_reruns_everything(controller):
     run_to_completion(controller)
 
     controller.bake_params.resolution = 64
-    assert controller.pending_stages() == ALL_STAGES
+    assert controller.pending_stages() == AFTER_BEVEL
 
     controller.request_bake()
     run_to_completion(controller)

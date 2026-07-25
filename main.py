@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import moderngl_window as mglw  # noqa: E402
 
-from core.params import RESOLUTIONS  # noqa: E402
+from core.params import RESOLUTIONS, BevelParams  # noqa: E402
 from render.viewport import MeshMapApp  # noqa: E402
 
 
@@ -39,6 +39,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Initial bake resolution (default: 1024).",
     )
     parser.add_argument(
+        "--bevel",
+        nargs="?",
+        const="0.001,3,30",
+        metavar="AMOUNT,SEGMENTS,ANGLE",
+        help="Bevel sharp edges before baking, so the curvature has geometry to "
+             "land on. Defaults to 0.001,3,30 -- 1 mm, 3 segments, edges sharper "
+             "than 30 degrees. Mirrors Blender's Bevel modifier under Offset "
+             "width and the Angle limit method.",
+    )
+    parser.add_argument(
         "--auto-unwrap",
         action="store_true",
         help="Let xatlas generate a fresh atlas instead of baking into the "
@@ -58,7 +68,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run the whole pipeline offscreen: bake, export the maps, and "
              "save a viewport render to DIR, then exit. Needs a mesh argument.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.bevel_params = _parse_bevel(parser, args.bevel)
+    return args
+
+
+def _parse_bevel(parser: argparse.ArgumentParser, spec: str | None) -> BevelParams:
+    """Turn ``AMOUNT,SEGMENTS,ANGLE`` into a :class:`BevelParams`."""
+    if spec is None:
+        return BevelParams(enabled=False)
+    fields = [part.strip() for part in spec.split(",")]
+    if len(fields) != 3:
+        parser.error(f"--bevel wants AMOUNT,SEGMENTS,ANGLE, got {spec!r}")
+    try:
+        amount, segments, angle = float(fields[0]), int(fields[1]), float(fields[2])
+    except ValueError:
+        parser.error(f"--bevel values must be numbers, got {spec!r}")
+    if amount <= 0 or segments < 1 or not 0 < angle <= 180:
+        parser.error(f"--bevel needs amount > 0, segments >= 1, 0 < angle <= 180: {spec!r}")
+    return BevelParams(enabled=True, amount=amount, segments=segments, angle=angle)
 
 
 def run_selftest(args: argparse.Namespace) -> int:
@@ -76,6 +104,7 @@ def run_selftest(args: argparse.Namespace) -> int:
     MeshMapApp.initial_z_up = args.z_up
     MeshMapApp.initial_resolution = args.resolution
     MeshMapApp.initial_auto_unwrap = args.auto_unwrap
+    MeshMapApp.initial_bevel = args.bevel_params
     if args.ui_scale is not None:
         MeshMapApp.initial_ui_scale = args.ui_scale
         MeshMapApp.initial_ui_scale_explicit = True
@@ -137,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     MeshMapApp.initial_z_up = args.z_up
     MeshMapApp.initial_resolution = args.resolution
     MeshMapApp.initial_auto_unwrap = args.auto_unwrap
+    MeshMapApp.initial_bevel = args.bevel_params
     if args.ui_scale is not None:
         MeshMapApp.initial_ui_scale = args.ui_scale
         MeshMapApp.initial_ui_scale_explicit = True

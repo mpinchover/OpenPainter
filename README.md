@@ -27,6 +27,42 @@ applies directly to your original mesh — plug it into a `Mix Color` factor or
 into Roughness, and set the image's **Color Space to Non-Color**, because it is
 a mask and not a colour.
 
+### Bevel sharp edges before baking
+
+A perfectly sharp edge has zero width, so the curvature bake — which
+differentiates the interpolated normal per texel — has nowhere to put a
+gradient. Welding averages the corner normals of the faces meeting there
+instead, and that swing spreads across the *whole face*, so faces bake grey and
+the edge doesn't stand out at all.
+
+The **Bevel** panel fixes that by replacing sharp edges with a narrow strip
+before the bake. It approximates Blender's Bevel modifier under Affect = Edges,
+Width Type = Offset and Limit Method = Angle, and exposes its three real knobs:
+
+```bash
+python main.py chair.fbx --bevel                # 1 mm, 3 segments, 30 degrees
+python main.py chair.fbx --bevel 0.01,3,30      # AMOUNT,SEGMENTS,ANGLE
+```
+
+The bevel is never exported. It inherits the source UV layout, landing in the
+outer rim of each island — which on your original unbeveled mesh is the texture
+right up against the edge, so that is where the wear appears.
+
+**The bevel has to be at least a texel or two wide to bake anything.** A 1 mm
+bevel on a 2 m object at 1024 is 0.2 texels and falls between samples,
+leaving nothing behind. The panel reports the width it lands at and warns below
+two texels; raise Amount or the bake resolution. This is the one place where
+Blender's usual 1 mm doesn't transfer — it's a modelling value, and here it has
+to clear the sampling rate.
+
+It is an approximation, not a port. Blender's real bevel is
+`bmesh_bevel.cc`, 8,485 lines over BMesh with five corner mesh kinds and an
+Eigen least-squares solve. Edge selection by dihedral angle, the Offset width
+convention, loop slide and the circular profile are faithful; corners where
+three or more beveled edges meet are fanned onto the corner sphere rather than
+Grid Filled, so the topology there differs. Since the geometry only ever feeds
+the bake, that costs a little accuracy in the corner falloff and nothing else.
+
 `--auto-unwrap` (or *Bake into source UVs* in Advanced bake settings) turns that
 off and lets xatlas invent an atlas instead. Only reach for it on a mesh with no
 UVs, and understand what you get: the atlas fits nothing but the triangulated
@@ -237,6 +273,8 @@ FBX / OBJ / GLB
       ▼  core/mesh_io.py      trimesh natively, else the assimp CLI via .glb
    validate ─ triangulate ─ weld (never across a UV seam) ─ repair winding
       │
+      ▼  core/bevel.py       optional: a strip of geometry on every sharp edge,
+   so the curvature bake has somewhere to put its gradient
       ▼  core/uv_unwrap.py    the mesh's own UV map, vertex for vertex
    (or --auto-unwrap: xatlas charts, packs and splits a new atlas,
     handing back a vmapping to the original vertices)
@@ -392,6 +430,7 @@ same shaders, same ImGui panel — and writes the maps plus viewport renders.
 main.py                  entry point, argument parsing, --selftest
 core/
   mesh_io.py             import, backend selection, triangulate/weld/repair
+  bevel.py               Blender's Bevel modifier, approximated
   uv_unwrap.py           source UV layout, or the xatlas fallback + vmapping
   baking.py              the UV-space curvature bake, the 95% blur, dilation
   pipeline.py            stage keying, CPU/GL split, threading, cancel

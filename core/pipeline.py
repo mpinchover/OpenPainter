@@ -23,11 +23,12 @@ import numpy as np
 import trimesh
 
 from .baking import GBuffer, UVSpaceBaker, dilate
+from .bevel import bevel
 from .edge_wear import normalize_position
-from .params import BakeParams, UnwrapParams
+from .params import BakeParams, BevelParams, UnwrapParams
 from .uv_unwrap import UnwrapResult, source_uv_layout, unwrap
 
-STAGES = ("unwrap", "curvature", "post")
+STAGES = ("bevel", "unwrap", "curvature", "post")
 
 
 @dataclass
@@ -47,10 +48,12 @@ class BakeController:
 
         self.mesh: Optional[trimesh.Trimesh] = None
         self.mesh_token: int = 0
+        self.bevel_params = BevelParams()
         self.unwrap_params = UnwrapParams()
         self.bake_params = BakeParams()
 
         # Stage outputs.
+        self.beveled_mesh: Optional[trimesh.Trimesh] = None
         self.unwrap_result: Optional[UnwrapResult] = None
         self.gbuffer: Optional[GBuffer] = None
         self.curvature_map: Optional[np.ndarray] = None
@@ -82,6 +85,7 @@ class BakeController:
         self.mesh = mesh
         self.mesh_token += 1
         self._completed.clear()
+        self.beveled_mesh = None
         self.unwrap_result = None
         self.gbuffer = None
         self.curvature_map = None
@@ -97,14 +101,15 @@ class BakeController:
     # -- planning ---------------------------------------------------------
 
     def _keys(self) -> dict[str, tuple]:
-        unwrap_key = (
-            self.mesh_token,
+        bevel_key = (self.mesh_token, self.bevel_params.key())
+        unwrap_key = bevel_key + (
             self.unwrap_params.key(),
             self.bake_params.resolution,
         )
         curvature_key = unwrap_key + self.bake_params.curvature_key()
         post_key = curvature_key + (self.bake_params.dilation,)
         return {
+            "bevel": bevel_key,
             "unwrap": unwrap_key,
             "curvature": curvature_key,
             "post": post_key,
@@ -128,6 +133,7 @@ class BakeController:
             "Reading source UVs" if self.unwrap_params.use_source_uvs else "Unwrapping UVs"
         )
         definitions = {
+            "bevel": ("Bevelling edges", False, self._run_bevel),
             "unwrap": (unwrap_label, False, self._run_unwrap),
             "curvature": ("Baking curvature", True, self._run_curvature),
             "post": ("Padding seams", False, self._run_post),
@@ -141,15 +147,28 @@ class BakeController:
 
     # -- stage bodies -----------------------------------------------------
 
-    def _run_unwrap(self) -> None:
+    def _run_bevel(self) -> None:
+        """Give the bake geometry to see at every sharp edge.
+
+        The bevel exists only for the bake. It inherits the source UV layout,
+        so the texture still addresses the *original* unbeveled mesh -- the wear
+        lands in the outer rim of each UV island, which on that mesh is the
+        texture right against the edge.
+        """
         assert self.mesh is not None
+        self.beveled_mesh = bevel(self.mesh, self.bevel_params)
+
+    def _run_unwrap(self) -> None:
+        assert self.beveled_mesh is not None
         resolution = self.bake_params.resolution
         if self.unwrap_params.use_source_uvs:
             # No charting and no reindexing -- bake into the layout the artist
             # authored, so the PNG applies to their mesh and not to ours.
-            self.unwrap_result = source_uv_layout(self.mesh, resolution)
+            self.unwrap_result = source_uv_layout(self.beveled_mesh, resolution)
         else:
-            self.unwrap_result = unwrap(self.mesh, self.unwrap_params, resolution)
+            self.unwrap_result = unwrap(
+                self.beveled_mesh, self.unwrap_params, resolution
+            )
 
     def _run_curvature(self) -> None:
         assert self.unwrap_result is not None
@@ -158,7 +177,7 @@ class BakeController:
         self.gbuffer = self.baker.rasterize(self.bake_params.resolution, self.bake_params)
 
     def _run_post(self) -> None:
-        assert self.gbuffer is not None and self.mesh is not None
+        assert self.gbuffer is not None and self.beveled_mesh is not None
         mask = self.gbuffer.mask
         padding = self.bake_params.dilation
 
@@ -166,8 +185,10 @@ class BakeController:
         # so re-running with a different width cannot pad an already-padded map.
         self.curvature_map = dilate(self.gbuffer.curvature, mask, padding)
 
-        lower = np.asarray(self.mesh.bounds[0], dtype=np.float32)
-        extents = np.asarray(self.mesh.extents, dtype=np.float32)
+        # Normalise against the geometry that was actually rasterised, so the
+        # 0..1 range still spans the bounding box the G-buffer positions live in.
+        lower = np.asarray(self.beveled_mesh.bounds[0], dtype=np.float32)
+        extents = np.asarray(self.beveled_mesh.extents, dtype=np.float32)
         bposition = normalize_position(self.gbuffer.position, lower, extents)
         self.position_map = dilate(bposition, mask, padding)
 

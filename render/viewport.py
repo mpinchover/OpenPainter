@@ -20,7 +20,7 @@ from moderngl_window.scene.camera import OrbitCamera
 
 from core.export import export_maps, export_textured_obj
 from core.mesh_io import SUPPORTED_SUFFIXES, MeshLoadError, load_mesh
-from core.params import EdgeWearParams, MeshInfo
+from core.params import BevelParams, EdgeWearParams, MeshInfo
 from core.pipeline import BakeController
 from render.imgui_renderer import ImGuiRenderer
 from render.shaders import load_shader
@@ -199,6 +199,7 @@ class MeshMapApp(mglw.WindowConfig):
     initial_resolution: int = 1024
     #: False bakes into the mesh's own UVs; True lets xatlas invent an atlas.
     initial_auto_unwrap: bool = False
+    initial_bevel: Optional[BevelParams] = None
     initial_ui_scale: float = 1.35
     #: True when --ui-scale was passed, so it overrides the saved preference.
     initial_ui_scale_explicit: bool = False
@@ -213,6 +214,8 @@ class MeshMapApp(mglw.WindowConfig):
         self.controller = BakeController(self.ctx)
         self.controller.bake_params.resolution = int(self.initial_resolution)
         self.controller.unwrap_params.use_source_uvs = not self.initial_auto_unwrap
+        if self.initial_bevel is not None:
+            self.controller.bevel_params = self.initial_bevel
         self.wear_params = EdgeWearParams()
         self.mesh_info: Optional[MeshInfo] = None
         self.mesh: Optional[trimesh.Trimesh] = None

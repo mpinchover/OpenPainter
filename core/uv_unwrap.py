@@ -72,6 +72,58 @@ def source_uvs(mesh: trimesh.Trimesh) -> np.ndarray | None:
     return np.ascontiguousarray(uv[:, :2])
 
 
+def _area_weighted_normals(vertex_count: int, faces: np.ndarray,
+                           face_normals: np.ndarray, face_angles: np.ndarray,
+                           face_areas: np.ndarray) -> np.ndarray:
+    """Vertex normals weighted by face area as well as corner angle.
+
+    trimesh weights by corner angle alone, which is wrong for the meshes this
+    tool exists to bake. A vertex where a large flat face meets a 1 mm bevel
+    quad has a right angle in both, so angle weighting lets the sliver drag the
+    big face's normal ~20 degrees off flat -- and since the bake differentiates
+    that normal, the whole face lights up instead of just the bevel. Folding in
+    area makes the large face dominate by its area ratio, which confines the
+    gradient to the bevel where it belongs. This is what Blender's Weighted
+    Normal modifier does in its "Face Area & Angle" mode.
+    """
+    weights = face_angles * face_areas[:, None]
+    normals = np.zeros((vertex_count, 3), dtype=np.float64)
+    contribution = face_normals[:, None, :] * weights[:, :, None]
+    for corner in range(faces.shape[1]):
+        np.add.at(normals, faces[:, corner], contribution[:, corner, :])
+
+    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+    degenerate = lengths[:, 0] < 1e-12
+    if degenerate.any():
+        # Nothing meaningful to average; fall back to any incident face.
+        fallback = np.zeros((vertex_count, 3))
+        for corner in range(faces.shape[1]):
+            fallback[faces[:, corner]] = face_normals
+        normals[degenerate] = fallback[degenerate]
+        lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+    return normals / np.clip(lengths, 1e-12, None)
+
+
+def uv_density(mesh: trimesh.Trimesh) -> float:
+    """UV units per metre of surface, averaged over the mesh.
+
+    Multiply by the atlas resolution to get texels per metre, which is what
+    decides whether a feature is big enough to bake at all: anything narrower
+    than a texel falls between samples and leaves nothing behind.
+    """
+    uv = source_uvs(mesh)
+    if uv is None:
+        return 0.0
+    corners = uv[np.asarray(mesh.faces)]
+    edge_a = corners[:, 1] - corners[:, 0]
+    edge_b = corners[:, 2] - corners[:, 0]
+    uv_area = float(np.abs(edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0]).sum()) / 2.0
+    surface = float(mesh.area)
+    if uv_area <= 0.0 or surface <= 0.0:
+        return 0.0
+    return float(np.sqrt(uv_area / surface))
+
+
 def _welded_vertex_normals(mesh: trimesh.Trimesh) -> np.ndarray:
     """Smooth vertex normals that ignore UV seams.
 
@@ -83,16 +135,16 @@ def _welded_vertex_normals(mesh: trimesh.Trimesh) -> np.ndarray:
     invisible to the derivative.
     """
     unique, inverse = trimesh.grouping.unique_rows(mesh.vertices)
-    if len(unique) == len(mesh.vertices):
-        return np.ascontiguousarray(mesh.vertex_normals, dtype=np.float32)
-
     welded = trimesh.Trimesh(
         vertices=np.asarray(mesh.vertices)[unique],
         faces=inverse[np.asarray(mesh.faces)],
         process=False,
     )
-    normals = np.asarray(welded.vertex_normals, dtype=np.float32)[inverse]
-    return np.ascontiguousarray(normals, dtype=np.float32)
+    normals = _area_weighted_normals(
+        len(unique), welded.faces, welded.face_normals,
+        welded.face_angles, welded.area_faces,
+    )
+    return np.ascontiguousarray(normals[inverse], dtype=np.float32)
 
 
 def source_uv_layout(mesh: trimesh.Trimesh, resolution: int) -> UnwrapResult:

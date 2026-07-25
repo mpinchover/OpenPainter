@@ -27,7 +27,7 @@ import numpy as np
 import trimesh
 
 from .params import MeshInfo
-from .uv_unwrap import source_uvs
+from .uv_unwrap import source_uvs, uv_density
 
 #: Formats trimesh parses on its own, no Assimp round-trip needed.
 NATIVE_SUFFIXES = {
@@ -364,6 +364,7 @@ def load_mesh(path: str | Path, *, z_up: bool = False) -> tuple[trimesh.Trimesh,
         scale=float(np.linalg.norm(mesh.extents)),
         watertight=is_watertight(mesh),
         has_uvs=uvs is not None,
+        uv_density=uv_density(mesh),
         notes=notes,
     )
 
