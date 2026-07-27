@@ -63,27 +63,110 @@ three or more beveled edges meet are fanned onto the corner sphere rather than
 Grid Filled, so the topology there differs. Since the geometry only ever feeds
 the bake, that costs a little accuracy in the corner falloff and nothing else.
 
-`--auto-unwrap` (or *Bake into source UVs* in Advanced bake settings) turns that
-off and lets xatlas invent an atlas instead. Only reach for it on a mesh with no
-UVs, and understand what you get: the atlas fits nothing but the triangulated
-OBJ this app exports, so the texture is meaningless on your original mesh. Two
-things get lost on that route — the quad topology, because trimesh and Assimp
-both represent triangles only, and any correspondence to your own UVs.
+**Export** writes `edge_wear.png` and `curvature.png`, and that is the whole
+product — they address your original mesh through its own UV map, so there is
+nothing to ship alongside them.
 
-For that route, click **Export textured OBJ for Blender**. MeshMap writes the
-`.obj`, its `.mtl`, `edge_wear.png`, and `curvature.png` into the same output
-folder. Keep those files together; importing the OBJ into Blender loads the
-edge-wear image as the material's diffuse texture automatically. FBX unit
-metadata is baked into the OBJ vertex coordinates, so a Blender FBX round-trip
-retains the source object's physical size even though OBJ itself is unitless.
+`--auto-unwrap` (or *Bake into source UVs* in Advanced bake settings) turns the
+source-UV path off and lets xatlas invent an atlas instead. Only reach for it on
+a mesh with no UVs at all, and understand what you get: the atlas belongs to
+MeshMap's internal triangulated copy, so the texture will not fit your original
+mesh. Unwrapping in Blender is almost always the better answer.
 
 | Key | Action |
 | --- | --- |
 | `1`–`5` | Preview: edge wear / curvature texture / UV checker / normals / shaded |
-| `B` / `E` / `F` | Bake / export / frame the mesh |
+| `B` / `E` / `F` | Bake / export maps / frame the mesh (also resets the view) |
 | `W` / `L` | Wireframe / lighting |
 | `+` / `-` | Bigger / smaller UI |
-| drag / shift-drag / scroll | Orbit / pan / zoom |
+
+### Navigating
+
+| Gesture | Action |
+| --- | --- |
+| scroll / two-finger swipe | Orbit (turntable) |
+| pinch, or ctrl (or alt) + scroll | Zoom |
+| shift + scroll | Pan |
+| left-drag | Orbit |
+| shift-drag or middle-drag | Pan |
+| right-drag | Zoom |
+| click an axis ball | Align to that axis, orthographic |
+
+The gestures are Blender's own 3D-viewport trackpad bindings, from
+`blender_default.py`: `TRACKPADPAN` orbits, `+shift` pans, `+ctrl` zooms.
+
+**Pinch** takes a detour to get here. macOS sends it as `magnifyWithEvent:`, and
+pyglet's Cocoa view implements no gesture handlers, so the event found no taker
+and the pinch did nothing — and it is *not* ctrl+scroll either, since that
+translation is a browser convention rather than an AppKit one. `render/trackpad.py`
+adds the selector to pyglet's view class at runtime, which the Objective-C
+runtime permits for an already-registered class. It is a no-op off macOS.
+
+Speeds are adjustable under **Settings → Viewport navigation** — orbit, pan and
+zoom, plus a separate multiplier for scroll and trackpad gestures, since a
+trackpad's stream of small deltas and a wheel's whole notches rarely want the
+same rate. There are invert-axis toggles for natural scrolling. Everything is
+remembered between launches in `prefs.json`. A speed of 1.0 orbits at 0.4
+degrees per pixel, which is Blender's own `view_rotate_sensitivity_turntable`.
+
+**Smoothing** is there for one specific defect. macOS reports scrolling one
+pixel of finger travel at a time — `[NSEvent deltaY]`, which pyglet reads
+(`pyglet/window/cocoa/pyglet_view.py`, `getMouseDelta`), carries a tenth of a
+point per pixel, and `scrollingDeltaY` carries the same pixel count directly, so
+neither accessor knows anything finer. Move slowly and a pixel takes several
+frames to cross: what arrives is a run of zeros punctuated by a step, and the
+view sits still and then hops. That is the stutter you feel at low speed and not
+at high.
+
+The motion between steps is not in the event stream and cannot be recovered, so
+the repair is to stop presenting a step as though it happened in one frame. The
+app measures how fast steps are arriving — one step divided by the frames since
+the last one, which holds flat between steps where a per-frame average would
+spike and sag — and moves that much every frame. Constant input becomes constant
+motion. It costs about one step of delay at a crawl, and none at all once the
+steps arrive every frame, since then there is nothing to spread. Total travel is
+identical at every setting; 1.00 follows the gesture's speed exactly, 0 applies
+each step whole the moment it lands, and mouse dragging is never smoothed.
+
+The orbit is a **turntable**, ported from the non-trackball branch of Blender's
+`viewrotate_apply` (`view3d_navigate_view_rotate.cc`): horizontal motion spins
+about world up, vertical motion pitches about the screen horizon. Because yaw is
+always about the same world axis, the horizon stays level no matter how you got
+there — a trackball cannot promise that, and the roll it accumulates is what
+makes one feel like it is fighting you.
+
+Nothing clamps, so you can look straight down and tumble under the subject and
+keep going. moderngl-window's stock `OrbitCamera` clamps its polar angle to a
+170° band precisely to dodge the pole degeneracy; what replaces the clamp here
+is Blender's own horizon blend, which switches the pitch axis from the world
+horizon to the camera's right as you approach a pole.
+
+### The axis gizmo
+
+Six axis balls sit in the top-right corner, modelled on Blender's navigation
+gizmo (`view3d_gizmo_navigate_type.cc`) down to the theme colours. Click one to
+look straight down that axis in **orthographic** projection; orbiting away
+restores perspective, which is Blender's Auto Perspective behaviour. Positive
+axes are filled and lettered, negative ones hollow, and the balls are depth
+sorted so the ordering reads correctly.
+
+Toggle it from the *Axis gizmo* checkbox.
+
+### Axis convention
+
+The viewport is **Z-up, like Blender**, and the axis colours are Blender's own.
+A Y-up source — which is what Blender's FBX and glTF exporters write — is
+rotated into that convention on import, the same +90° about X that Blender's
+importers apply. So the gizmo, the bake **Axis** dropdown and the size readout
+all mean what they mean in Blender: `-Z` is down, and gravity-driven scuffing
+uses `-Z`.
+
+Pass `--z-up` (or tick *Source is Z-up*) if a file genuinely stores Z as up
+already, and it will be used as-is.
+
+The conversion only affects how the model is presented and how the bake's Axis
+option is interpreted. `MeshInfo.to_world` records it, so anything needing the
+source file's own coordinates can invert it.
 
 ---
 
@@ -446,6 +529,7 @@ render/
     copy.frag            the 95% round-trip blur
     preview.frag         viewport shading modes
 ui/panel.py              the slider panel
+ui/gizmo.py              the clickable axis gizmo
 tests/                   pipeline, GL, controller, and UI-scale tests
 ```
 

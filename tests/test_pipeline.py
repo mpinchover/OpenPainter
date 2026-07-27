@@ -26,13 +26,12 @@ from core.edge_wear import (  # noqa: E402
     tex_noise_f,
     tex_noise_fbm,
 )
-from core.export import export_maps, export_textured_obj  # noqa: E402
+from core.export import export_maps  # noqa: E402
 from core.mesh_io import _fbx_unit_scale, load_mesh  # noqa: E402
 from core.params import BakeParams, BevelParams, EdgeWearParams, UnwrapParams  # noqa: E402
 from core.uv_unwrap import (  # noqa: E402
     SourceUVError,
     _welded_vertex_normals,
-    UnwrapResult,
     source_uv_layout,
     source_uvs,
     unwrap,
@@ -84,6 +83,58 @@ def test_ascii_fbx_unit_scale_is_read(tmp_path):
         'P: "UnitScaleFactor", "double", "Number", "",100\n'
     )
     assert _fbx_unit_scale(path) == 100.0
+
+
+# --------------------------------------------------------------------------
+# axis convention
+# --------------------------------------------------------------------------
+
+def test_a_y_up_source_is_imported_z_up(tmp_path):
+    """The app is Z-up like Blender, so a Y-up file is rotated on the way in.
+
+    Blender's FBX and glTF exporters both write Y-up, and Blender's own
+    importers apply this same +90 about X coming back.
+    """
+    # Tall along Y, so where the height lands identifies the convention.
+    box = trimesh.creation.box(extents=(1.0, 4.0, 2.0))
+    path = tmp_path / "tall.obj"
+    box.export(path)
+
+    mesh, info = load_mesh(path)
+    assert np.argmax(info.extents) == 2, "the tall axis must end up on Z"
+    assert info.extents == pytest.approx((1.0, 2.0, 4.0), abs=1e-6)
+    assert info.to_world is not None
+
+
+def test_a_z_up_source_is_left_alone(tmp_path):
+    box = trimesh.creation.box(extents=(1.0, 4.0, 2.0))
+    path = tmp_path / "tall.obj"
+    box.export(path)
+
+    mesh, info = load_mesh(path, source_z_up=True)
+    assert info.extents == pytest.approx((1.0, 4.0, 2.0), abs=1e-6)
+    assert info.to_world is None or np.allclose(info.to_world, np.eye(4))
+
+
+def test_export_undoes_the_axis_conversion(tmp_path):
+    """A round trip must not rotate the model.
+
+    The OBJ is written in the source's own orientation, so re-importing it the
+    normal way lands back where it started.
+    """
+    box = trimesh.creation.box(extents=(1.0, 4.0, 2.0)).unwrap()
+    source = tmp_path / "tall.obj"
+    box.export(source)
+    mesh, info = load_mesh(source)
+
+    # Undo the conversion the way an exporter would, and it lands back home.
+    undone = mesh.copy()
+    undone.apply_transform(np.linalg.inv(info.to_world))
+    out = tmp_path / "back.obj"
+    undone.export(out)
+
+    reloaded, reloaded_info = load_mesh(out)
+    assert reloaded_info.extents == pytest.approx(info.extents, abs=1e-4)
 
 
 # --------------------------------------------------------------------------
@@ -570,31 +621,3 @@ def test_export_16_bit_has_more_levels(tmp_path):
 def test_export_rejects_odd_bit_depth(tmp_path):
     with pytest.raises(ValueError):
         export_maps(tmp_path, np.zeros((4, 4)), np.zeros((4, 4)), bits=12)
-
-
-def test_export_textured_obj_writes_blender_package(tmp_path):
-    mesh = UnwrapResult(
-        vertices=np.array(
-            [[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32
-        ),
-        normals=np.array([[0, 0, 1]] * 3, dtype=np.float32),
-        uvs=np.array([[0, 0], [1, 0], [0, 1]], dtype=np.float32),
-        faces=np.array([[0, 1, 2]], dtype=np.uint32),
-        vmapping=np.arange(3, dtype=np.uint32),
-        chart_count=1,
-        utilization=1.0,
-        atlas_size=(4, 4),
-    )
-    image = np.ones((4, 4), dtype=np.float32)
-
-    paths = export_textured_obj(tmp_path, "sample", mesh, image, image)
-
-    assert [path.name for path in paths] == [
-        "sample.obj", "sample.mtl", "edge_wear.png", "curvature.png"
-    ]
-    obj = paths[0].read_text()
-    mtl = paths[1].read_text()
-    assert "mtllib sample.mtl" in obj
-    assert "usemtl sample_edge_wear" in obj
-    assert "f 1/1/1 2/2/2 3/3/3" in obj
-    assert "map_Kd edge_wear.png" in mtl

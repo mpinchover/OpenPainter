@@ -29,7 +29,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--z-up",
         action="store_true",
-        help="Treat the source as Z-up and rotate it into the viewport's Y-up convention.",
+        help="The source file is already Z-up, so import it as-is. Off by "
+             "default, which rotates a Y-up source into this app's Z-up world "
+             "-- what Blender's FBX and glTF exporters write.",
     )
     parser.add_argument(
         "--resolution",

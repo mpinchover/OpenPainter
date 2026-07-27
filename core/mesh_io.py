@@ -299,16 +299,33 @@ def is_watertight(mesh: trimesh.Trimesh) -> bool:
     return bool(welded.is_watertight)
 
 
-def _axis_fix(mesh: trimesh.Trimesh, z_up: bool) -> None:
-    """Rotate a Z-up source into the viewport's Y-up convention."""
-    if not z_up:
-        return
-    rot = trimesh.transformations.rotation_matrix(-np.pi / 2.0, (1.0, 0.0, 0.0))
-    mesh.apply_transform(rot)
+#: Y-up source -> the app's Z-up world. FBX and glTF both store Y-up, and this
+#: is the same +90-degrees-about-X that Blender's own importers apply, which is
+#: why a Blender export comes back in with Z up exactly as it left.
+Y_UP_TO_Z_UP = trimesh.transformations.rotation_matrix(np.pi / 2.0, (1.0, 0.0, 0.0))
 
 
-def load_mesh(path: str | Path, *, z_up: bool = False) -> tuple[trimesh.Trimesh, MeshInfo]:
-    """Load a mesh file and return it alongside a populated :class:`MeshInfo`."""
+def _axis_fix(mesh: trimesh.Trimesh, source_z_up: bool) -> np.ndarray:
+    """Bring a source into the app's Z-up world, returning what was applied.
+
+    The caller keeps the transform in :attr:`MeshInfo.to_world` so anything that
+    needs to speak the source file's coordinates again can undo it.
+    """
+    if source_z_up:
+        return np.eye(4)
+    mesh.apply_transform(Y_UP_TO_Z_UP)
+    return Y_UP_TO_Z_UP
+
+
+def load_mesh(
+    path: str | Path, *, source_z_up: bool = False
+) -> tuple[trimesh.Trimesh, MeshInfo]:
+    """Load a mesh file and return it alongside a populated :class:`MeshInfo`.
+
+    ``source_z_up`` says the file is *already* Z-up and needs no conversion.
+    Leave it False for anything out of Blender: the FBX and glTF exporters both
+    write Y-up.
+    """
     path = Path(path).expanduser()
     if not path.exists():
         raise MeshLoadError(f"File not found: {path}")
@@ -338,7 +355,7 @@ def load_mesh(path: str | Path, *, z_up: bool = False) -> tuple[trimesh.Trimesh,
                     f"Converted FBX units to metres (x{scale_to_metres:g})"
                 )
 
-    _axis_fix(mesh, z_up)
+    to_world = _axis_fix(mesh, source_z_up)
     mesh = prepare_mesh(mesh, notes)
 
     # Touch these once here so the (cached) normals are computed on the main
@@ -365,6 +382,7 @@ def load_mesh(path: str | Path, *, z_up: bool = False) -> tuple[trimesh.Trimesh,
         watertight=is_watertight(mesh),
         has_uvs=uvs is not None,
         uv_density=uv_density(mesh),
+        to_world=to_world,
         notes=notes,
     )
 

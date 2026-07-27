@@ -53,8 +53,6 @@ def draw_panel(app: "MeshMapApp") -> None:
 # --------------------------------------------------------------------------
 
 def _draw_parameters(app: "MeshMapApp") -> None:
-    from render.viewport import PREVIEW_MODES  # local import avoids a cycle
-
     scale = app.ui_pixel_scale
     margin = 12 * scale
     # Fill the window height minus the status bar, so a long parameter list
@@ -66,6 +64,23 @@ def _draw_parameters(app: "MeshMapApp") -> None:
         imgui.Cond_.first_use_ever,
     )
     imgui.begin("Parameters")
+    if imgui.begin_tab_bar("panel_tabs"):
+        selected, _ = imgui.begin_tab_item("Bake")
+        if selected:
+            _draw_bake_tab(app)
+            imgui.end_tab_item()
+        selected, _ = imgui.begin_tab_item("Settings")
+        if selected:
+            _draw_settings_tab(app)
+            imgui.end_tab_item()
+        imgui.end_tab_bar()
+    imgui.end()
+
+
+def _draw_bake_tab(app: "MeshMapApp") -> None:
+    from render.viewport import PREVIEW_MODES  # local import avoids a cycle
+
+    scale = app.ui_pixel_scale
     # Labels sit to the right of each widget; give them a fixed share so long
     # names ("Threshold falloff") are never clipped at any scale.
     imgui.push_item_width(-170 * scale)
@@ -77,8 +92,14 @@ def _draw_parameters(app: "MeshMapApp") -> None:
     if imgui.button("Open mesh..."):
         app.file_dialog = pfd.open_file("Open mesh", str(Path.home()), MESH_FILTERS)
     imgui.same_line()
-    changed, app.z_up_import = imgui.checkbox("Z-up source", app.z_up_import)
-    _tooltip("Rotate the import -90 degrees about X. Reload the file to apply.")
+    changed, app.source_z_up = imgui.checkbox("Source is Z-up", app.source_z_up)
+    _tooltip(
+        "Tick only if the file itself stores Z as up, in which case it is used\n"
+        "as-is. Leave it off for anything out of Blender: the FBX and glTF\n"
+        "exporters both write Y-up, and the importer rotates that into this\n"
+        "app's Z-up world the same way Blender's own importer does.\n"
+        "Reload the file to apply."
+    )
 
     info = app.mesh_info
     if info is not None:
@@ -111,6 +132,15 @@ def _draw_parameters(app: "MeshMapApp") -> None:
         _, app.checker_scale = imgui.slider_float("Checker density", app.checker_scale, 2.0, 96.0, "%.0f")
 
     _, app.show_map_inspector = imgui.checkbox("Map inspector", app.show_map_inspector)
+    imgui.same_line()
+    _, app.show_gizmo = imgui.checkbox("Axis gizmo", app.show_gizmo)
+    _tooltip(
+        "The axis balls in the top-right corner. Click one to look straight down\n"
+        "that axis in orthographic projection; orbiting returns to perspective.\n"
+        "Z is up, matching Blender."
+    )
+    if app.camera.orthographic:
+        imgui.text_colored(MUTED_COLOR, "Orthographic - orbit to return to perspective")
 
     # -- bake stage ------------------------------------------------------
     imgui.separator_text("Bake  (re-bake required)")
@@ -151,7 +181,7 @@ def _draw_parameters(app: "MeshMapApp") -> None:
     changed, bake.axis = imgui.combo("Axis", bake.axis, list(BAKE_AXES))
     _tooltip(
         "Anything but XYZ multiplies the result by dot(normal, axis), so only\n"
-        "edges facing that way wear. Use it for gravity-driven scuffing."
+        "edges facing that way wear. Z is up as in Blender, so -Z is gravity."
     )
 
     # -- bevel ------------------------------------------------------------
@@ -294,23 +324,99 @@ def _draw_parameters(app: "MeshMapApp") -> None:
     imgui.begin_disabled(not ready)
     if imgui.button("Export edge_wear / curvature", imgui.ImVec2(-1, 0)):
         app.export()
-    if imgui.button("Export textured OBJ for Blender", imgui.ImVec2(-1, 0)):
-        app.export_obj()
     _tooltip(
-        "Writes OBJ + MTL + edge_wear.png into one folder. Keep the files\n"
-        "together and Blender applies the edge-wear texture on import."
+        "Writes edge_wear.png and curvature.png. They apply to your original\n"
+        "mesh directly, because the bake used its own UV map."
     )
     imgui.end_disabled()
 
-    # -- interface -------------------------------------------------------
+    imgui.pop_item_width()
+
+
+def _draw_settings_tab(app: "MeshMapApp") -> None:
+    """Viewport navigation speeds and interface scale, all persisted."""
+    scale = app.ui_pixel_scale
+    imgui.push_item_width(-170 * scale)
+
+    nav = app.navigation
+    dirty = False
+
+    imgui.separator_text("Viewport navigation")
+    imgui.text_colored(
+        MUTED_COLOR,
+        "Multipliers on the base rates.\n"
+        "1.0 orbits at 0.4 deg/pixel, Blender's default.",
+    )
+
+    changed, nav.orbit_speed = imgui.slider_float(
+        "Orbit speed", nav.orbit_speed, 0.05, 3.0, "%.2fx",
+        imgui.SliderFlags_.logarithmic,
+    )
+    dirty |= changed
+    _tooltip("Degrees turned per pixel of drag. Applies to scroll-orbit too.")
+
+    changed, nav.pan_speed = imgui.slider_float(
+        "Pan speed", nav.pan_speed, 0.05, 3.0, "%.2fx", imgui.SliderFlags_.logarithmic
+    )
+    dirty |= changed
+
+    changed, nav.zoom_speed = imgui.slider_float(
+        "Zoom speed", nav.zoom_speed, 0.05, 3.0, "%.2fx", imgui.SliderFlags_.logarithmic
+    )
+    dirty |= changed
+
+    changed, nav.scroll_speed = imgui.slider_float(
+        "Trackpad / wheel", nav.scroll_speed, 0.05, 3.0, "%.2fx",
+        imgui.SliderFlags_.logarithmic,
+    )
+    dirty |= changed
+    _tooltip(
+        "Extra multiplier for scroll and trackpad gestures only, on top of the\n"
+        "three above. A trackpad reports a gesture as a stream of small deltas\n"
+        "and a wheel reports whole notches, so the speed that suits one is\n"
+        "usually wrong for the other. Turn this down if two-finger orbiting\n"
+        "overshoots."
+    )
+
+    changed, nav.smoothing = imgui.slider_float(
+        "Smoothing", nav.smoothing, 0.0, 1.0, "%.2f"
+    )
+    dirty |= changed
+    _tooltip(
+        "Moves the view at the speed of the gesture, rather than in the steps\n"
+        "the trackpad reports.\n\n"
+        "macOS reports scrolling a pixel of finger travel at a time. Move\n"
+        "slowly and a pixel takes several frames to cross, so what arrives is a\n"
+        "run of nothing punctuated by a step -- the view sticks, then hops.\n"
+        "This measures how fast the steps are arriving and moves that much each\n"
+        "frame instead, which costs about one step of delay at a crawl and\n"
+        "nothing at all once the steps arrive every frame.\n\n"
+        "1.00 follows the gesture exactly; lower runs ahead of it, and 0 applies\n"
+        "each step whole the moment it lands. Mouse dragging is never smoothed."
+    )
+
+    changed, nav.invert_orbit_x = imgui.checkbox("Invert orbit X", nav.invert_orbit_x)
+    dirty |= changed
+    imgui.same_line()
+    changed, nav.invert_orbit_y = imgui.checkbox("Invert orbit Y", nav.invert_orbit_y)
+    dirty |= changed
+    _tooltip("For natural-scrolling trackpads, or simple preference.")
+
+    if imgui.button("Reset navigation"):
+        app.navigation = type(nav)()
+        dirty = True
+
+    if dirty:
+        app.apply_navigation()
+
     imgui.separator_text("Interface")
     changed, requested = imgui.slider_float("UI scale", app.ui_scale, 0.6, 3.0, "%.2fx")
     if changed:
         app.set_ui_scale(requested)
     _tooltip("Size of this panel and its text. Remembered between launches.")
 
+    imgui.text_colored(MUTED_COLOR, "Settings are saved between launches.")
     imgui.pop_item_width()
-    imgui.end()
 
 
 def _draw_bake_controls(app: "MeshMapApp") -> None:
@@ -354,6 +460,10 @@ def _draw_map_inspector(app: "MeshMapApp") -> None:
     )
     imgui.set_next_window_size(imgui.ImVec2(width, 460 * scale), imgui.Cond_.first_use_ever)
     expanded, app.show_map_inspector = imgui.begin("Map inspector", app.show_map_inspector)
+
+    # Hand the axis gizmo this window's real rect so it can stay clear of it.
+    position, size = imgui.get_window_pos(), imgui.get_window_size()
+    app._inspector_rect = (position.x, position.y, size.x, size.y)
 
     if expanded:
         mode = PREVIEW_MODES[app.preview_index]

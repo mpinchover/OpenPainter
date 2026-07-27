@@ -206,4 +206,7 @@ class MeshInfo:
     uv_density: float = 0.0
     """UV units per metre of surface. Times the resolution gives texels per
     metre, which is what decides whether a bevel is wide enough to bake."""
+    to_world: Any = None
+    """The 4x4 that took the source into the app's Z-up world, or the identity.
+    Invert it to speak the source file's own coordinates again."""
     notes: list[str] = field(default_factory=list)

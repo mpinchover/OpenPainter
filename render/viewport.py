@@ -18,12 +18,14 @@ import trimesh
 from imgui_bundle import imgui
 from moderngl_window.scene.camera import OrbitCamera
 
-from core.export import export_maps, export_textured_obj
+from core.export import export_maps
 from core.mesh_io import SUPPORTED_SUFFIXES, MeshLoadError, load_mesh
 from core.params import BevelParams, EdgeWearParams, MeshInfo
 from core.pipeline import BakeController
 from render.imgui_renderer import ImGuiRenderer
 from render.shaders import load_shader
+from render.trackpad import install_pinch_zoom
+from ui import gizmo
 from ui.panel import draw_panel
 
 THUMBNAIL_SIZE = 384
@@ -66,20 +68,93 @@ def _settings_dir() -> Path:
     return directory
 
 
-def _load_ui_scale(default: float) -> float:
-    """Read the persisted UI scale, falling back to ``default``."""
+def _load_prefs() -> dict:
+    """Read the saved preferences. Anything unreadable falls back to defaults."""
     try:
         stored = json.loads((_settings_dir() / "prefs.json").read_text())
-        return float(np.clip(float(stored["ui_scale"]), 0.6, 3.0))
+        return stored if isinstance(stored, dict) else {}
     except Exception:
-        return default
+        return {}
 
 
-def _save_ui_scale(value: float) -> None:
+def _save_prefs(values: dict) -> None:
     try:
-        (_settings_dir() / "prefs.json").write_text(json.dumps({"ui_scale": round(value, 3)}))
+        (_settings_dir() / "prefs.json").write_text(json.dumps(values, indent=2))
     except OSError:
         pass  # a read-only home directory is not worth failing over
+
+
+@dataclass
+class NavigationPrefs:
+    """How fast the viewport responds, and which way round.
+
+    Every speed is a plain multiplier on a base rate, so 1.0 is the reference
+    behaviour and the numbers stay meaningful: orbit's base is Blender's own
+    0.4 degrees per pixel.
+    """
+
+    orbit_speed: float = 1.0
+    pan_speed: float = 1.0
+    zoom_speed: float = 1.0
+    scroll_speed: float = 1.0
+    """Applies on top of orbit/pan/zoom, but only for scroll and trackpad
+    gestures -- a trackpad's deltas are nothing like a wheel's, and one is
+    usually far too fast when the other feels right."""
+
+    smoothing: float = 1.0
+    """How closely scroll output follows the *rate* of the input, 0 to 1.
+
+    This exists because of the resolution macOS reports trackpad scrolling at.
+    A scroll event carries its delta in ``NSEvent``'s fixed-point field --
+    pyglet's ``deltaY`` (``pyglet/window/cocoa/pyglet_view.py``,
+    ``getMouseDelta``) -- in units of a tenth of a point, one step per pixel the
+    fingers travel. Move slowly and a pixel takes several frames to cross, so
+    what arrives is a run of zeros punctuated by a step. Nothing downstream can
+    invent the motion in between; all it can do is not present a step as though
+    it happened in one frame.
+
+    At 0 each step is applied whole, the moment it lands. At 1
+    :meth:`MeshMapApp._drain_scroll` moves at exactly the speed the steps are
+    arriving, so a sparse run of them leaves as steady motion; in between it
+    runs proportionally ahead of that speed.
+
+    Rate-following, not damping. A fast gesture has a fast rate and drains the
+    frame it arrives, the delay at a crawl is about one step -- and it shrinks
+    to nothing as the gesture speeds up, because the steps come closer together
+    -- and the total travel is identical at every setting.
+
+    Never applied to a mouse drag, which reports genuine per-pixel floats.
+    """
+
+    invert_orbit_x: bool = False
+    invert_orbit_y: bool = False
+
+    FIELDS = ("orbit_speed", "pan_speed", "zoom_speed", "scroll_speed",
+              "smoothing", "invert_orbit_x", "invert_orbit_y")
+
+    def as_dict(self) -> dict:
+        return {
+            name: (round(value, 4) if isinstance(value, float) else value)
+            for name, value in ((field, getattr(self, field)) for field in self.FIELDS)
+        }
+
+    @classmethod
+    def from_dict(cls, stored: dict) -> "NavigationPrefs":
+        prefs = cls()
+        for field in cls.FIELDS:
+            if field not in stored:
+                continue
+            try:
+                current = getattr(prefs, field)
+                if isinstance(current, bool):
+                    setattr(prefs, field, bool(stored[field]))
+                elif field == "smoothing":
+                    setattr(prefs, field, float(np.clip(float(stored[field]), 0.0, 1.0)))
+                else:
+                    setattr(prefs, field, float(np.clip(float(stored[field]), 0.05, 5.0)))
+            except (TypeError, ValueError):
+                pass  # keep the default for anything malformed
+        return prefs
 
 
 #: Style fields that are not pixel dimensions and must never be scaled:
@@ -139,50 +214,245 @@ def _mat_bytes(matrix: glm.mat4) -> bytes:
     return np.array(matrix.to_list(), dtype="f4").tobytes()
 
 
-class PanOrbitCamera(OrbitCamera):
-    """OrbitCamera plus panning, and a zoom that suits any mesh scale.
+#: Degrees of orbit per pixel of drag. Blender's own default, from
+#: ``DNA_userdef_types.h``: ``view_rotate_sensitivity_turntable = DEG2RAD(0.4)``.
+_ORBIT_PER_PIXEL = 0.4
+#: Pixels of equivalent drag per unit of scroll. A trackpad reports a gesture as
+#: many small deltas, and macOS adds a momentum tail, so this converts to the
+#: same units the drag path uses rather than being a second sensitivity.
+_PIXELS_PER_SCROLL = 12.0
+#: Largest single event honoured, as a teleport guard only -- see
+#: ``_TELEPORT_NOTE``. Both sit far beyond anything a hand produces, because a
+#: threshold tight enough to shape normal input is felt as a speed ceiling.
+_MAX_SCROLL_STEP = 120.0
+_MAX_DRAG_STEP = 2000.0
+#: Scroll units per unit of pinch magnification. NSEvent reports a pinch as an
+#: incremental change in scale, so a whole-hand spread totals around 1.0; at 8
+#: units that is roughly a 2.5x change in viewing distance, which puts the
+#: gesture in the same place it lands in Blender.
+_SCROLL_PER_MAGNIFICATION = 8.0
+#: How quickly the arrival-rate estimate follows a change in gesture speed,
+#: per event. Rising is followed harder than falling: lagging an acceleration
+#: is felt as the view dragging behind the hand, while chasing every wobble
+#: downward would put back the unevenness this is here to remove.
+_RATE_BLEND_UP = 0.3
+_RATE_BLEND_DOWN = 0.2
+#: Longest the buffer may hold input, in frames. The backstop for a rate
+#: estimate that has drifted low; at 60 Hz this is about an eighth of a second.
+_DRAIN_LIMIT_FRAMES = 8.0
+#: Frames of silence that end a gesture, after which the rate estimate is
+#: forgotten. Comfortably longer than the gap between steps in even a crawl, so
+#: it cannot fire in the middle of one.
+_GESTURE_END_FRAMES = 15
+#: Teleport guard for a single pinch event, in magnification -- see
+#: ``_TELEPORT_NOTE``. Real events are hundredths; this only catches a gesture
+#: interrupted by the window losing and regaining the pointer.
+_MAX_PINCH_STEP = 1.0
 
-    The stock ``zoom_state`` is additive and clamps the radius at 1.0, which
-    makes it useless for a 5cm bolt or a 40m building. This one is
-    multiplicative and clamps relative to the subject.
+_TELEPORT_NOTE = """
+These guards exist for one case: the pointer leaving the window and re-entering
+while a button is held, which arrives as a single delta spanning the whole gap.
+
+They are deliberately huge, and they *clamp* rather than discard. Earlier values
+of 6.0 and 250 px were small enough to catch real gestures -- a quick trackpad
+flick exceeds 6.0, and a fast drag on a frame where rendering hitched exceeds
+250 px. Capping the scroll put a ceiling on flick speed, and discarding the drag
+froze the view for that frame. Both read as the view sticking or snapping.
+"""
+#: World up. Z, matching Blender -- imports are rotated into this convention by
+#: ``_axis_fix`` in :mod:`core.mesh_io`, so the axis names here mean what they
+#: mean in Blender.
+_WORLD_UP = (0.0, 0.0, 1.0)
+#: The default view, as the direction the camera *looks* along. Negated, it puts
+#: the eye front-right-above at (+X, -Y, +Z) -- Blender's startup view, 30
+#: degrees above the horizon.
+_HOME_FORWARD = (-0.6124, 0.6124, -0.5)
+
+
+class PanOrbitCamera(OrbitCamera):
+    """A turntable camera, matching Blender's orbit, plus pan and ortho views.
+
+    Three departures from the stock ``OrbitCamera``:
+
+    **Turntable orbit.** Orientation is a quaternion, and :meth:`orbit` is a
+    port of the non-trackball branch of Blender's ``viewrotate_apply``
+    (``view3d_navigate_view_rotate.cc``): horizontal motion spins about world
+    up, vertical motion pitches about the screen horizon. Because yaw is always
+    about the *same world axis*, the horizon stays level no matter how you get
+    there -- which is what a trackball cannot promise, and what makes a
+    trackball feel like it is fighting you. The stock ``rot_state`` clamps its
+    polar angle to ``[-175, -5]`` degrees instead, so it can never look straight
+    down; nothing here clamps, and Blender's horizon blend (below) is what keeps
+    the poles well-behaved without one.
+
+    **Orthographic views.** Aligning to an axis switches to ortho, mirroring
+    Blender's Auto Perspective; orbiting away switches back.
+
+    **Scale-aware zoom.** Multiplicative and clamped relative to the subject.
+    The stock one is additive with a floor of 1.0, useless for a 5 cm bolt or a
+    40 m building.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.subject_scale = 1.0
         self.pan_sensitivity = 1.0
+        self.orthographic = False
+        self.orientation = self._home_orientation()
+
+    @staticmethod
+    def _home_orientation() -> glm.quat:
+        return glm.quatLookAt(
+            glm.normalize(glm.vec3(*_HOME_FORWARD)), glm.vec3(*_WORLD_UP)
+        )
+
+    def _axes(self) -> tuple[glm.vec3, glm.vec3, glm.vec3]:
+        """The camera's own right / up / forward, in world space."""
+        rotation = glm.mat3_cast(self.orientation)
+        return (
+            rotation * glm.vec3(1.0, 0.0, 0.0),
+            rotation * glm.vec3(0.0, 1.0, 0.0),
+            rotation * glm.vec3(0.0, 0.0, -1.0),
+        )
 
     @property
     def eye(self) -> glm.vec3:
-        angle_x = glm.radians(self.angle_x)
-        angle_y = glm.radians(self.angle_y)
-        return glm.vec3(
-            glm.cos(angle_x) * glm.sin(angle_y) * self.radius + self.target[0],
-            glm.cos(angle_y) * self.radius + self.target[1],
-            glm.sin(angle_x) * glm.sin(angle_y) * self.radius + self.target[2],
-        )
+        return self.target - self._axes()[2] * self.radius
 
-    def _basis(self) -> tuple[glm.vec3, glm.vec3]:
-        forward = glm.normalize(self.target - self.eye)
-        right = glm.normalize(glm.cross(forward, self.up))
-        return right, glm.normalize(glm.cross(right, forward))
+    @property
+    def matrix(self) -> glm.mat4:
+        _, up, forward = self._axes()
+        position = self.target - forward * self.radius
+        # The base class tracks this for anything that asks the camera where it
+        # is; keep it in step even though the view matrix is built here.
+        self.set_position(*position)
+        return glm.lookAt(position, self.target, up)
+
+    @property
+    def projection_matrix(self) -> glm.mat4:
+        """Perspective, or an ortho box framing the same subject."""
+        if not self.orthographic:
+            return self.projection.matrix
+        # Match the height the perspective view covers at the target, so
+        # toggling projection does not appear to change the zoom level.
+        half_height = self.radius * float(
+            np.tan(np.radians(self.projection.fov * 0.5))
+        )
+        half_width = half_height * self.projection.aspect_ratio
+        depth = self.radius + self.subject_scale * 1.5
+        # An ortho box distributes depth linearly, so it can start behind the
+        # target without costing any precision.
+        return glm.ortho(-half_width, half_width, -half_height, half_height,
+                         -depth, depth)
+
+    def _pitch_axis(self) -> glm.vec3:
+        """The screen horizon to pitch about, per Blender's gimbal-lock blend.
+
+        Straight from ``viewrotate_apply``. Two candidate axes:
+
+        ``cross(world_up, back)`` is the true turntable horizon -- horizontal in
+        world terms -- but it collapses to nothing at the poles, where ``back``
+        and ``world_up`` are parallel.
+
+        The camera's own right axis never collapses, but on its own it lets the
+        turntable gimbal-lock: with the view rolled 90 degrees, pitching and
+        yawing become the same motion and there is no way out.
+
+        Blending between them by how close the view is to a pole gets both
+        properties. ``fac`` reaches 1 at either pole -- where the camera's right
+        axis is the only usable answer -- and 0 at the equator, where the world
+        horizon is exactly right. Squaring biases the blend toward the world
+        horizon, so ordinary orbiting is a true turntable and the correction
+        only appears near the poles.
+        """
+        right, _, back = self._axes()
+        world_up = glm.vec3(*_WORLD_UP)
+
+        horizon = glm.cross(world_up, back)
+        if glm.length(horizon) < 1e-6:
+            return right
+        if glm.dot(horizon, right) < 0.0:
+            horizon = -horizon
+
+        fraction = float(np.arccos(np.clip(glm.dot(world_up, back), -1.0, 1.0)) / np.pi)
+        blend = abs(fraction - 0.5) * 2.0
+        blend *= blend
+        return glm.normalize(glm.mix(glm.normalize(horizon), right, blend))
+
+    def orbit(self, dx: float, dy: float) -> None:
+        """Turntable-orbit by ``dx``/``dy`` degrees.
+
+        ``dx`` spins about world up and ``dy`` pitches about the screen horizon.
+        Both are world-space axes, so they pre-multiply the camera's
+        orientation.
+        """
+        _, up, _ = self._axes()
+        # Blender's `vod->reverse`: once the view is upside down, dragging right
+        # should still swing the subject the same way it looks like it should.
+        reverse = -1.0 if glm.dot(up, glm.vec3(*_WORLD_UP)) < 0.0 else 1.0
+
+        yaw = glm.angleAxis(glm.radians(float(dx) * reverse), glm.vec3(*_WORLD_UP))
+        pitch = glm.angleAxis(glm.radians(float(dy)), self._pitch_axis())
+        self.orientation = glm.normalize(yaw * pitch * self.orientation)
+
+        # Any orbit means the view is no longer axis-aligned, so Blender's Auto
+        # Perspective hands perspective back.
+        self.orthographic = False
+
+    def rot_state(self, dx: float, dy: float) -> None:
+        """Orbit from a mouse drag, in pixels."""
+        scale = self.mouse_sensitivity * _ORBIT_PER_PIXEL
+        self.orbit(dx * scale, dy * scale)
+
+    def align_to_axis(self, axis: tuple[float, float, float]) -> None:
+        """Look down ``axis`` in orthographic projection, as Blender's gizmo does.
+
+        ``axis`` points from the target toward the new eye, so ``(0, 0, 1)`` is
+        the top view.
+        """
+        direction = glm.normalize(glm.vec3(*axis))
+        world_up = glm.vec3(*_WORLD_UP)
+        if abs(glm.dot(direction, world_up)) > 0.999:
+            # Straight up or down leaves roll unconstrained. Blender's top view
+            # puts +Y up the screen, and the bottom view mirrors it.
+            along = 1.0 if glm.dot(direction, world_up) > 0.0 else -1.0
+            hint = glm.vec3(0.0, 1.0, 0.0) * along
+        else:
+            hint = world_up
+        self.orientation = glm.quatLookAt(-direction, hint)
+        self.orthographic = True
 
     def pan(self, dx: float, dy: float) -> None:
-        right, up = self._basis()
+        right, up, _ = self._axes()
         step = self.radius * 0.0018 * self.pan_sensitivity
         self.target = self.target + (-right * float(dx) + up * float(dy)) * step
 
     def zoom_state(self, y_offset: float) -> None:
         self.radius *= float(np.exp(-y_offset * 0.12 * self._zoom_sensitivity))
         self.radius = float(np.clip(self.radius, self.subject_scale * 0.02, self.subject_scale * 60.0))
+        self._update_clip()
+
+    def _update_clip(self) -> None:
+        """Fit the depth range to where the subject actually is.
+
+        A perspective depth buffer spends its precision near the near plane, so
+        a near plane much closer than it needs to be starves the subject of
+        resolution and coplanar surfaces start flickering against each other as
+        the view moves. Tracking the eye distance keeps ``far / near`` in the
+        low hundreds at every zoom level instead of the 40,000 a fixed pair gave.
+        """
+        reach = self.subject_scale * 0.75
+        near = max(self.radius - reach, self.radius * 0.01, 1e-6)
+        self.projection.update(near=near, far=near + reach * 4.0 + self.radius)
 
     def frame(self, center, scale: float) -> None:
-        """Point the camera at a subject of the given size."""
+        """Point the camera at a subject of the given size, upright again."""
         self.subject_scale = max(float(scale), 1e-6)
         self.target = glm.vec3(*[float(v) for v in center])
         self.radius = self.subject_scale * 1.5
-        self.angle_x, self.angle_y = 45.0, -60.0
-        self.projection.update(near=self.subject_scale * 0.005, far=self.subject_scale * 200.0)
+        self.orientation = self._home_orientation()
+        self.orthographic = False
+        self._update_clip()
 
 
 class MeshMapApp(mglw.WindowConfig):
@@ -224,20 +494,48 @@ class MeshMapApp(mglw.WindowConfig):
         self.lighting = True
         self.checker_scale = 24.0
         self.wireframe = False
-        self.z_up_import = bool(self.initial_z_up)
+        self.source_z_up = bool(self.initial_z_up)
         self.export_dir = str(Path.cwd() / "output")
         self.export_bits = 8
         self.show_map_inspector = True
+        self.show_gizmo = True
         self.status = "Drop an FBX onto the window, or click 'Open mesh...'."
         self.status_is_error = False
         self.file_dialog = None
         self.folder_dialog = None
 
-        self.ui_scale = (
-            self.initial_ui_scale
-            if self.initial_ui_scale_explicit
-            else _load_ui_scale(self.initial_ui_scale)
-        )
+        self._mouse: tuple[float, float] = (0.0, 0.0)
+        #: Rect the Map inspector occupied last frame, so the gizmo can dodge it.
+        self._inspector_rect: Optional[tuple[float, float, float, float]] = None
+        #: What the in-flight drag belongs to: "camera", "gizmo", "ui" or None.
+        #: Latched on press so a gesture cannot change hands halfway through.
+        self._drag_owner: Optional[str] = None
+
+        #: Scroll input waiting to be applied, drained a share per frame by
+        #: :meth:`_drain_scroll`.
+        self._pending_orbit = [0.0, 0.0]
+        self._pending_pan = [0.0, 0.0]
+        self._pending_zoom = 0.0
+        #: Input that landed since the last frame, and the running average of
+        #: it, which is what :meth:`_drain_scroll` paces the camera by.
+        self._scroll_arrived = 0.0
+        self._scroll_rate = 0.0
+        self._scroll_idle = 0
+        self._scroll_gaps = 0
+        #: Last known keyboard modifiers. pyglet clears them on scroll events,
+        #: so scroll reads this rather than ``wnd.modifiers``.
+        self._modifiers = self.wnd.modifiers
+
+        self._prefs = _load_prefs()
+        self.navigation = NavigationPrefs.from_dict(self._prefs.get("navigation", {}))
+
+        stored_scale = self._prefs.get("ui_scale")
+        self.ui_scale = self.initial_ui_scale
+        if not self.initial_ui_scale_explicit and stored_scale is not None:
+            try:
+                self.ui_scale = float(np.clip(float(stored_scale), 0.6, 3.0))
+            except (TypeError, ValueError):
+                pass
         # Snapshot before the first scale is applied, so the baseline is pristine.
         self._style_defaults = snapshot_style()
         self.apply_ui_scale()
@@ -294,7 +592,16 @@ class MeshMapApp(mglw.WindowConfig):
             target=(0.0, 0.0, 0.0), radius=3.0, aspect_ratio=self.wnd.aspect_ratio,
             fov=50.0, near=0.01, far=1000.0,
         )
-        self.camera.mouse_sensitivity = 3.0
+        # 1.0 leaves _ORBIT_PER_PIXEL alone, which is Blender's own rate. This
+        # used to be 3.0, left over from the stock OrbitCamera's rot_state, which
+        # divided by 10 internally; once that was replaced the 3.0 was no longer
+        # being cancelled and the viewport orbited at three times Blender's speed.
+        self.camera.mouse_sensitivity = 1.0
+        self._apply_navigation()
+
+        #: True once the macOS pinch gesture is wired up; False everywhere else,
+        #: where a pinch never reaches the process at all.
+        self.pinch_zoom = install_pinch_zoom(self.wnd, self.on_pinch_zoom)
 
         if self.initial_mesh:
             self.open_mesh(self.initial_mesh)
@@ -319,13 +626,29 @@ class MeshMapApp(mglw.WindowConfig):
     def set_ui_scale(self, value: float) -> None:
         self.ui_scale = float(np.clip(value, 0.6, 3.0))
         self.apply_ui_scale()
-        _save_ui_scale(self.ui_scale)
+        self.save_prefs()
+
+    def apply_navigation(self) -> None:
+        """Push the navigation preferences onto the camera, and remember them."""
+        self._apply_navigation()
+        self.save_prefs()
+
+    def _apply_navigation(self) -> None:
+        self.camera.mouse_sensitivity = self.navigation.orbit_speed
+        self.camera.pan_sensitivity = self.navigation.pan_speed
+        self.camera.zoom_sensitivity = self.navigation.zoom_speed
+
+    def save_prefs(self) -> None:
+        """Persist the interface and navigation settings."""
+        self._prefs["ui_scale"] = round(self.ui_scale, 3)
+        self._prefs["navigation"] = self.navigation.as_dict()
+        _save_prefs(self._prefs)
 
     # -- mesh loading -----------------------------------------------------
 
     def open_mesh(self, path: str | Path) -> None:
         try:
-            mesh, info = load_mesh(path, z_up=self.z_up_import)
+            mesh, info = load_mesh(path, source_z_up=self.source_z_up)
         except MeshLoadError as exc:
             self.set_status(str(exc), error=True)
             return
@@ -515,7 +838,7 @@ class MeshMapApp(mglw.WindowConfig):
         (texture or self._blank_texture).use(0)
 
         view = self.camera.matrix
-        mvp = self.camera.projection.matrix * view
+        mvp = self.camera.projection_matrix * view
 
         self.preview_program["u_mvp"].write(_mat_bytes(mvp))
         self.preview_program["u_mode"].value = mode.shader_mode
@@ -533,6 +856,7 @@ class MeshMapApp(mglw.WindowConfig):
     # -- moderngl-window hooks --------------------------------------------
 
     def on_render(self, time: float, frame_time: float) -> None:
+        self._drain_scroll()
         self.controller.pump()
         self._sync_bake_outputs()
 
@@ -545,6 +869,9 @@ class MeshMapApp(mglw.WindowConfig):
 
         imgui.new_frame()
         draw_panel(self)
+        if self.show_gizmo and self.mesh is not None:
+            gizmo.draw(self.camera, self._gizmo_center(), self.ui_pixel_scale,
+                       self._mouse)
         imgui.render()
         self.gui.render(imgui.get_draw_data())
 
@@ -565,6 +892,7 @@ class MeshMapApp(mglw.WindowConfig):
 
     def on_key_event(self, key, action, modifiers) -> None:
         self.gui.key_event(key, action, modifiers)
+        self._modifiers = modifiers
         if imgui.get_io().want_capture_keyboard:
             return
 
@@ -599,24 +927,59 @@ class MeshMapApp(mglw.WindowConfig):
 
     def on_mouse_position_event(self, x: int, y: int, dx: int, dy: int) -> None:
         self.gui.mouse_position_event(x, y, dx, dy)
+        self._mouse = (float(x), float(y))
+        self._modifiers = self.wnd.modifiers
 
     def on_mouse_press_event(self, x: int, y: int, button: int) -> None:
         self.gui.mouse_press_event(x, y, button)
+        self._mouse = (float(x), float(y))
+        self._modifiers = self.wnd.modifiers
+
+        # Decide once, here, what this gesture is for. Deciding per-event instead
+        # lets a drag that began on a slider grab the camera the moment the
+        # pointer leaves the panel, which is a jarring jump mid-drag.
+        if imgui.get_io().want_capture_mouse:
+            self._drag_owner = "ui"
+            return
+
+        if button == self.wnd.mouse.left and self.mesh is not None:
+            target = gizmo.pick(self.camera, self._gizmo_center(), self.ui_pixel_scale,
+                                self._mouse)
+            if target is not None:
+                self.camera.align_to_axis(target.axis)
+                self._drag_owner = "gizmo"
+                self.set_status(
+                    f"{'+' if target.positive else '-'}{gizmo._LABELS[target.index]} "
+                    f"orthographic view"
+                )
+                return
+            if gizmo.hit_test(self._gizmo_center(), self.ui_pixel_scale, self._mouse):
+                self._drag_owner = "gizmo"
+                return
+
+        self._drag_owner = "camera"
 
     def on_mouse_release_event(self, x: int, y: int, button: int) -> None:
         self.gui.mouse_release_event(x, y, button)
+        self._drag_owner = None
 
     def on_mouse_drag_event(self, x: int, y: int, dx: int, dy: int) -> None:
         self.gui.mouse_drag_event(x, y, dx, dy)
-        if imgui.get_io().want_capture_mouse:
+        self._mouse = (float(x), float(y))
+        if self._drag_owner != "camera":
             return
+
+        # Clamp, never discard: dropping the event stalls the view for a frame,
+        # which is exactly what a fast flick feels like it should not do.
+        dx = float(np.clip(dx, -_MAX_DRAG_STEP, _MAX_DRAG_STEP))
+        dy = float(np.clip(dy, -_MAX_DRAG_STEP, _MAX_DRAG_STEP))
 
         states = self.wnd.mouse_states
         panning = states.middle or (states.left and self.wnd.modifiers.shift)
         if panning:
             self.camera.pan(dx, dy)
         elif states.left:
-            self.camera.rot_state(-dx, -dy)
+            self.camera.rot_state(*self._orbit_deltas(-dx, -dy))
         elif states.right:
             self.camera.zoom_state(-dy * 0.25)
 
@@ -624,7 +987,202 @@ class MeshMapApp(mglw.WindowConfig):
         self.gui.mouse_scroll_event(x_offset, y_offset)
         if imgui.get_io().want_capture_mouse:
             return
-        self.camera.zoom_state(y_offset)
+
+        # Blender's own trackpad bindings for the 3D viewport, from
+        # blender_default.py: TRACKPADPAN orbits, +shift pans, +ctrl zooms, and a
+        # pinch (TRACKPADZOOM) zooms. macOS delivers a pinch as ctrl+scroll, so
+        # the ctrl branch covers both.
+        x_offset = float(np.clip(x_offset, -_MAX_SCROLL_STEP, _MAX_SCROLL_STEP))
+        y_offset = float(np.clip(y_offset, -_MAX_SCROLL_STEP, _MAX_SCROLL_STEP))
+
+        # Scroll gets its own speed on top of the per-action ones: a trackpad's
+        # deltas are nothing like a wheel's, so one is usually far too fast when
+        # the other is right.
+        step = _PIXELS_PER_SCROLL * self.navigation.scroll_speed
+
+        # pyglet wipes the modifier state on every scroll event
+        # (``_handle_modifiers(0)`` in its moderngl-window backend), so read the
+        # copy kept from the last key or button event instead.
+        modifiers = self._modifiers
+        if modifiers.ctrl or modifiers.alt:
+            self._queue_scroll(zoom=y_offset * self.navigation.scroll_speed)
+        elif modifiers.shift:
+            self._queue_scroll(pan=(x_offset * step, y_offset * step))
+        else:
+            # Same units and sign as a left-drag, so both gestures feel alike.
+            self._queue_scroll(
+                orbit=self._orbit_deltas(-x_offset * step, y_offset * step)
+            )
+
+    def on_pinch_zoom(self, magnification: float) -> None:
+        """A trackpad pinch, delivered by :mod:`render.trackpad`.
+
+        Fingers spreading apart is a positive magnification and zooms in, which
+        is the direction every other macOS app uses. It joins the same buffer as
+        scroll zoom, so a gesture that lands several events in one frame is
+        applied once, at the sum.
+        """
+        if imgui.get_io().want_capture_mouse:
+            return
+
+        magnification = float(np.clip(magnification, -_MAX_PINCH_STEP, _MAX_PINCH_STEP))
+        # scroll_speed applies here for the same reason it applies to scroll:
+        # this is a trackpad gesture, and the wheel's speed rarely suits it.
+        self._queue_scroll(
+            zoom=magnification * _SCROLL_PER_MAGNIFICATION * self.navigation.scroll_speed
+        )
+
+    def _queue_scroll(
+        self,
+        *,
+        orbit: tuple[float, float] = (0.0, 0.0),
+        pan: tuple[float, float] = (0.0, 0.0),
+        zoom: float = 0.0,
+    ) -> None:
+        """Buffer one gesture event for :meth:`_drain_scroll` to pace out."""
+        self._pending_orbit[0] += orbit[0]
+        self._pending_orbit[1] += orbit[1]
+        self._pending_pan[0] += pan[0]
+        self._pending_pan[1] += pan[1]
+        self._pending_zoom += zoom
+        # How much motion this event asked for, in the same mixed magnitude the
+        # drain measures the buffer in. Only its size matters, not its axis.
+        self._scroll_arrived += (
+            abs(orbit[0]) + abs(orbit[1]) + abs(pan[0]) + abs(pan[1]) + abs(zoom)
+        )
+
+    def _track_arrival_rate(self) -> None:
+        """Update :attr:`_scroll_rate`: input per frame, averaged over arrivals.
+
+        Measured as *one event divided by the frames since the last one*, not as
+        an average over every frame. That distinction is the whole trick. An
+        average taken every frame is pulled down by the empty ones and jerked
+        back up by each arrival, so it peaks the instant a step lands and sags
+        until the next -- pacing by it reproduces the very burst it is meant to
+        even out. A per-gap measurement holds flat between steps, which is what
+        makes the output flat.
+        """
+        arrived, self._scroll_arrived = self._scroll_arrived, 0.0
+
+        if arrived <= 0.0:
+            self._scroll_idle += 1
+            if self._scroll_idle > _GESTURE_END_FRAMES:
+                self._scroll_rate = 0.0  # gesture over; the next starts fresh
+                self._scroll_gaps = 0
+            return
+
+        gap, self._scroll_idle = self._scroll_idle + 1, 0
+        if self._scroll_gaps == 0:
+            # Nothing measured yet. Emit this one whole rather than pace it by
+            # a guess: at the start of a gesture that is felt as the view
+            # refusing to move, and one step is too small to read as a jump.
+            self._scroll_rate = arrived
+        elif self._scroll_gaps == 1:
+            self._scroll_rate = arrived / gap  # first real measurement, trusted
+        else:
+            sample = arrived / gap
+            # Rise faster than it falls. Speeding up is felt directly, as the
+            # view failing to keep up with the hand, so follow that quickly;
+            # the wobble in the gaps a hand produces is what the average is
+            # here to absorb, so give way to it slowly.
+            blend = _RATE_BLEND_UP if sample > self._scroll_rate else _RATE_BLEND_DOWN
+            self._scroll_rate += (sample - self._scroll_rate) * blend
+        self._scroll_gaps += 1
+
+    def _drain_scroll(self) -> None:
+        """Hand the accumulated scroll input to the camera, once per frame.
+
+        Scroll arrives a pixel at a time (see :attr:`NavigationPrefs.smoothing`),
+        so at low speed several frames pass with nothing and then one lands a
+        whole step. Applying each step as it arrives is what the chop is: the
+        view moves in bursts separated by stillness.
+
+        So don't emit what arrived -- emit how fast it is arriving.
+        :meth:`_track_arrival_rate` keeps that figure, and that much leaves the
+        buffer each frame, which turns a sparse run of steps into motion at the
+        speed of the fingers. The buffer holds about one
+        step's worth in hand to do it, so the view trails the gesture by roughly
+        the time between steps: a frame or two at slow speed, and less as the
+        gesture speeds up, since the steps arrive closer together.
+
+        Three things keep it honest. The first event of a gesture is emitted
+        whole, because there is no history to average yet and holding it back is
+        felt as the view refusing to start -- by the second or third step the
+        average has learned the speed and pacing takes over. A floor drains
+        whatever is waiting within :data:`_DRAIN_LIMIT_FRAMES` no matter how far
+        the estimate has drifted, so a low estimate costs a fraction of a step of
+        lag rather than a growing backlog. And nothing is ever added or dropped,
+        only moved between frames, so the view lands exactly where the gesture
+        asked.
+        """
+        smoothing = float(np.clip(self.navigation.smoothing, 0.0, 1.0))
+        pending = (
+            abs(self._pending_orbit[0]) + abs(self._pending_orbit[1])
+            + abs(self._pending_pan[0]) + abs(self._pending_pan[1])
+            + abs(self._pending_zoom)
+        )
+
+        self._track_arrival_rate()
+
+        if pending <= 1e-6:
+            return
+
+        if smoothing <= 0.0:
+            share = 1.0
+        else:
+            # One frame's worth of travel at the speed input is arriving. The
+            # preference divides in, so 1.0 paces exactly at the gesture's speed
+            # and lower values run proportionally ahead of it.
+            budget = self._scroll_rate / smoothing
+            # The floor: never sit on the buffer longer than
+            # _DRAIN_LIMIT_FRAMES, however far the estimate has drifted.
+            budget = max(budget, pending / _DRAIN_LIMIT_FRAMES)
+            share = float(np.clip(budget / pending, 0.0, 1.0))
+        # Never leave a tail dribbling for ever.
+        if pending < 0.05:
+            share = 1.0
+
+        if self._pending_orbit[0] or self._pending_orbit[1]:
+            self.camera.rot_state(
+                self._pending_orbit[0] * share, self._pending_orbit[1] * share
+            )
+            self._pending_orbit[0] *= 1.0 - share
+            self._pending_orbit[1] *= 1.0 - share
+        if self._pending_pan[0] or self._pending_pan[1]:
+            self.camera.pan(self._pending_pan[0] * share, self._pending_pan[1] * share)
+            self._pending_pan[0] *= 1.0 - share
+            self._pending_pan[1] *= 1.0 - share
+        if self._pending_zoom:
+            self.camera.zoom_state(self._pending_zoom * share)
+            self._pending_zoom *= 1.0 - share
+
+    def _orbit_deltas(self, dx: float, dy: float) -> tuple[float, float]:
+        """Apply the invert-axis preferences to an orbit delta."""
+        return (
+            -dx if self.navigation.invert_orbit_x else dx,
+            -dy if self.navigation.invert_orbit_y else dy,
+        )
+
+    def _gizmo_center(self) -> tuple[float, float]:
+        """Where to put the gizmo: top-right, but clear of the Map inspector.
+
+        The inspector's default home is the same corner. Rather than let them
+        overlap, tuck the gizmo just left of whatever the inspector actually
+        occupies -- read from ImGui after it draws, so moving or resizing the
+        window brings the gizmo along.
+        """
+        width = float(self.wnd.buffer_size[0])
+        reach = gizmo.radius(self.ui_pixel_scale)
+        margin = gizmo.MARGIN * self.ui_pixel_scale
+        right_edge = width
+
+        inspector = self._inspector_rect
+        if inspector is not None:
+            x, y, inspector_width, inspector_height = inspector
+            # Only dodge if it is actually in the way of the top-right corner.
+            if y <= margin + reach * 2.0 and x + inspector_width >= width - margin:
+                right_edge = x
+        return right_edge - reach - margin, margin + reach
 
     def on_close(self) -> None:
         self.controller.release()
@@ -643,18 +1201,9 @@ class MeshMapApp(mglw.WindowConfig):
         self.set_status("Baking...")
 
     def export(self) -> None:
-        self._export(include_obj=False)
-
-    def export_obj(self) -> None:
-        self._export(include_obj=True)
-
-    def _export(self, *, include_obj: bool) -> None:
         controller = self.controller
         if controller.curvature_map is None:
             self.set_status("Nothing baked yet - hit Bake first", error=True)
-            return
-        if include_obj and controller.unwrap_result is None:
-            self.set_status("No unwrapped mesh available - hit Bake first", error=True)
             return
         if self.output_fbo is None:
             self.set_status("No render target for the edge wear map", error=True)
@@ -673,25 +1222,11 @@ class MeshMapApp(mglw.WindowConfig):
         stem = Path(self.mesh_info.path).stem if self.mesh_info else "mesh"
         target = Path(self.export_dir) / stem
         try:
-            if include_obj:
-                written = export_textured_obj(
-                    target,
-                    stem,
-                    controller.unwrap_result,
-                    shaped,
-                    controller.curvature_map,
-                    bits=self.export_bits,
-                )
-            else:
-                written = export_maps(
-                    target,
-                    shaped,
-                    controller.curvature_map,
-                    bits=self.export_bits,
-                )
+            written = export_maps(
+                target, shaped, controller.curvature_map, bits=self.export_bits
+            )
         except Exception:
             self.set_status(traceback.format_exc(limit=3), error=True)
             return
 
-        kind = "textured OBJ package" if include_obj else f"{len(written)} maps"
-        self.set_status(f"Wrote {kind} to {target}")
+        self.set_status(f"Wrote {len(written)} maps to {target}")

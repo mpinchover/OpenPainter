@@ -1,8 +1,12 @@
-"""Writers for output maps and Blender-friendly textured OBJ packages.
+"""Writers for the output maps.
 
 Images are flipped vertically on write. Our textures store row 0 at v=0, while
 PNG stores row 0 at the top, so the flip is what makes the exported file line up
 with the same UVs in Blender, Substance or any other DCC.
+
+The maps are the whole product: they are baked into the mesh's own UV layout, so
+they apply directly to the model you exported from Blender. There is nothing
+else to ship alongside them.
 """
 
 from __future__ import annotations
@@ -11,8 +15,6 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-
-from .uv_unwrap import UnwrapResult
 
 #: The product: the EdgeWear001 mask.
 EDGE_WEAR_NAME = "edge_wear"
@@ -63,70 +65,3 @@ def export_maps(
         save_map(output_dir / f"{prefix}{name}.png", array, bits=bits)
         for name, array in zip(MAP_NAMES, arrays)
     ]
-
-
-def export_textured_obj(
-    output_dir: str | Path,
-    name: str,
-    mesh: UnwrapResult,
-    edge_wear: np.ndarray,
-    curvature: np.ndarray,
-    *,
-    bits: int = 8,
-) -> list[Path]:
-    """Write an OBJ, MTL, and its texture maps into one portable folder.
-
-    The unwrap result has one position, normal and UV for every exported vertex,
-    including xatlas' seam splits. Giving all three OBJ indices the same value
-    therefore preserves the exact atlas used by the bake.
-    """
-    output_dir = Path(output_dir).expanduser()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    safe_name = Path(name).stem or "mesh"
-    obj_path = output_dir / f"{safe_name}.obj"
-    mtl_path = output_dir / f"{safe_name}.mtl"
-    texture_paths = export_maps(
-        output_dir, edge_wear, curvature, bits=bits
-    )
-
-    material_name = f"{safe_name}_edge_wear"
-    obj_lines = [
-        f"# Exported by MeshMap\nmtllib {mtl_path.name}\n",
-        f"o {safe_name}\nusemtl {material_name}\ns 1\n",
-    ]
-    obj_lines.extend(
-        f"v {float(x):.9g} {float(y):.9g} {float(z):.9g}\n"
-        for x, y, z in mesh.vertices
-    )
-    obj_lines.extend(
-        f"vt {float(u):.9g} {float(v):.9g}\n" for u, v in mesh.uvs
-    )
-    obj_lines.extend(
-        f"vn {float(x):.9g} {float(y):.9g} {float(z):.9g}\n"
-        for x, y, z in mesh.normals
-    )
-    for face in mesh.faces:
-        indices = [int(index) + 1 for index in face]
-        obj_lines.append(
-            "f " + " ".join(f"{index}/{index}/{index}" for index in indices) + "\n"
-        )
-    obj_path.write_text("".join(obj_lines), encoding="utf-8")
-
-    mtl_path.write_text(
-        "\n".join(
-            (
-                "# Exported by MeshMap",
-                f"newmtl {material_name}",
-                "Ka 0 0 0",
-                "Kd 1 1 1",
-                "Ks 0 0 0",
-                "Ns 1",
-                "illum 1",
-                f"map_Kd {texture_paths[0].name}",
-                "",
-            )
-        ),
-        encoding="utf-8",
-    )
-    return [obj_path, mtl_path, *texture_paths]
