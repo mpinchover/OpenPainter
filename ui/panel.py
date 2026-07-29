@@ -27,6 +27,8 @@ if TYPE_CHECKING:  # pragma: no cover
 #: ui_pixel_scale, because ImGui is driven in physical pixels here.
 PANEL_WIDTH = 430
 INSPECTOR_WIDTH = 380
+#: Width of the clickable decal preview in the Decal tab.
+DECAL_THUMBNAIL = 92
 STATUS_BAR_HEIGHT = 34
 ERROR_COLOR = imgui.ImVec4(1.0, 0.45, 0.42, 1.0)
 MUTED_COLOR = imgui.ImVec4(0.62, 0.64, 0.68, 1.0)
@@ -34,6 +36,11 @@ WARN_COLOR = imgui.ImVec4(1.0, 0.78, 0.35, 1.0)
 
 MESH_FILTERS = [
     "Meshes", "*.fbx *.obj *.glb *.gltf *.stl *.ply *.dae *.3ds *.off",
+    "All files", "*",
+]
+
+DECAL_FILTERS = [
+    "Images", "*.png *.jpg *.jpeg *.tga *.tif *.tiff *.bmp *.exr",
     "All files", "*",
 ]
 
@@ -68,6 +75,10 @@ def _draw_parameters(app: "MeshMapApp") -> None:
         selected, _ = imgui.begin_tab_item("Bake")
         if selected:
             _draw_bake_tab(app)
+            imgui.end_tab_item()
+        selected, _ = imgui.begin_tab_item("Decal")
+        if selected:
+            _draw_decal_tab(app)
             imgui.end_tab_item()
         selected, _ = imgui.begin_tab_item("Settings")
         if selected:
@@ -320,15 +331,201 @@ def _draw_bake_tab(app: "MeshMapApp") -> None:
         app.export_bits = 8 if bit_index == 0 else 16
     _tooltip("Reach for 16-bit if you see banding in the gradients.")
 
-    ready = controller.curvature_map is not None
-    imgui.begin_disabled(not ready)
-    if imgui.button("Export edge_wear / curvature", imgui.ImVec2(-1, 0)):
+    baked = controller.curvature_map is not None
+    decal = app.decal_params.active()
+    names = [name for name, present in
+             (("edge_wear / curvature", baked), ("normal", decal)) if present]
+    imgui.begin_disabled(not names)
+    label = f"Export {' + '.join(names)}" if names else "Export"
+    if imgui.button(label, imgui.ImVec2(-1, 0)):
         app.export()
     _tooltip(
-        "Writes edge_wear.png and curvature.png. They apply to your original\n"
-        "mesh directly, because the bake used its own UV map."
+        "Writes edge_wear.png and curvature.png from the bake, and normal.png\n"
+        "for any decal. They apply to your original mesh directly, because both\n"
+        "use its own UV map."
     )
     imgui.end_disabled()
+
+    imgui.pop_item_width()
+
+
+def _draw_decal_tab(app: "MeshMapApp") -> None:
+    """Place an imported normal map into the mesh's UV layout.
+
+    Every control here is live: the composite is one full-screen pass over the
+    atlas, so the mesh in the viewport re-lights as the handle moves.
+    """
+    from render.viewport import PREVIEW_MODES  # local import avoids a cycle
+
+    scale = app.ui_pixel_scale
+    imgui.push_item_width(-170 * scale)
+
+    decal = app.decal_params
+    image = app.decal_image
+    dirty = False
+
+    if imgui.button("Import normal map..."):
+        app.decal_dialog = pfd.open_file("Import decal", str(Path.home()), DECAL_FILTERS)
+    _tooltip(
+        "A tangent-space normal map -- a scifi vent, a hatch, a panel seam.\n"
+        "A grayscale image is read as a height map and converted, since that is\n"
+        "the only reading of it that describes a surface."
+    )
+    if image is not None:
+        imgui.same_line()
+        if imgui.button("Clear"):
+            app.clear_decal()
+            image = None
+
+    if image is None:
+        imgui.text_colored(
+            MUTED_COLOR,
+            "No decal loaded.\n"
+            "The decal is stamped into the mesh's UV layout and exported as\n"
+            "normal.png, alongside the bake's own maps.",
+        )
+        imgui.pop_item_width()
+        return
+
+    width, height = image.size
+    origin = "height map, converted" if image.from_height else "normal map"
+
+    # The map itself, clickable: picking it up is the quickest way to place it,
+    # and pointing at the model beats reasoning about UV coordinates.
+    if app.tex_decal is not None:
+        thumbnail = DECAL_THUMBNAIL * scale
+        imgui.begin_group()
+        if imgui.image_button(
+            "##decal_pick",
+            imgui.ImTextureRef(app.tex_decal.glo),
+            imgui.ImVec2(thumbnail, thumbnail * height / max(width, 1)),
+        ):
+            app.begin_decal_placement()
+        _tooltip(
+            "Click to pick the decal up, then move the cursor over the mesh --\n"
+            "it follows the surface under it. Click again to drop it there.\n"
+            "Esc or right-click puts it back where it was."
+        )
+        imgui.end_group()
+        imgui.same_line()
+
+    imgui.begin_group()
+    imgui.text_colored(
+        MUTED_COLOR,
+        f"{Path(decal.path).name}\n{width} x {height}\n({origin})",
+    )
+    changed, decal.enabled = imgui.checkbox("Enabled", decal.enabled)
+    dirty |= changed
+    _tooltip("Off leaves the normal map flat, and stops normal.png being written.")
+    imgui.end_group()
+
+    if app.decal_placing:
+        imgui.text_colored(
+            WARN_COLOR, "Placing: click on the mesh to drop it, Esc to cancel"
+        )
+        if imgui.button("Cancel placement", imgui.ImVec2(-1, 0)):
+            app.end_decal_placement(keep=False)
+    else:
+        imgui.begin_disabled(app.mesh is None)
+        if imgui.button("Place on the mesh", imgui.ImVec2(-1, 0)):
+            app.begin_decal_placement()
+        imgui.end_disabled()
+        _tooltip(
+            "Point at the model instead of typing coordinates. The decal rides\n"
+            "the surface under the cursor; click to drop it, Esc to cancel."
+        )
+
+    imgui.begin_disabled(not decal.enabled)
+
+    imgui.separator_text("Depth")
+    changed, decal.intensity = imgui.slider_float(
+        "Height intensity", decal.intensity, 0.0, 4.0, "%.2f"
+    )
+    dirty |= changed
+    _tooltip(
+        "How deep the bump reads. This scales the surface slope the map\n"
+        "describes, not the stored vector, so 2.0 is genuinely twice as steep\n"
+        "instead of tipping the normal flat against the surface.\n"
+        "0 is flat, 1 is the map exactly as it was authored."
+    )
+
+    changed, decal.flip_green = imgui.checkbox("Flip green (DirectX)", decal.flip_green)
+    dirty |= changed
+    _tooltip(
+        "Tick for a map baked in DirectX convention (-Y). Everything here is\n"
+        "OpenGL (+Y up), which is what Blender expects. If the decal reads\n"
+        "inside-out -- raised where it should be recessed -- this is why."
+    )
+
+    imgui.separator_text("Placement  (UV space)")
+    changed, decal.scale = imgui.slider_float(
+        "Scale", decal.scale, 0.01, 1.0, "%.3f", imgui.SliderFlags_.logarithmic
+    )
+    dirty |= changed
+    _tooltip(
+        "Fraction of the atlas the decal spans across. Its height follows from\n"
+        "the image's own aspect ratio, so a wide vent stays wide."
+    )
+
+    changed, decal.center_u = imgui.slider_float("Position U", decal.center_u, 0.0, 1.0, "%.3f")
+    dirty |= changed
+    changed, decal.center_v = imgui.slider_float("Position V", decal.center_v, 0.0, 1.0, "%.3f")
+    dirty |= changed
+    _tooltip(
+        "Where the middle of the decal sits in the UV layout. Usually easier to\n"
+        "set by pointing: click the decal above, or 'Place on the mesh', and put\n"
+        "it where you want it on the model."
+    )
+
+    changed, decal.rotation = imgui.slider_float(
+        "Rotation", decal.rotation, -180.0, 180.0, "%.0f deg"
+    )
+    dirty |= changed
+
+    if imgui.button("Reset placement"):
+        blank = type(decal)()
+        decal.center_u, decal.center_v = blank.center_u, blank.center_v
+        decal.scale, decal.rotation = blank.scale, blank.rotation
+        dirty = True
+
+    imgui.end_disabled()
+
+    # Where it lands on the mesh, in the units the artist thinks in.
+    info = app.mesh_info
+    if info is not None and info.uv_density > 0.0:
+        span = decal.scale / info.uv_density
+        imgui.text_colored(
+            MUTED_COLOR, f"About {span:.3g} m across on the mesh at this scale"
+        )
+
+    imgui.separator_text("Preview")
+    decal_mode = next(
+        (index for index, mode in enumerate(PREVIEW_MODES) if mode.texture == "normal"),
+        None,
+    )
+    if decal_mode is not None and imgui.button("Show the normal map", imgui.ImVec2(-1, 0)):
+        app.preview_index = decal_mode
+        app._thumbnail_dirty = True
+    _tooltip(
+        "The composited map itself, as colour. The decal lights the mesh in\n"
+        "every other mode too, exactly as it will once exported."
+    )
+
+    imgui.text_colored(
+        MUTED_COLOR,
+        "Exported as normal.png with the other maps. The bake is not involved:\n"
+        "the decal is placed in UV space, so it needs no geometry pass.",
+    )
+    if info is not None and not info.has_uvs:
+        imgui.text_colored(
+            WARN_COLOR,
+            "! This mesh carries no UVs, so there is no layout to place into\n"
+            "  yet. Bake once to generate an atlas -- but that atlas fits only\n"
+            "  the OBJ this app exports, not your original mesh.",
+        )
+
+    if dirty:
+        app.mark_normal_dirty()
 
     imgui.pop_item_width()
 
@@ -522,3 +719,9 @@ def _pump_dialogs(app: "MeshMapApp") -> None:
         app.folder_dialog = None
         if selection:
             app.export_dir = selection
+
+    if app.decal_dialog is not None and app.decal_dialog.ready():
+        selection = app.decal_dialog.result()
+        app.decal_dialog = None
+        if selection:
+            app.open_decal(selection[0])

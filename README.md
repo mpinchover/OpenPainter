@@ -63,9 +63,48 @@ three or more beveled edges meet are fanned onto the corner sphere rather than
 Grid Filled, so the topology there differs. Since the geometry only ever feeds
 the bake, that costs a little accuracy in the corner falloff and nothing else.
 
-**Export** writes `edge_wear.png` and `curvature.png`, and that is the whole
-product — they address your original mesh through its own UV map, so there is
-nothing to ship alongside them.
+**Export** writes `edge_wear.png` and `curvature.png`, plus `normal.png` if a
+decal is placed — they address your original mesh through its own UV map, so
+there is nothing to ship alongside them.
+
+### Decals
+
+The **Decal** tab stamps an imported normal map into the mesh — a scifi vent, a
+hatch, a panel seam. Import a tangent-space normal map (a grayscale image is
+read as a height map and converted, since that is the only reading of it that
+describes a surface), and it composites into an atlas-wide normal map exported
+as `normal.png`. Plug that into a Normal Map node; everywhere outside the decal
+it is flat `(0.5, 0.5, 1.0)` and changes nothing.
+
+**Place it by pointing at the model.** Click the decal preview in the panel (or
+*Place on the mesh*) and it picks the decal up: it then rides the surface under
+the cursor, following it across the model as you move, and a click drops it
+there. `Esc` or a right-click puts it back where it was. Under the hood the
+cursor becomes a ray, the ray hits a triangle, and that triangle's own UVs are
+interpolated at the hit — so what you point at is what the decal is placed on,
+in perspective or in an orthographic axis view alike. Two-finger orbiting still
+works while placing, so you can turn the model to reach the far side.
+
+The placement itself is stated in UV space — **Position U/V**, **Scale** (the
+fraction of the atlas it spans across, with its height following the image's
+aspect) and **Rotation** — and the sliders stay live for nudging afterwards.
+Substance Painter projects through a 3D gizmo instead; for anything with a sane
+UV layout these come to the same thing, and the *UV checker* preview shows which
+part of the mesh a given placement lands on.
+
+**Height intensity** scales the *slope* the map describes, `xy/z`, rather than
+the stored vector. That is what makes 2.0 genuinely twice as steep: scaling the
+vector instead runs the normal flat against the surface and then past it, which
+reads as the bump inverting rather than deepening. **Flip green** is there for a
+map baked DirectX-style (−Y); everything here is OpenGL (+Y up), which is what
+Blender expects.
+
+None of it involves the bake. The decal is placed in UV space, so it needs no
+geometry pass behind it: import, place, export, with no mesh baked at all if the
+normal map is all you want. The mesh in the viewport lights through the decal as
+you drag the sliders, using a tangent frame derived per pixel from the
+derivatives of position and UV — so it reads correctly on any mesh the app can
+load, without a tangent attribute.
 
 `--auto-unwrap` (or *Bake into source UVs* in Advanced bake settings) turns the
 source-UV path off and lets xatlas invent an atlas instead. Only reach for it on
@@ -75,10 +114,11 @@ mesh. Unwrapping in Blender is almost always the better answer.
 
 | Key | Action |
 | --- | --- |
-| `1`–`5` | Preview: edge wear / curvature texture / UV checker / normals / shaded |
+| `1`–`6` | Preview: edge wear / curvature texture / UV checker / normals / shaded / decal normals |
 | `B` / `E` / `F` | Bake / export maps / frame the mesh (also resets the view) |
 | `W` / `L` | Wireframe / lighting |
 | `+` / `-` | Bigger / smaller UI |
+| `Esc` | Cancel a decal placement |
 
 ### Navigating
 

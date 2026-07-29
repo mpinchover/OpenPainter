@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 RESOLUTIONS = (512, 1024, 2048, 4096)
 
 #: make_bake.c's bake_axis, which masks curvature by facing direction.
@@ -187,6 +189,79 @@ class EdgeWearParams:
             "u_roughness": self.roughness,
             "u_lacunarity": self.lacunarity,
             "u_distortion": self.distortion,
+        }
+
+
+@dataclass
+class DecalParams:
+    """A normal-map decal stamped into the mesh's UV layout.
+
+    Substance Painter projects a decal onto the surface through a 3D placement
+    gizmo. There is no painting viewport here to do that with, so the placement
+    is stated in UV space instead: the decal occupies a rectangle of the atlas,
+    which is a rectangle of the surface. For anything with a sane UV layout --
+    a panel, a hull plate, the side of a crate -- that is the same operation
+    expressed in the coordinates this app already works in.
+
+    The image is never modified. Everything below is applied when the decal is
+    composited into the normal map, so all of it stays live.
+    """
+
+    enabled: bool = True
+    path: str = ""
+
+    center_u: float = 0.5
+    center_v: float = 0.5
+    """Where the middle of the decal sits in UV space."""
+
+    scale: float = 0.25
+    """Fraction of the atlas width the decal spans. Its height follows from the
+    image's own aspect ratio, so a wide vent stays wide."""
+
+    rotation: float = 0.0
+    """Degrees, counter-clockwise in UV space."""
+
+    intensity: float = 1.0
+    """How deep the bump reads. Scales the decal's surface *slope* rather than
+    the stored vector, which is what makes 2.0 twice as steep instead of
+    pushing the normal past horizontal and folding it over. 0 is flat, 1 is the
+    map exactly as authored."""
+
+    flip_green: bool = False
+    """Flip the green channel, for a map baked in DirectX (-Y) convention.
+    Everything here is OpenGL (+Y up), which is what Blender expects."""
+
+    def loaded(self) -> bool:
+        return bool(self.path)
+
+    def active(self) -> bool:
+        """Whether this decal contributes anything to the normal map."""
+        return self.enabled and self.loaded()
+
+    def key(self) -> tuple:
+        return (
+            self.enabled,
+            self.path,
+            round(self.center_u, 6),
+            round(self.center_v, 6),
+            round(self.scale, 6),
+            round(self.rotation, 4),
+            round(self.intensity, 6),
+            self.flip_green,
+        )
+
+    def size(self, aspect: float) -> tuple[float, float]:
+        """Width and height in UV units, for an image ``aspect`` wide per tall."""
+        return (self.scale, self.scale / max(float(aspect), 1e-6))
+
+    def as_uniforms(self, aspect: float) -> dict[str, Any]:
+        width, height = self.size(aspect)
+        return {
+            "u_center": (self.center_u, self.center_v),
+            "u_size": (width, height),
+            "u_rotation": float(np.radians(self.rotation)),
+            "u_intensity": self.intensity,
+            "u_flipGreen": 1.0 if self.flip_green else 0.0,
         }
 
 

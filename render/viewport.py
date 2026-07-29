@@ -18,10 +18,13 @@ import trimesh
 from imgui_bundle import imgui
 from moderngl_window.scene.camera import OrbitCamera
 
+from core.decal import DecalImage, DecalLoadError, load_decal
 from core.export import export_maps
 from core.mesh_io import SUPPORTED_SUFFIXES, MeshLoadError, load_mesh
-from core.params import BevelParams, EdgeWearParams, MeshInfo
+from core.params import BevelParams, DecalParams, EdgeWearParams, MeshInfo
+from core.picking import pick_uv, screen_ray
 from core.pipeline import BakeController
+from core.uv_unwrap import source_uvs
 from render.imgui_renderer import ImGuiRenderer
 from render.shaders import load_shader
 from render.trackpad import install_pinch_zoom
@@ -39,6 +42,9 @@ class PreviewMode:
     label: str
     shader_mode: int
     texture: Optional[str]  # which bake target to sample, if any
+    needs_bake: bool = True
+    """False for a map the app can produce without any bake -- the decal normals
+    are placed in UV space and need no geometry pass behind them."""
 
 
 PREVIEW_MODES = (
@@ -47,6 +53,7 @@ PREVIEW_MODES = (
     PreviewMode("UV checker", 1, None),
     PreviewMode("Normals", 2, None),
     PreviewMode("Shaded", 3, None),
+    PreviewMode("Decal normals", 4, "normal", needs_bake=False),
 )
 
 
@@ -477,6 +484,14 @@ class MeshMapApp(mglw.WindowConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+        # moderngl-window quits on its exit_key, which defaults to Escape and is
+        # checked before the key ever reaches on_key_event. Escape means "cancel
+        # what I am doing" here -- cancelling a decal placement -- and an app
+        # holding a bake and a set of parameters has no business closing on a
+        # stray keypress. Quitting stays where every other app puts it: the
+        # window's close button, or Cmd-Q.
+        self.wnd.exit_key = None
+
         imgui.create_context()
         imgui.get_io().set_ini_filename(str(_settings_dir() / "layout.ini"))
         self.gui = ImGuiRenderer(self.wnd)
@@ -487,6 +502,12 @@ class MeshMapApp(mglw.WindowConfig):
         if self.initial_bevel is not None:
             self.controller.bevel_params = self.initial_bevel
         self.wear_params = EdgeWearParams()
+        self.decal_params = DecalParams()
+        self.decal_image: Optional[DecalImage] = None
+        #: True while the decal is following the cursor, waiting to be dropped.
+        self.decal_placing = False
+        #: Where it was before that started, to put back if the user cancels.
+        self._decal_anchor: Optional[tuple[float, float]] = None
         self.mesh_info: Optional[MeshInfo] = None
         self.mesh: Optional[trimesh.Trimesh] = None
 
@@ -503,6 +524,7 @@ class MeshMapApp(mglw.WindowConfig):
         self.status_is_error = False
         self.file_dialog = None
         self.folder_dialog = None
+        self.decal_dialog = None
 
         self._mouse: tuple[float, float] = (0.0, 0.0)
         #: Rect the Map inspector occupied last frame, so the gizmo can dodge it.
@@ -556,19 +578,29 @@ class MeshMapApp(mglw.WindowConfig):
             vertex_shader=load_shader("fullscreen.vert"),
             fragment_shader=load_shader("blit.frag"),
         )
+        self.decal_program = self.ctx.program(
+            vertex_shader=load_shader("fullscreen.vert"),
+            fragment_shader=load_shader("decal.frag"),
+        )
 
         self.shape_program["u_curvature"].value = 0
         self.shape_program["u_position"].value = 1
         self.preview_program["u_map"].value = 0
+        self.preview_program["u_normalMap"].value = 1
         self.blit_program["u_tex"].value = 0
+        self.decal_program["u_decal"].value = 0
 
         self.shape_vao = self.ctx.vertex_array(self.shape_program, [])
         self.background_vao = self.ctx.vertex_array(self.background_program, [])
         self.blit_vao = self.ctx.vertex_array(self.blit_program, [])
+        self.decal_vao = self.ctx.vertex_array(self.decal_program, [])
 
         self.mesh_vao: Optional[moderngl.VertexArray] = None
         self._mesh_buffers: list = []
         self._vao_token: tuple = ()
+        #: The geometry the VAO was built from, kept for cursor picking: the
+        #: ray has to hit exactly what is on screen, seams and all.
+        self._pick_geometry: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None
 
         self.tex_curvature: Optional[moderngl.Texture] = None
         self.tex_position: Optional[moderngl.Texture] = None
@@ -578,9 +610,24 @@ class MeshMapApp(mglw.WindowConfig):
         self._uploaded_maps_version = -1
         self._output_dirty = True
 
+        # The decal chain: the imported image, and the atlas-sized normal map it
+        # is composited into. Independent of the bake -- a decal is placed in UV
+        # space, so it needs no geometry pass behind it.
+        self.tex_decal: Optional[moderngl.Texture] = None
+        self.tex_normal: Optional[moderngl.Texture] = None
+        self.normal_fbo: Optional[moderngl.Framebuffer] = None
+        self._normal_resolution = 0
+        self._normal_dirty = True
+
         # Bound whenever the active preview mode samples no map, so unit 0 is
         # never left pointing at nothing.
         self._blank_texture = self.ctx.texture((1, 1), 1, data=np.ones(1, dtype="f4").tobytes(), dtype="f4")
+        # Flat tangent-space normal, for when there is no decal: (0.5, 0.5, 1)
+        # decodes to straight out of the surface, so the preview shader can bind
+        # this unconditionally and light the mesh unchanged.
+        self._flat_normal = self.ctx.texture(
+            (1, 1), 3, data=np.array([0.5, 0.5, 1.0], dtype="f4").tobytes(), dtype="f4"
+        )
 
         self.thumbnail = self.ctx.texture((THUMBNAIL_SIZE, THUMBNAIL_SIZE), 4)
         self.thumbnail.filter = (moderngl.LINEAR, moderngl.LINEAR)
@@ -661,17 +708,22 @@ class MeshMapApp(mglw.WindowConfig):
         self.controller.set_mesh(mesh)
 
         # Show the raw geometry immediately; the unwrap pass replaces this VAO
-        # with the seam-split version once it finishes.
+        # with the seam-split version once it finishes. The mesh's own UVs come
+        # along if it has any, so a decal and the UV checker read correctly
+        # before any bake -- neither of them waits on the geometry pass.
+        uvs = source_uvs(mesh)
         self._build_mesh_vao(
             np.asarray(mesh.vertices, dtype="f4"),
             np.asarray(mesh.vertex_normals, dtype="f4"),
-            np.zeros((len(mesh.vertices), 2), dtype="f4"),
+            np.zeros((len(mesh.vertices), 2), dtype="f4") if uvs is None
+            else uvs.astype("f4"),
             np.asarray(mesh.faces, dtype="u4"),
         )
         self._vao_token = ("raw", self.controller.mesh_token)
 
         self.camera.frame(mesh.bounds.mean(axis=0), info.scale)
-        if PREVIEW_MODES[self.preview_index].texture is not None:
+        mode = PREVIEW_MODES[self.preview_index]
+        if mode.texture is not None and mode.needs_bake:
             self.preview_index = SHADED_INDEX  # nothing baked yet
 
         note = f" ({'; '.join(info.notes)})" if info.notes else ""
@@ -684,12 +736,228 @@ class MeshMapApp(mglw.WindowConfig):
         self.status = message
         self.status_is_error = error
 
+    # -- decals -----------------------------------------------------------
+
+    def open_decal(self, path: str | Path) -> None:
+        """Import a normal map to stamp into the atlas.
+
+        A grayscale image is read as a height map and converted, since that is
+        the only reading of it that describes a surface -- see
+        :func:`core.decal.load_decal`.
+        """
+        try:
+            image = load_decal(path)
+        except DecalLoadError as exc:
+            self.set_status(str(exc), error=True)
+            return
+        except Exception:
+            self.set_status(traceback.format_exc(limit=3), error=True)
+            return
+
+        self.decal_image = image
+        self.decal_params.path = image.path
+        self.decal_params.enabled = True
+        self._upload_decal()
+        self.mark_normal_dirty()
+
+        width, height = image.size
+        source = "height map, converted" if image.from_height else "normal map"
+        self.set_status(
+            f"Decal: {Path(image.path).name} ({width}x{height} {source}). "
+            f"Exports as normal.png."
+        )
+
+    def clear_decal(self) -> None:
+        """Drop the decal and put the normal map back to flat."""
+        self.decal_placing = False
+        self._decal_anchor = None
+        self.decal_image = None
+        self.decal_params = DecalParams(enabled=False)
+        self._release_decal_texture()
+        self.mark_normal_dirty()
+        if PREVIEW_MODES[self.preview_index].texture == "normal":
+            self.preview_index = SHADED_INDEX
+        self.set_status("Decal cleared")
+
+    def mark_normal_dirty(self) -> None:
+        self._normal_dirty = True
+
+    # -- placing a decal by pointing at the mesh --------------------------
+
+    def begin_decal_placement(self) -> None:
+        """Pick the decal up: it now follows the cursor until a click drops it.
+
+        The current placement is remembered, so cancelling puts it back rather
+        than leaving it wherever the cursor last wandered.
+        """
+        if not self.decal_params.loaded():
+            self.set_status("Import a normal map first", error=True)
+            return
+        if self.mesh is None:
+            self.set_status("Load a mesh to place a decal on", error=True)
+            return
+
+        self.decal_params.enabled = True
+        self.decal_placing = True
+        self._decal_anchor = (self.decal_params.center_u, self.decal_params.center_v)
+        self.set_status("Placing decal - click on the mesh to drop it, Esc to cancel")
+        self.follow_cursor_with_decal()
+
+    def end_decal_placement(self, *, keep: bool) -> None:
+        """Drop the decal where it is, or put it back where it came from."""
+        if not self.decal_placing:
+            return
+        self.decal_placing = False
+
+        if not keep and self._decal_anchor is not None:
+            self.decal_params.center_u, self.decal_params.center_v = self._decal_anchor
+            self.mark_normal_dirty()
+            self.set_status("Placement cancelled")
+        else:
+            self.set_status(
+                f"Decal placed at UV "
+                f"{self.decal_params.center_u:.3f}, {self.decal_params.center_v:.3f}"
+            )
+        self._decal_anchor = None
+
+    def follow_cursor_with_decal(self) -> bool:
+        """Move the decal to the surface under the cursor. False if it missed.
+
+        A miss leaves the decal where it was rather than snapping it somewhere
+        arbitrary -- dragging off the silhouette and back should not lose the
+        placement you were lining up.
+        """
+        uv = self.surface_uv_at(self._mouse)
+        if uv is None:
+            return False
+        self.decal_params.center_u, self.decal_params.center_v = uv
+        self.mark_normal_dirty()
+        return True
+
+    def surface_uv_at(self, mouse: tuple[float, float]) -> Optional[tuple[float, float]]:
+        """The mesh's UV under a cursor position, or None if it points at sky."""
+        if self._pick_geometry is None:
+            return None
+
+        width, height = self.wnd.buffer_size
+        if width <= 0 or height <= 0:
+            return None
+
+        # Mouse events arrive in the window's logical units; the framebuffer may
+        # be larger on a HiDPI display. Scale into buffer pixels the same way
+        # the ImGui renderer does, then into normalised device coordinates --
+        # whose y runs up the screen, while the cursor's runs down.
+        ratio = float(self.wnd.pixel_ratio)
+        ndc_x = (mouse[0] * ratio) / width * 2.0 - 1.0
+        ndc_y = 1.0 - (mouse[1] * ratio) / height * 2.0
+
+        mvp = self.camera.projection_matrix * self.camera.matrix
+        inverse = np.array(glm.inverse(mvp).to_list(), dtype=np.float64).T
+        origin, direction = screen_ray(inverse, ndc_x, ndc_y)
+
+        vertices, faces, uvs = self._pick_geometry
+        return pick_uv(origin, direction, vertices, faces, uvs)
+
+    def _release_decal_texture(self) -> None:
+        if self.tex_decal is None:
+            return
+        # The panel draws it, so ImGui knows about it too and has to be told.
+        try:
+            self.gui.remove_texture(self.tex_decal)
+        except KeyError:
+            pass
+        self.tex_decal.release()
+        self.tex_decal = None
+
+    def _upload_decal(self) -> None:
+        self._release_decal_texture()
+        if self.decal_image is None:
+            return
+
+        image = self.decal_image
+        self.tex_decal = self.ctx.texture(
+            image.size, 4, data=np.ascontiguousarray(image.rgba(), dtype="f4").tobytes(),
+            dtype="f4",
+        )
+        # Mipmaps because the decal is usually larger than the patch of atlas it
+        # lands in, so minification without them aliases the fine detail a vent
+        # is made of. Clamped rather than repeating: outside its rectangle the
+        # decal contributes nothing, and the shader already tests for that.
+        self.tex_decal.build_mipmaps()
+        self.tex_decal.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+        self.tex_decal.repeat_x = False
+        self.tex_decal.repeat_y = False
+        # The Decal tab shows it, and clicking it starts a placement.
+        self.gui.register_texture(self.tex_decal)
+
+    def _sync_decal(self) -> None:
+        """Keep the normal map in step with the decal and the export resolution.
+
+        Nothing is allocated until a decal actually exists -- an atlas-sized
+        float target is real memory, and most sessions never place one.
+        """
+        if self.tex_normal is None and not self.decal_params.active():
+            return
+        if self._normal_resolution != int(self.controller.bake_params.resolution):
+            self._normal_dirty = True
+        if self._normal_dirty:
+            self._run_decal()
+
+    def _run_decal(self) -> None:
+        """Re-composite the normal map. One full-screen pass over the atlas."""
+        resolution = int(self.controller.bake_params.resolution)
+        self._ensure_normal_texture(resolution)
+        assert self.normal_fbo is not None
+
+        params = self.decal_params
+        active = params.active() and self.tex_decal is not None
+        if active:
+            assert self.decal_image is not None
+            self.tex_decal.use(0)
+            for name, value in params.as_uniforms(self.decal_image.aspect).items():
+                self.decal_program[name].value = value
+        else:
+            # Nothing to stamp: place the decal nowhere, so the pass writes the
+            # flat normal everywhere rather than being skipped and leaving
+            # whatever the last decal put there.
+            self._blank_texture.use(0)
+            self.decal_program["u_size"].value = (0.0, 0.0)
+            self.decal_program["u_intensity"].value = 0.0
+
+        self.normal_fbo.use()
+        self.ctx.viewport = (0, 0, resolution, resolution)
+        self.ctx.disable(moderngl.DEPTH_TEST | moderngl.CULL_FACE | moderngl.BLEND)
+        self.decal_vao.render(moderngl.TRIANGLES, vertices=3)
+        self._normal_dirty = False
+        if PREVIEW_MODES[self.preview_index].texture == "normal":
+            self._thumbnail_dirty = True
+
+    def read_normal_map(self) -> Optional[np.ndarray]:
+        """The composited normal map as an (n, n, 3) array, or None if flat.
+
+        Read back off the GPU rather than recomputed on the CPU, so the PNG is
+        exactly the pixels the viewport is lighting with.
+        """
+        if not self.decal_params.active() or self.normal_fbo is None:
+            return None
+        if self._normal_dirty:
+            self._run_decal()
+        resolution = self._normal_resolution
+        return np.frombuffer(
+            self.normal_fbo.read(components=3, dtype="f4"), dtype="f4"
+        ).reshape(resolution, resolution, 3)
+
     # -- GL resources -----------------------------------------------------
 
     def _build_mesh_vao(
         self, vertices: np.ndarray, normals: np.ndarray, uvs: np.ndarray, faces: np.ndarray
     ) -> None:
         self._release_mesh_vao()
+        self._pick_geometry = (
+            np.ascontiguousarray(vertices, dtype=np.float64),
+            np.ascontiguousarray(faces, dtype=np.int64),
+            np.ascontiguousarray(uvs, dtype=np.float64),
+        )
         interleaved = np.hstack([vertices, normals, uvs]).astype("f4")
         vbo = self.ctx.buffer(interleaved.tobytes())
         ibo = self.ctx.buffer(np.ascontiguousarray(faces, dtype="u4").tobytes())
@@ -729,6 +997,27 @@ class MeshMapApp(mglw.WindowConfig):
 
         self.output_fbo = self.ctx.framebuffer(color_attachments=[self.tex_output])
         self._texture_resolution = resolution
+
+    def _ensure_normal_texture(self, resolution: int) -> None:
+        """The decal normal map's own target, sized by the bake resolution.
+
+        Separate from :meth:`_ensure_textures` because the decal does not wait
+        for a bake: this exists as soon as an image is imported, at whatever
+        resolution the export is set to.
+        """
+        if self._normal_resolution == resolution and self.tex_normal is not None:
+            return
+        if self.tex_normal is not None:
+            self.tex_normal.release()
+        if self.normal_fbo is not None:
+            self.normal_fbo.release()
+
+        self.tex_normal = self.ctx.texture((resolution, resolution), 3, dtype="f4")
+        self.tex_normal.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.tex_normal.repeat_x = False
+        self.tex_normal.repeat_y = False
+        self.normal_fbo = self.ctx.framebuffer(color_attachments=[self.tex_normal])
+        self._normal_resolution = resolution
 
     # -- per-frame sync ---------------------------------------------------
 
@@ -795,6 +1084,7 @@ class MeshMapApp(mglw.WindowConfig):
         return {
             "curvature": self.tex_curvature,
             "output": self.tex_output,
+            "normal": self.tex_normal,
         }.get(name or "")
 
     def _update_thumbnail(self) -> None:
@@ -802,6 +1092,10 @@ class MeshMapApp(mglw.WindowConfig):
         if source is None:
             return
         source.use(0)
+        # The normal map is the one target whose channels are not a mask.
+        self.blit_program["u_rgb"].value = (
+            1 if PREVIEW_MODES[self.preview_index].texture == "normal" else 0
+        )
         self.thumbnail_fbo.use()
         self.ctx.viewport = (0, 0, THUMBNAIL_SIZE, THUMBNAIL_SIZE)
         self.ctx.disable(moderngl.DEPTH_TEST)
@@ -837,12 +1131,19 @@ class MeshMapApp(mglw.WindowConfig):
             mode = PREVIEW_MODES[SHADED_INDEX]  # nothing baked yet
         (texture or self._blank_texture).use(0)
 
+        # The decal lights the mesh in every mode, the way a normal map in a
+        # material does; with no decal this is the flat 1x1, which changes
+        # nothing and costs one texture unit.
+        decal_lit = self.decal_params.active() and self.tex_normal is not None
+        (self.tex_normal if decal_lit else self._flat_normal).use(1)
+
         view = self.camera.matrix
         mvp = self.camera.projection_matrix * view
 
         self.preview_program["u_mvp"].write(_mat_bytes(mvp))
         self.preview_program["u_mode"].value = mode.shader_mode
         self.preview_program["u_lighting"].value = 1.0 if self.lighting else 0.0
+        self.preview_program["u_useNormalMap"].value = 1.0 if decal_lit else 0.0
         self.preview_program["u_checkerScale"].value = self.checker_scale
 
         eye = self.camera.eye
@@ -862,6 +1163,7 @@ class MeshMapApp(mglw.WindowConfig):
 
         if self._output_dirty:
             self._run_shaping()
+        self._sync_decal()
         if self._thumbnail_dirty and self.show_map_inspector:
             self._update_thumbnail()
 
@@ -900,6 +1202,10 @@ class MeshMapApp(mglw.WindowConfig):
         if action != keys.ACTION_PRESS:
             return
 
+        if key == keys.ESCAPE and self.decal_placing:
+            self.end_decal_placement(keep=False)
+            return
+
         shortcuts = {
             keys.NUMBER_1: 0, keys.NUMBER_2: 1, keys.NUMBER_3: 2,
             keys.NUMBER_4: 3, keys.NUMBER_5: 4, keys.NUMBER_6: 5,
@@ -930,6 +1236,11 @@ class MeshMapApp(mglw.WindowConfig):
         self._mouse = (float(x), float(y))
         self._modifiers = self.wnd.modifiers
 
+        # A decal being placed rides the cursor. Not over the panel, though:
+        # crossing it on the way to the mesh must not fling the decal about.
+        if self.decal_placing and not imgui.get_io().want_capture_mouse:
+            self.follow_cursor_with_decal()
+
     def on_mouse_press_event(self, x: int, y: int, button: int) -> None:
         self.gui.mouse_press_event(x, y, button)
         self._mouse = (float(x), float(y))
@@ -940,6 +1251,20 @@ class MeshMapApp(mglw.WindowConfig):
         # pointer leaves the panel, which is a jarring jump mid-drag.
         if imgui.get_io().want_capture_mouse:
             self._drag_owner = "ui"
+            return
+
+        if self.decal_placing:
+            # The click that ends placement belongs to the decal and nothing
+            # else -- it must not also start an orbit.
+            self._drag_owner = "decal"
+            if button == self.wnd.mouse.left:
+                # What you see is what you get: the decal is already sitting
+                # where it will land, so a click keeps it there. A click that
+                # misses the mesh keeps the last spot it did land on.
+                self.follow_cursor_with_decal()
+                self.end_decal_placement(keep=True)
+            else:
+                self.end_decal_placement(keep=False)
             return
 
         if button == self.wnd.mouse.left and self.mesh is not None:
@@ -1201,32 +1526,46 @@ class MeshMapApp(mglw.WindowConfig):
         self.set_status("Baking...")
 
     def export(self) -> None:
+        """Write every map there is: the bake's two, plus the decal normals.
+
+        The two halves are independent. A bake with no decal writes what it
+        always did, and a decal with no bake still writes normal.png -- it is
+        placed in UV space and owes the bake nothing.
+        """
         controller = self.controller
-        if controller.curvature_map is None:
-            self.set_status("Nothing baked yet - hit Bake first", error=True)
-            return
-        if self.output_fbo is None:
-            self.set_status("No render target for the edge wear map", error=True)
+        baked = controller.curvature_map is not None and self.output_fbo is not None
+        normal = self.read_normal_map()
+
+        if not baked and normal is None:
+            self.set_status(
+                "Nothing to export - bake a mesh, or import a decal", error=True
+            )
             return
 
-        if self._output_dirty:
-            self._run_shaping()
-
-        resolution = self._texture_resolution
-        # Read the shaped map back off the GPU rather than recomputing it on the
-        # CPU, so the PNG is exactly the pixels shown in the viewport.
-        shaped = np.frombuffer(
-            self.output_fbo.read(components=1, dtype="f4"), dtype="f4"
-        ).reshape(resolution, resolution)
+        shaped = None
+        if baked:
+            if self._output_dirty:
+                self._run_shaping()
+            resolution = self._texture_resolution
+            # Read the shaped map back off the GPU rather than recomputing it on
+            # the CPU, so the PNG is exactly the pixels shown in the viewport.
+            shaped = np.frombuffer(
+                self.output_fbo.read(components=1, dtype="f4"), dtype="f4"
+            ).reshape(resolution, resolution)
 
         stem = Path(self.mesh_info.path).stem if self.mesh_info else "mesh"
         target = Path(self.export_dir) / stem
         try:
             written = export_maps(
-                target, shaped, controller.curvature_map, bits=self.export_bits
+                target,
+                shaped,
+                controller.curvature_map if baked else None,
+                normal=normal,
+                bits=self.export_bits,
             )
         except Exception:
             self.set_status(traceback.format_exc(limit=3), error=True)
             return
 
-        self.set_status(f"Wrote {len(written)} maps to {target}")
+        names = ", ".join(path.name for path in written)
+        self.set_status(f"Wrote {names} to {target}")

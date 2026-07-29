@@ -31,6 +31,30 @@ macos_only = pytest.mark.skipif(
 )
 
 
+@pytest.fixture
+def pyglet_view():
+    """pyglet's Cocoa view class, or a skip if it cannot be reached.
+
+    Importing ``pyglet.window`` builds a hidden shadow window on the way in,
+    and that needs a display to exist: ``CGGetActiveDisplayList`` reports none
+    while the screen is asleep or the session is detached from the console, and
+    the import then dies on an empty screen list. Nothing here needs a window --
+    only the class object to add a selector to -- so turn the shadow window off
+    for the import and put the setting back afterwards.
+    """
+    import pyglet
+
+    previous = pyglet.options.shadow_window
+    pyglet.options.shadow_window = False
+    try:
+        from pyglet.window.cocoa.pyglet_view import PygletView_Implementation
+    except Exception as exc:  # pragma: no cover - depends on the host
+        pytest.skip(f"pyglet's Cocoa window is unavailable here: {exc}")
+    finally:
+        pyglet.options.shadow_window = previous
+    return PygletView_Implementation
+
+
 class FakeApp:
     """Just the pinch handler and the scroll drain, lifted off MeshMapApp.
 
@@ -137,7 +161,7 @@ def test_install_declines_without_a_cocoa_window():
 
 
 @macos_only
-def test_pyglet_view_gains_the_gesture_selector():
+def test_pyglet_view_gains_the_gesture_selector(pyglet_view):
     from pyglet.libs.darwin import cocoapy
 
     assert trackpad._install_selector()
@@ -148,7 +172,7 @@ def test_pyglet_view_gains_the_gesture_selector():
 
 
 @macos_only
-def test_a_gesture_event_reaches_the_registered_handler():
+def test_a_gesture_event_reaches_the_registered_handler(pyglet_view):
     """The whole path, through the real Objective-C runtime.
 
     The event is a stand-in class answering ``magnification``, which is the only
