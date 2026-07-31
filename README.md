@@ -16,7 +16,26 @@ python main.py cube.fbx --auto-unwrap   # for a mesh with no UVs at all
 python main.py --ui-scale 1.8        # bigger panel and text
 ```
 
-Press **B** to bake, drag the *Edge wear* sliders, press **E** to export.
+Press **B** to bake, build a texture in the sidebar, press **E** to export.
+
+### The window
+
+A bar across the top holds the view controls — what to look at, and how it is
+drawn. The **Shaded** view is the texture, lit; **Normals** is the decal normal
+map. Those are the two things the app makes, so those are the two things to
+look at.
+
+The sidebar down the left is the parameters, tabbed by which half of the
+pipeline they belong to, and the status bar sits along the bottom. Nothing
+floats: all three are part of the frame, the 3D view is laid out in what is
+left, and the projection and the cursor rays are built from that rect rather
+than from the whole window — so nothing is ever hidden behind a panel and
+pointing at the model lands where you point.
+
+The maps themselves are visible where they are being made rather than in a
+window of their own: the Texture tab's tree carries a swatch or a thumbnail per
+row, and the Decal tab shows the imported map. The model is the preview for
+everything else -- at the size and on the surface it will be seen at.
 
 ### UV your mesh in Blender first
 
@@ -63,9 +82,64 @@ three or more beveled edges meet are fanned onto the corner sphere rather than
 Grid Filled, so the topology there differs. Since the geometry only ever feeds
 the bake, that costs a little accuracy in the corner falloff and nothing else.
 
-**Export** writes `edge_wear.png` and `curvature.png`, plus `normal.png` if a
-decal is placed — they address your original mesh through its own UV map, so
+**Export** is one button and writes everything there is: `color.png` from the
+mask tree, `normal.png` from any decals, and `edge_wear.png` and `curvature.png`
+from the bake. All four address your original mesh through its own UV map, so
 there is nothing to ship alongside them.
+
+### Textures
+
+The **Texture** tab is where a texture is built, and the active one resolves to
+`color.png`. Press **New** and you get one flat colour, called *Texture 01*.
+Change its **type** to a mask — edge wear or noise — and it grows a white and a
+black side underneath, each of which can be another colour or another mask. Edge
+wear picking between rust and bare metal is one mask; edge wear picking between
+rust and a noise that itself picks between two greys is three.
+
+**Every texture you make stays around.** The dropdown at the top of the tab
+lists them and switches between them, so a variant is something to come back to
+rather than something to lose; past five it grows a search box, which matches
+anywhere in the name and ignores case. *Remove* drops the active one and falls
+back to its neighbour.
+
+Everything in the tree can be **renamed** by double-clicking its row — the
+texture itself included, since that is the row at the top. A name describes the
+part of the texture rather than the kind of thing it currently is, so it
+survives changing a colour into a mask and back, and the automatic label (the
+mask's kind, or the colour's hex code) follows it in brackets. Clear the name
+and that label takes over again.
+
+Two mask kinds so far: **edge wear** (the curvature bake — white on the edges)
+and **noise** (the same field the wear pass breaks up with, thresholded by bias
+and contrast). A node keeps both sets of settings, so switching kinds and back
+finds them intact.
+
+**The Shaded view is the texture**, lit. A new mask starts as plain black and
+white, so what you see on the model is the mask itself — edge wear white on the
+edges, or a noise in black and white — until you put colours, or another mask,
+under it. Colour is then something you add deliberately rather than something to
+undo. Before a bake, or with no texture at all, Shaded draws plain grey.
+
+**The sidebar's two halves do different jobs.** The tree is binary and its
+depth is unbounded, so indenting the whole thing runs out of panel before it
+runs out of tree — a node graph is the usual escape and this is the other one.
+The top edits whatever is *selected*: its type, and either a colour picker or
+that mask's own sliders -- all of them, laid out flat, nothing folded behind a
+header. The bottom is the tree itself, one line per slot with a swatch or a
+thumbnail, for selecting with, scrolling on its own so a deep tree cannot push
+the controls off the top. Depth costs a line rather than a column.
+
+The thumbnails come free from how the tree is rendered: **one full-screen pass per node, bottom up**
+(`render/composite.py`). Everything here is UV space already, so a node's
+children are just textures by the time it runs — no recursion in GLSL, no shader
+generated per tree, and depth costs passes rather than shader complexity. Each
+node therefore ends up holding a real texture, which is exactly what the panel
+wants to show. Targets are recycled, so a tree of depth *d* needs *d + 1* of
+them however wide it is, and nesting stops at 8.
+
+The Bake tab's own *Edge wear* sliders are a separate thing: they shape
+`edge_wear.png`, the mask on its own. The texture's edge-wear masks carry their
+own settings.
 
 ### Decals
 
@@ -114,7 +188,7 @@ mesh. Unwrapping in Blender is almost always the better answer.
 
 | Key | Action |
 | --- | --- |
-| `1`–`6` | Preview: edge wear / curvature texture / UV checker / normals / shaded / decal normals |
+| `1` / `2` | Preview: shaded (the mask tree) / normals (the decals) |
 | `B` / `E` / `F` | Bake / export maps / frame the mesh (also resets the view) |
 | `W` / `L` | Wireframe / lighting |
 | `+` / `-` | Bigger / smaller UI |

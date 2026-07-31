@@ -24,6 +24,8 @@ EDGE_WEAR_NAME = "edge_wear"
 CURVATURE_NAME = "curvature"
 #: Tangent-space normals, carrying whatever decals are placed.
 NORMAL_NAME = "normal"
+#: The mask tree resolved to colour.
+COLOR_NAME = "color"
 
 MAP_NAMES = (EDGE_WEAR_NAME, CURVATURE_NAME)
 
@@ -79,19 +81,20 @@ def _write_rgb16_png(path: Path, pixels: np.ndarray) -> None:
     )
 
 
-def save_normal_map(path: str | Path, array: np.ndarray, *, bits: int = 8) -> Path:
-    """Write an (h, w, 3) array of already-encoded 0..1 normals as an RGB PNG.
+def save_rgb_map(path: str | Path, array: np.ndarray, *, bits: int = 8) -> Path:
+    """Write an (h, w, 3) array of 0..1 values as an RGB PNG.
 
-    Encoded, not raw: the caller hands over what a Normal Map node expects to
-    read, with a flat surface at (0.5, 0.5, 1.0). Nothing here re-encodes, so
-    there is no second place for the convention to be decided.
+    Values are written as handed over. The two RGB products differ in what they
+    mean -- a normal map is an encoded direction, a colour map is colour -- but
+    not in how they are stored, and re-encoding either here would put the
+    convention in two places.
     """
     if bits not in (8, 16):
         raise ValueError(f"bits must be 8 or 16, got {bits}")
 
     array = np.asarray(array, dtype=np.float32)
     if array.ndim != 3 or array.shape[2] != 3:
-        raise ValueError(f"a normal map needs shape (h, w, 3), got {array.shape}")
+        raise ValueError(f"an RGB map needs shape (h, w, 3), got {array.shape}")
 
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,20 +108,27 @@ def save_normal_map(path: str | Path, array: np.ndarray, *, bits: int = 8) -> Pa
     return path
 
 
+def save_normal_map(path: str | Path, array: np.ndarray, *, bits: int = 8) -> Path:
+    """Write already-encoded tangent-space normals, flat being (0.5, 0.5, 1.0)."""
+    return save_rgb_map(path, array, bits=bits)
+
+
 def export_maps(
     output_dir: str | Path,
     edge_wear: np.ndarray | None = None,
     curvature: np.ndarray | None = None,
     *,
     normal: np.ndarray | None = None,
+    color: np.ndarray | None = None,
     bits: int = 8,
     prefix: str = "",
 ) -> list[Path]:
     """Write whichever maps were handed over, and return what was written.
 
-    edge_wear.png and the curvature bake behind it come from the bake; normal.png
-    comes from the decals and needs no bake at all, so any of the three may be
-    absent and the others still get written.
+    The four are independent products of independent halves of the app --
+    color.png from the mask tree, normal.png from the decals, edge_wear.png and
+    curvature.png from the bake -- so any of them may be absent and the rest
+    still get written. One export call, everything there is.
 
     16-bit is worth reaching for if banding shows up in the falloff -- the
     curvature bake is a smooth gradient that 256 levels can struggle with.
@@ -129,8 +139,9 @@ def export_maps(
         for name, array in zip(MAP_NAMES, (edge_wear, curvature))
         if array is not None
     ]
-    if normal is not None:
-        written.append(
-            save_normal_map(output_dir / f"{prefix}{NORMAL_NAME}.png", normal, bits=bits)
-        )
+    for name, array in ((COLOR_NAME, color), (NORMAL_NAME, normal)):
+        if array is not None:
+            written.append(
+                save_rgb_map(output_dir / f"{prefix}{name}.png", array, bits=bits)
+            )
     return written

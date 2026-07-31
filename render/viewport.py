@@ -20,21 +20,22 @@ from moderngl_window.scene.camera import OrbitCamera
 
 from core.decal import DecalImage, DecalLoadError, load_decal
 from core.export import export_maps
+from core.layers import Slot, describe, mask_at, new_texture, slot_at
 from core.mesh_io import SUPPORTED_SUFFIXES, MeshLoadError, load_mesh
 from core.params import BevelParams, DecalParams, EdgeWearParams, MeshInfo
 from core.picking import pick_uv, screen_ray
 from core.pipeline import BakeController
 from core.uv_unwrap import source_uvs
+from render.composite import LayerCompositor
 from render.imgui_renderer import ImGuiRenderer
 from render.shaders import load_shader
 from render.trackpad import install_pinch_zoom
-from ui import gizmo
+from ui import gizmo, panel
 from ui.panel import draw_panel
 
-THUMBNAIL_SIZE = 384
-
-#: Index of the fallback mode used when the selected map has not been baked.
-SHADED_INDEX = 4
+#: The Shaded view, which the app falls back to when a mode's map goes away.
+#: It draws the mask tree, and plain grey until there is one -- see FLAT_MODE.
+SHADED_INDEX = 0
 
 
 @dataclass(frozen=True)
@@ -47,14 +48,18 @@ class PreviewMode:
     are placed in UV space and need no geometry pass behind them."""
 
 
+#: The two products, and so the two things to look at. Shaded is the mask tree:
+#: whatever the masks resolve to, lit -- a fresh tree is plain black and white,
+#: so it shows the mask itself until colours are put under it. Normals is the
+#: decal normal map, which is the other thing the app exports.
 PREVIEW_MODES = (
-    PreviewMode("Edge wear", 0, "output"),
-    PreviewMode("Curvature texture", 0, "curvature"),
-    PreviewMode("UV checker", 1, None),
-    PreviewMode("Normals", 2, None),
-    PreviewMode("Shaded", 3, None),
-    PreviewMode("Decal normals", 4, "normal", needs_bake=False),
+    PreviewMode("Shaded", 4, "composite"),
+    PreviewMode("Normals", 4, "normal", needs_bake=False),
 )
+
+#: Drawn in place of any mode whose map does not exist yet -- an unbaked mesh
+#: under the Shaded view, mostly. Plain grey, so the geometry still reads.
+FLAT_MODE = PreviewMode("Shaded", 3, None)
 
 
 def _settings_dir() -> Path:
@@ -502,6 +507,22 @@ class MeshMapApp(mglw.WindowConfig):
         if self.initial_bevel is not None:
             self.controller.bevel_params = self.initial_bevel
         self.wear_params = EdgeWearParams()
+        #: Every texture made this session. A texture is a colour, or a mask
+        #: deciding between two more of them, recursively. One is active at a
+        #: time -- that is the one shown, edited and exported -- and the rest
+        #: are kept so a variant can be gone back to.
+        self.textures: list[Slot] = []
+        self.texture_index: int = -1
+        #: The slot the Texture tab is editing, within the active texture: a
+        #: colour or a mask, either way.
+        self.texture_path: tuple[str, ...] = ()
+        self._texture_dirty = True
+        #: Counts textures made this session, so each gets its own name.
+        self._texture_serial = 0
+        #: Which row the tree is renaming in place, if any.
+        self.renaming_path: Optional[tuple[str, ...]] = None
+        #: What has been typed into the texture picker's search box.
+        self.texture_filter: str = ""
         self.decal_params = DecalParams()
         self.decal_image: Optional[DecalImage] = None
         #: True while the decal is following the cursor, waiting to be dropped.
@@ -518,7 +539,6 @@ class MeshMapApp(mglw.WindowConfig):
         self.source_z_up = bool(self.initial_z_up)
         self.export_dir = str(Path.cwd() / "output")
         self.export_bits = 8
-        self.show_map_inspector = True
         self.show_gizmo = True
         self.status = "Drop an FBX onto the window, or click 'Open mesh...'."
         self.status_is_error = False
@@ -527,8 +547,6 @@ class MeshMapApp(mglw.WindowConfig):
         self.decal_dialog = None
 
         self._mouse: tuple[float, float] = (0.0, 0.0)
-        #: Rect the Map inspector occupied last frame, so the gizmo can dodge it.
-        self._inspector_rect: Optional[tuple[float, float, float, float]] = None
         #: What the in-flight drag belongs to: "camera", "gizmo", "ui" or None.
         #: Latched on press so a gesture cannot change hands halfway through.
         self._drag_owner: Optional[str] = None
@@ -574,10 +592,6 @@ class MeshMapApp(mglw.WindowConfig):
             vertex_shader=load_shader("fullscreen.vert"),
             fragment_shader=load_shader("background.frag"),
         )
-        self.blit_program = self.ctx.program(
-            vertex_shader=load_shader("fullscreen.vert"),
-            fragment_shader=load_shader("blit.frag"),
-        )
         self.decal_program = self.ctx.program(
             vertex_shader=load_shader("fullscreen.vert"),
             fragment_shader=load_shader("decal.frag"),
@@ -587,12 +601,13 @@ class MeshMapApp(mglw.WindowConfig):
         self.shape_program["u_position"].value = 1
         self.preview_program["u_map"].value = 0
         self.preview_program["u_normalMap"].value = 1
-        self.blit_program["u_tex"].value = 0
         self.decal_program["u_decal"].value = 0
+
+        self.compositor = LayerCompositor(self.ctx)
+        self._registered_thumbnails: set = set()
 
         self.shape_vao = self.ctx.vertex_array(self.shape_program, [])
         self.background_vao = self.ctx.vertex_array(self.background_program, [])
-        self.blit_vao = self.ctx.vertex_array(self.blit_program, [])
         self.decal_vao = self.ctx.vertex_array(self.decal_program, [])
 
         self.mesh_vao: Optional[moderngl.VertexArray] = None
@@ -628,12 +643,6 @@ class MeshMapApp(mglw.WindowConfig):
         self._flat_normal = self.ctx.texture(
             (1, 1), 3, data=np.array([0.5, 0.5, 1.0], dtype="f4").tobytes(), dtype="f4"
         )
-
-        self.thumbnail = self.ctx.texture((THUMBNAIL_SIZE, THUMBNAIL_SIZE), 4)
-        self.thumbnail.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.thumbnail_fbo = self.ctx.framebuffer(color_attachments=[self.thumbnail])
-        self.gui.register_texture(self.thumbnail)
-        self._thumbnail_dirty = True
 
         self.camera = PanOrbitCamera(
             target=(0.0, 0.0, 0.0), radius=3.0, aspect_ratio=self.wnd.aspect_ratio,
@@ -709,8 +718,8 @@ class MeshMapApp(mglw.WindowConfig):
 
         # Show the raw geometry immediately; the unwrap pass replaces this VAO
         # with the seam-split version once it finishes. The mesh's own UVs come
-        # along if it has any, so a decal and the UV checker read correctly
-        # before any bake -- neither of them waits on the geometry pass.
+        # along if it has any, so a decal placed on the mesh reads correctly
+        # before any bake -- it does not wait on the geometry pass.
         uvs = source_uvs(mesh)
         self._build_mesh_vao(
             np.asarray(mesh.vertices, dtype="f4"),
@@ -724,7 +733,9 @@ class MeshMapApp(mglw.WindowConfig):
         self.camera.frame(mesh.bounds.mean(axis=0), info.scale)
         mode = PREVIEW_MODES[self.preview_index]
         if mode.texture is not None and mode.needs_bake:
-            self.preview_index = SHADED_INDEX  # nothing baked yet
+            # Nothing baked for the new mesh yet; Shaded copes on its own,
+            # drawing plain grey until the tree has something to stand on.
+            self.preview_index = SHADED_INDEX
 
         note = f" ({'; '.join(info.notes)})" if info.notes else ""
         self.set_status(
@@ -839,17 +850,18 @@ class MeshMapApp(mglw.WindowConfig):
         if self._pick_geometry is None:
             return None
 
-        width, height = self.wnd.buffer_size
-        if width <= 0 or height <= 0:
-            return None
-
         # Mouse events arrive in the window's logical units; the framebuffer may
         # be larger on a HiDPI display. Scale into buffer pixels the same way
-        # the ImGui renderer does, then into normalised device coordinates --
-        # whose y runs up the screen, while the cursor's runs down.
+        # the ImGui renderer does, then into the 3D view's own rect -- the
+        # projection belongs to that rect, so a ray built off the whole window
+        # would point somewhere the model was never drawn.
         ratio = float(self.wnd.pixel_ratio)
-        ndc_x = (mouse[0] * ratio) / width * 2.0 - 1.0
-        ndc_y = 1.0 - (mouse[1] * ratio) / height * 2.0
+        rect_x, _, rect_width, rect_height = self.viewport_rect
+        navbar = int(panel.NAVBAR_HEIGHT * self.ui_pixel_scale)
+
+        # Normalised device coordinates: y runs up the screen, the cursor's down.
+        ndc_x = ((mouse[0] * ratio) - rect_x) / rect_width * 2.0 - 1.0
+        ndc_y = 1.0 - ((mouse[1] * ratio) - navbar) / rect_height * 2.0
 
         mvp = self.camera.projection_matrix * self.camera.matrix
         inverse = np.array(glm.inverse(mvp).to_list(), dtype=np.float64).T
@@ -929,8 +941,15 @@ class MeshMapApp(mglw.WindowConfig):
         self.ctx.disable(moderngl.DEPTH_TEST | moderngl.CULL_FACE | moderngl.BLEND)
         self.decal_vao.render(moderngl.TRIANGLES, vertices=3)
         self._normal_dirty = False
-        if PREVIEW_MODES[self.preview_index].texture == "normal":
-            self._thumbnail_dirty = True
+
+    def read_color_map(self) -> Optional[np.ndarray]:
+        """The mask tree resolved to colour, or None if it has never rendered.
+
+        Read back off the GPU rather than recomputed, so the PNG is exactly the
+        pixels the viewport is showing.
+        """
+        self._sync_texture()
+        return self.compositor.read()
 
     def read_normal_map(self) -> Optional[np.ndarray]:
         """The composited normal map as an (n, n, 3) array, or None if flat.
@@ -1050,6 +1069,7 @@ class MeshMapApp(mglw.WindowConfig):
                     )
                 self._uploaded_maps_version = controller.maps_version
                 self._output_dirty = True
+                self._texture_dirty = True  # the tree reads the new bake
 
                 if PREVIEW_MODES[self.preview_index].texture is None:
                     self.preview_index = 0
@@ -1060,6 +1080,120 @@ class MeshMapApp(mglw.WindowConfig):
 
     def mark_output_dirty(self) -> None:
         self._output_dirty = True
+
+    # -- the texture ------------------------------------------------------
+
+    def mark_texture_dirty(self) -> None:
+        self._texture_dirty = True
+
+    @property
+    def texture(self) -> Optional[Slot]:
+        """The active texture: the one shown, edited and exported."""
+        if 0 <= self.texture_index < len(self.textures):
+            return self.textures[self.texture_index]
+        return None
+
+    def create_texture(self) -> None:
+        """Add a texture: one flat colour, named, and made active.
+
+        Added rather than swapped in, so an earlier one is still there to go
+        back to through the picker.
+        """
+        self._texture_serial += 1
+        name = f"Texture {self._texture_serial:02d}"
+        self.textures.append(new_texture(name))
+        self.select_texture(len(self.textures) - 1)
+        self.set_status(f"{name} - pick a colour, or turn it into a mask")
+
+    def select_texture(self, index: int) -> None:
+        """Make one of the textures the active one."""
+        if not 0 <= index < len(self.textures):
+            return
+        self.texture_index = index
+        self.texture_path = ()
+        self.renaming_path = None
+        self.mark_texture_dirty()
+
+    def remove_texture(self) -> None:
+        """Drop the active texture, and fall back to its neighbour."""
+        if self.texture is None:
+            return
+        name = describe(self.textures.pop(self.texture_index))
+        self.texture_index = min(self.texture_index, len(self.textures) - 1)
+        self.texture_path = ()
+        self.renaming_path = None
+        if not self.textures:
+            self.compositor.clear()
+            self._sync_texture_thumbnails()
+        self.mark_texture_dirty()
+        self.set_status(f"Removed {name}")
+
+    @property
+    def selected_slot(self) -> Optional[Slot]:
+        """What the Texture tab is editing: a colour or a mask, or None with no
+        texture at all. The path is kept valid by :meth:`set_texture`."""
+        if self.texture is None:
+            return None
+        return slot_at(self.texture, self.texture_path)
+
+    def select_slot(self, path: tuple[str, ...]) -> None:
+        """Point the Texture tab at a slot, ignoring one that does not exist."""
+        if self.texture is None:
+            return
+        try:
+            slot_at(self.texture, tuple(path))
+        except KeyError:
+            return
+        self.texture_path = tuple(path)
+
+    def set_texture(self, texture: Slot) -> None:
+        """Swap in an edited version of the active texture and re-composite.
+
+        Edits rebuild the tree rather than mutating it, so this is also where
+        the selection is re-validated: collapsing a mask to a colour can pull
+        the ground out from under wherever the panel was standing.
+        """
+        if self.texture is None:
+            self.textures.append(texture)
+            self.texture_index = len(self.textures) - 1
+        else:
+            self.textures[self.texture_index] = texture
+        self.renaming_path = None
+        while self.texture_path:
+            try:
+                slot_at(self.texture, self.texture_path)
+                break
+            except KeyError:
+                self.texture_path = self.texture_path[:-1]
+        self.mark_texture_dirty()
+
+    def _sync_texture(self) -> None:
+        """Re-composite when the texture or the bake behind it has changed."""
+        if not self._texture_dirty or self.texture is None:
+            return
+        if self.tex_curvature is None or self.tex_position is None:
+            return  # the masks read the bake; nothing to stand on yet
+
+        self.compositor.render(
+            self.texture, self._texture_resolution,
+            self.tex_curvature, self.tex_position,
+        )
+        self._texture_dirty = False
+        self._sync_texture_thumbnails()
+
+    def _sync_texture_thumbnails(self) -> None:
+        """Keep ImGui's texture registry in step with the tree's previews."""
+        for texture in self.compositor.reclaim():
+            try:
+                self.gui.remove_texture(texture)
+            except KeyError:
+                pass
+            texture.release()
+
+        live = set(self.compositor.thumbnails.values())
+        for texture in live - self._registered_thumbnails:
+            self.gui.register_texture(texture)
+        self._registered_thumbnails = live
 
     def _run_shaping(self) -> None:
         """Re-derive the output map from the baked fields. Runs every frame a
@@ -1077,7 +1211,6 @@ class MeshMapApp(mglw.WindowConfig):
         self.ctx.disable(moderngl.DEPTH_TEST | moderngl.CULL_FACE | moderngl.BLEND)
         self.shape_vao.render(moderngl.TRIANGLES, vertices=3)
         self._output_dirty = False
-        self._thumbnail_dirty = True
 
     def _current_texture(self) -> Optional[moderngl.Texture]:
         name = PREVIEW_MODES[self.preview_index].texture
@@ -1085,22 +1218,44 @@ class MeshMapApp(mglw.WindowConfig):
             "curvature": self.tex_curvature,
             "output": self.tex_output,
             "normal": self.tex_normal,
+            "composite": self.compositor.texture,
         }.get(name or "")
 
-    def _update_thumbnail(self) -> None:
-        source = self._current_texture()
-        if source is None:
-            return
-        source.use(0)
-        # The normal map is the one target whose channels are not a mask.
-        self.blit_program["u_rgb"].value = (
-            1 if PREVIEW_MODES[self.preview_index].texture == "normal" else 0
+    # -- layout -----------------------------------------------------------
+
+    @property
+    def viewport_rect(self) -> tuple[int, int, int, int]:
+        """Where the 3D view sits, in GL terms: ``(x, y, width, height)``.
+
+        The window is a navigation bar across the top, a sidebar down the left
+        and a status bar along the bottom; what is left over is the model's.
+        GL measures y from the bottom, so the status bar is the offset.
+
+        The sidebar is capped at half the window: a panel wider than the thing
+        it is describing is not a layout worth honouring.
+        """
+        width, height = self.wnd.buffer_size
+        scale = self.ui_pixel_scale
+        sidebar = int(min(panel.PANEL_WIDTH * scale, width * 0.5))
+        navbar = int(panel.NAVBAR_HEIGHT * scale)
+        status = int(panel.STATUS_BAR_HEIGHT * scale)
+        return (
+            sidebar,
+            status,
+            max(1, width - sidebar),
+            max(1, height - navbar - status),
         )
-        self.thumbnail_fbo.use()
-        self.ctx.viewport = (0, 0, THUMBNAIL_SIZE, THUMBNAIL_SIZE)
-        self.ctx.disable(moderngl.DEPTH_TEST)
-        self.blit_vao.render(moderngl.TRIANGLES, vertices=3)
-        self._thumbnail_dirty = False
+
+    def _sync_projection(self) -> None:
+        """Keep the camera's aspect matching the rect it actually draws into.
+
+        Re-checked every frame rather than only on resize: the UI scale changes
+        the chrome's size, and so the shape of what is left.
+        """
+        _, _, width, height = self.viewport_rect
+        aspect = width / max(height, 1)
+        if abs(self.camera.projection.aspect_ratio - aspect) > 1e-6:
+            self.camera.projection.update(aspect_ratio=aspect)
 
     # -- drawing ----------------------------------------------------------
 
@@ -1112,6 +1267,11 @@ class MeshMapApp(mglw.WindowConfig):
         # Clear colour and depth together: moderngl's clear() always touches
         # both, so this has to happen before the background is drawn.
         self.ctx.clear(0.0, 0.0, 0.0, 1.0, depth=1.0)
+
+        # The model lives in the space the chrome leaves it, not behind the
+        # sidebar. Everything that turns a screen position into a direction --
+        # the projection, the cursor ray, the gizmo -- works off this same rect.
+        self.ctx.viewport = self.viewport_rect
 
         # Depth testing off also disables depth writes, so the backdrop cannot
         # occlude the mesh drawn after it.
@@ -1128,7 +1288,7 @@ class MeshMapApp(mglw.WindowConfig):
         mode = PREVIEW_MODES[self.preview_index]
         texture = self._current_texture()
         if mode.texture is not None and texture is None:
-            mode = PREVIEW_MODES[SHADED_INDEX]  # nothing baked yet
+            mode = FLAT_MODE  # that map does not exist yet
         (texture or self._blank_texture).use(0)
 
         # The decal lights the mesh in every mode, the way a normal map in a
@@ -1163,11 +1323,14 @@ class MeshMapApp(mglw.WindowConfig):
 
         if self._output_dirty:
             self._run_shaping()
+        self._sync_texture()
         self._sync_decal()
-        if self._thumbnail_dirty and self.show_map_inspector:
-            self._update_thumbnail()
-
+        self._sync_projection()
         self._draw_scene()
+
+        # The scene draws into its own rect; the interface is drawn over the
+        # whole window, and ImGui renders through whatever viewport is bound.
+        self.ctx.viewport = (0, 0, *self.wnd.buffer_size)
 
         imgui.new_frame()
         draw_panel(self)
@@ -1206,13 +1369,16 @@ class MeshMapApp(mglw.WindowConfig):
             self.end_decal_placement(keep=False)
             return
 
+        # One number key per preview mode, and no more: a shortcut for a mode
+        # that does not exist would index straight off the end of the tuple.
+        number_keys = (keys.NUMBER_1, keys.NUMBER_2, keys.NUMBER_3, keys.NUMBER_4,
+                       keys.NUMBER_5, keys.NUMBER_6)
         shortcuts = {
-            keys.NUMBER_1: 0, keys.NUMBER_2: 1, keys.NUMBER_3: 2,
-            keys.NUMBER_4: 3, keys.NUMBER_5: 4, keys.NUMBER_6: 5,
+            key_code: index
+            for index, key_code in enumerate(number_keys[:len(PREVIEW_MODES)])
         }
         if key in shortcuts:
             self.preview_index = shortcuts[key]
-            self._thumbnail_dirty = True
         elif key == keys.B:
             self.request_bake()
         elif key == keys.E:
@@ -1489,25 +1655,18 @@ class MeshMapApp(mglw.WindowConfig):
         )
 
     def _gizmo_center(self) -> tuple[float, float]:
-        """Where to put the gizmo: top-right, but clear of the Map inspector.
+        """The gizmo's home: the top-right corner of the 3D view.
 
-        The inspector's default home is the same corner. Rather than let them
-        overlap, tuck the gizmo just left of whatever the inspector actually
-        occupies -- read from ImGui after it draws, so moving or resizing the
-        window brings the gizmo along.
+        Of the view, not of the window -- the navigation bar owns the strip
+        above it, and nothing floats over the view any more to dodge.
         """
-        width = float(self.wnd.buffer_size[0])
+        rect_x, _, rect_width, _ = self.viewport_rect
+        # ImGui measures y down from the top of the window, so the top of the
+        # 3D view is the navigation bar's height.
+        top = float(panel.NAVBAR_HEIGHT * self.ui_pixel_scale)
         reach = gizmo.radius(self.ui_pixel_scale)
         margin = gizmo.MARGIN * self.ui_pixel_scale
-        right_edge = width
-
-        inspector = self._inspector_rect
-        if inspector is not None:
-            x, y, inspector_width, inspector_height = inspector
-            # Only dodge if it is actually in the way of the top-right corner.
-            if y <= margin + reach * 2.0 and x + inspector_width >= width - margin:
-                right_edge = x
-        return right_edge - reach - margin, margin + reach
+        return float(rect_x + rect_width) - reach - margin, top + margin + reach
 
     def on_close(self) -> None:
         self.controller.release()
@@ -1526,17 +1685,19 @@ class MeshMapApp(mglw.WindowConfig):
         self.set_status("Baking...")
 
     def export(self) -> None:
-        """Write every map there is: the bake's two, plus the decal normals.
+        """Write every map there is, in one go.
 
-        The two halves are independent. A bake with no decal writes what it
-        always did, and a decal with no bake still writes normal.png -- it is
-        placed in UV space and owes the bake nothing.
+        One button, whatever exists: the mask tree's colours, the decals'
+        normals, and the bake's own two maps. They come from independent halves
+        of the app -- a decal is placed in UV space and owes the bake nothing --
+        so each is written if it is there and skipped if it is not.
         """
         controller = self.controller
         baked = controller.curvature_map is not None and self.output_fbo is not None
         normal = self.read_normal_map()
+        color = self.read_color_map()
 
-        if not baked and normal is None:
+        if not baked and normal is None and color is None:
             self.set_status(
                 "Nothing to export - bake a mesh, or import a decal", error=True
             )
@@ -1561,6 +1722,7 @@ class MeshMapApp(mglw.WindowConfig):
                 shaped,
                 controller.curvature_map if baked else None,
                 normal=normal,
+                color=color,
                 bits=self.export_bits,
             )
         except Exception:

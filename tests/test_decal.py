@@ -571,7 +571,6 @@ def test_the_decal_lights_the_mesh_in_the_viewport(app, tmp_path):
     app.open_decal(tmp_path / "vent.png")
     app.decal_params.scale = 1.0  # cover the quad entirely
     app.decal_params.intensity = 3.0
-    app.show_map_inspector = False
     app.mark_normal_dirty()
 
     def render() -> np.ndarray:
@@ -601,15 +600,25 @@ def placeable(app, tmp_path):
     write_normal_map(tmp_path / "vent.png", tilt=(1.0, 0.0))
     app.open_decal(tmp_path / "vent.png")
     app.decal_params.scale = 0.2
-    app.show_map_inspector = False
     app.on_render(0.0, 1 / 60.0)
     return app
 
 
 def viewport_point(app, fraction_x: float, fraction_y: float) -> tuple[int, int]:
-    """A cursor position, as a fraction across the window."""
-    width, height = app.wnd.buffer_size
-    return int(width * fraction_x), int(height * fraction_y)
+    """A cursor position inside the 3D view, as a fraction across it.
+
+    Not across the window: the navigation bar and the sidebar take their share,
+    and the model is laid out in what is left.
+    """
+    from ui.panel import NAVBAR_HEIGHT
+
+    left, _, width, height = app.viewport_rect
+    top = NAVBAR_HEIGHT * app.ui_pixel_scale
+    ratio = app.wnd.pixel_ratio
+    return (
+        int((left + width * fraction_x) / ratio),
+        int((top + height * fraction_y) / ratio),
+    )
 
 
 def test_the_cursor_reads_the_uv_under_it(placeable):

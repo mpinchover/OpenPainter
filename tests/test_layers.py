@@ -1,0 +1,810 @@
+"""The mask tree: its shape, and the passes that render it.
+
+A mask decides between two things, and either of those can be another mask, so
+the model is a binary tree of unbounded depth. Two properties carry the whole
+feature: edits rebuild the tree rather than mutating it (a panel holding a stale
+node must not be able to write into the live one), and rendering costs one pass
+per node with a bounded number of targets however deep it goes.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from core.layers import (  # noqa: E402
+    MASK_KINDS,
+    MAX_DEPTH,
+    ColorSlot,
+    MaskLayer,
+    NoiseMaskParams,
+    can_nest,
+    convert_slot,
+    depth,
+    describe,
+    kind_of,
+    mask_at,
+    mask_count,
+    new_texture,
+    path_labels,
+    set_slot,
+    slot_at,
+    walk,
+)
+
+RED = (1.0, 0.0, 0.0)
+BLUE = (0.0, 0.0, 1.0)
+GREEN = (0.0, 1.0, 0.0)
+
+
+def nested_tree() -> MaskLayer:
+    """Edge wear over red, with a noise deciding the black side."""
+    return MaskLayer(
+        kind="edge_wear",
+        white=ColorSlot(RED),
+        black=MaskLayer(kind="noise", white=ColorSlot(GREEN), black=ColorSlot(BLUE)),
+    )
+
+
+# --------------------------------------------------------------------------
+# the shape of the tree
+# --------------------------------------------------------------------------
+
+def test_a_new_texture_is_a_single_colour():
+    """A texture starts as the simplest thing that is still a texture."""
+    texture = new_texture()
+    assert isinstance(texture, ColorSlot)
+    assert kind_of(texture) == "color"
+    assert depth(texture) == 0 and mask_count(texture) == 0
+
+
+def test_making_a_colour_into_a_mask_grows_the_tree_under_it():
+    texture = ColorSlot(RED)
+    as_mask = convert_slot(texture, "noise")
+
+    assert isinstance(as_mask, MaskLayer) and as_mask.kind == "noise"
+    assert depth(as_mask) == 1 and mask_count(as_mask) == 1
+    # Plain white and black underneath, so the model shows the mask itself --
+    # the thing just asked for, and the thing to judge before colouring it.
+    assert as_mask.white.color == (1.0, 1.0, 1.0)
+    assert as_mask.black.color == (0.0, 0.0, 0.0)
+
+
+def test_a_mask_back_to_a_colour_takes_its_branches_with_it():
+    tree = set_slot(convert_slot(ColorSlot(RED), "edge_wear"), ("white",), ColorSlot(RED))
+    tree = set_slot(tree, ("black",), MaskLayer(kind="noise"))
+    assert depth(tree) == 2
+
+    collapsed = convert_slot(tree, "color")
+    assert isinstance(collapsed, ColorSlot)
+    assert collapsed.color == RED, "the white side is the colour just described"
+    assert depth(collapsed) == 0
+
+
+def test_switching_between_two_mask_kinds_keeps_the_branches():
+    tree = MaskLayer(kind="noise", white=ColorSlot(RED), black=ColorSlot(BLUE))
+    switched = convert_slot(tree, "edge_wear")
+
+    assert switched.kind == "edge_wear"
+    assert switched.white.color == RED and switched.black.color == BLUE
+
+
+def test_an_unknown_kind_is_refused():
+    with pytest.raises(KeyError):
+        convert_slot(ColorSlot(RED), "marble")
+
+
+def test_paths_address_every_slot():
+    tree = nested_tree()
+    assert slot_at(tree, ()) is tree
+    assert slot_at(tree, ("white",)).color == RED
+    assert slot_at(tree, ("black", "white")).color == GREEN
+    assert slot_at(tree, ("black", "black")).color == BLUE
+    assert mask_at(tree, ("black",)).kind == "noise"
+
+
+def test_a_path_through_a_colour_is_an_error():
+    tree = nested_tree()
+    with pytest.raises(KeyError):
+        slot_at(tree, ("white", "white"))
+    with pytest.raises(KeyError):
+        mask_at(tree, ("white",))
+
+
+def test_only_white_and_black_are_slots():
+    with pytest.raises(KeyError):
+        MaskLayer().slot("grey")
+
+
+def test_editing_rebuilds_rather_than_mutates():
+    """The panel edits by replacing. A tree handed out earlier must not change
+    underneath whoever is holding it."""
+    tree = nested_tree()
+    edited = set_slot(tree, ("black", "white"), ColorSlot((0.5, 0.5, 0.5)))
+
+    assert slot_at(edited, ("black", "white")).color == (0.5, 0.5, 0.5)
+    assert slot_at(tree, ("black", "white")).color == GREEN, "the original stands"
+    assert edited is not tree
+
+
+def test_setting_the_root_replaces_the_whole_texture():
+    """Including with a colour: the whole texture may be just one."""
+    replacement = MaskLayer(kind="noise")
+    assert set_slot(nested_tree(), (), replacement) is replacement
+
+    flat = ColorSlot(RED)
+    assert set_slot(nested_tree(), (), flat) is flat
+
+
+def test_a_mask_can_replace_a_colour_and_a_colour_a_whole_subtree():
+    tree = set_slot(MaskLayer(), ("white",), MaskLayer(kind="noise"))
+    assert depth(tree) == 2
+
+    flattened = set_slot(tree, ("white",), ColorSlot(RED))
+    assert depth(flattened) == 1, "collapsing a branch takes its children with it"
+
+
+def test_depth_counts_the_deepest_branch():
+    assert depth(ColorSlot(RED)) == 0
+    assert depth(MaskLayer()) == 1
+    assert depth(nested_tree()) == 2
+
+    stacked = MaskLayer()
+    for _ in range(4):
+        stacked = MaskLayer(white=stacked)
+    assert depth(stacked) == 5
+    assert mask_count(stacked) == 5
+
+
+def test_walk_visits_parents_before_children_and_white_before_black():
+    paths = [path for path, _ in walk(nested_tree())]
+    assert paths == [
+        (), ("white",), ("black",), ("black", "white"), ("black", "black"),
+    ]
+
+
+def test_nesting_stops_at_the_cap():
+    tree = MaskLayer()
+    path: tuple[str, ...] = ()
+    for _ in range(MAX_DEPTH - 1):
+        path = path + ("white",)
+        tree = set_slot(tree, path, MaskLayer(kind="noise"))
+
+    assert can_nest(tree, path + ("white",)) is False, "one more would pass the cap"
+    assert can_nest(tree, ("black",)) is True, "a shallow slot is still free"
+
+
+def test_switching_kind_keeps_both_sets_of_settings():
+    """Dialling in wear, trying noise, and going back should find the wear
+    settings where they were left."""
+    from dataclasses import replace
+
+    node = MaskLayer(kind="edge_wear")
+    node.edge_wear.contrast = 7.5
+    node.noise.scale = 33.0
+
+    as_noise = replace(node, kind="noise")
+    back = replace(as_noise, kind="edge_wear")
+    assert back.edge_wear.contrast == 7.5
+    assert as_noise.noise.scale == 33.0
+
+
+def test_a_slot_can_be_named_and_un_named():
+    """A name is for the parts worth naming; everything else names itself."""
+    colour = ColorSlot((1.0, 0.0, 0.0))
+    assert describe(colour) == "#FF0000"
+
+    colour.name = "Rust"
+    assert describe(colour) == "Rust"
+    assert colour.auto_label == "#FF0000", "what it goes back to"
+
+    colour.name = ""
+    assert describe(colour) == "#FF0000"
+
+
+def test_a_name_survives_a_change_of_kind():
+    """It names the part of the texture, not the kind of thing it is today."""
+    colour = ColorSlot(RED, name="Rust")
+
+    as_mask = convert_slot(colour, "noise")
+    assert as_mask.name == "Rust" and describe(as_mask) == "Rust"
+    assert as_mask.auto_label == "Noise"
+
+    as_wear = convert_slot(as_mask, "edge_wear")
+    assert as_wear.name == "Rust"
+
+    back = convert_slot(as_wear, "color")
+    assert back.name == "Rust"
+
+
+def test_labels_say_what_a_slot_is():
+    assert describe(ColorSlot((1.0, 0.0, 0.0))) == "#FF0000"
+    assert describe(MaskLayer(kind="noise")) == MASK_KINDS["noise"]
+
+    crumbs = path_labels(nested_tree(), ("black",))
+    assert crumbs == ["Edge wear", "Black: Noise"]
+
+
+def test_only_edge_wear_needs_the_bake():
+    assert MaskLayer(kind="edge_wear").needs_bake
+    assert not MaskLayer(kind="noise").needs_bake
+
+
+def test_noise_params_reach_the_shader_by_name():
+    uniforms = NoiseMaskParams(scale=3.0).as_uniforms()
+    assert uniforms["u_noiseScale"] == 3.0
+    assert set(uniforms) == {
+        "u_noiseScale", "u_noiseDetail", "u_noiseRoughness", "u_noiseLacunarity",
+        "u_noiseDistortion", "u_noiseBias", "u_noiseContrast",
+    }
+
+
+# --------------------------------------------------------------------------
+# rendering it
+# --------------------------------------------------------------------------
+
+RESOLUTION = 64
+
+
+@pytest.fixture(scope="module")
+def ctx():
+    import moderngl
+
+    try:
+        context = moderngl.create_standalone_context(require=330)
+    except Exception as exc:  # pragma: no cover - depends on the host
+        pytest.skip(f"no GL context available: {exc}")
+    yield context
+    context.release()
+
+
+@pytest.fixture
+def compositor(ctx):
+    from render.composite import LayerCompositor
+
+    instance = LayerCompositor(ctx)
+    yield instance
+    instance.release()
+
+
+@pytest.fixture
+def inputs(ctx):
+    """A curvature ramp along u, and positions spanning the bounding box."""
+    curvature = np.tile(np.linspace(0.0, 1.0, RESOLUTION, dtype="f4"), (RESOLUTION, 1))
+    axis = np.linspace(0.0, 1.0, RESOLUTION, dtype="f4")
+    gx, gy = np.meshgrid(axis, axis)
+    position = np.stack([gx, gy, np.full_like(gx, 0.3)], axis=-1).astype("f4")
+
+    tex_curvature = ctx.texture((RESOLUTION, RESOLUTION), 1, data=curvature.tobytes(), dtype="f4")
+    tex_position = ctx.texture((RESOLUTION, RESOLUTION), 3, data=position.tobytes(), dtype="f4")
+    yield tex_curvature, tex_position
+    tex_curvature.release()
+    tex_position.release()
+
+
+def render(compositor, inputs, tree) -> np.ndarray:
+    compositor.render(tree, RESOLUTION, *inputs)
+    return compositor.read()
+
+
+def plain_wear(**colors) -> MaskLayer:
+    """Wear with the noise weighted out, so the mask is the curvature itself."""
+    tree = MaskLayer(kind="edge_wear", **colors)
+    tree.edge_wear.wear_amount = 0.0
+    tree.edge_wear.contrast = 1.0
+    return tree
+
+
+def test_a_mask_picks_between_its_two_colours(compositor, inputs):
+    out = render(compositor, inputs, plain_wear(white=ColorSlot(RED), black=ColorSlot(BLUE)))
+
+    assert out.shape == (RESOLUTION, RESOLUTION, 3)
+    assert out[32, -1] == pytest.approx(RED, abs=0.05), "high curvature is white's side"
+    assert out[32, 0] == pytest.approx(BLUE, abs=0.05), "low curvature is black's"
+
+
+def test_the_two_sides_swap_with_the_colours(compositor, inputs):
+    swapped = render(compositor, inputs, plain_wear(white=ColorSlot(BLUE), black=ColorSlot(RED)))
+    assert swapped[32, -1] == pytest.approx(BLUE, abs=0.05)
+
+
+def test_a_nested_mask_replaces_that_side(compositor, inputs):
+    """The black side becomes a noise between two colours, so what was one flat
+    colour is now two."""
+    flat = render(compositor, inputs, plain_wear(white=ColorSlot(RED), black=ColorSlot(BLUE)))
+
+    tree = plain_wear(white=ColorSlot(RED))
+    tree = set_slot(tree, ("black",), MaskLayer(
+        kind="noise",
+        noise=NoiseMaskParams(scale=20.0, contrast=12.0),
+        white=ColorSlot(GREEN),
+        black=ColorSlot(BLUE),
+    ))
+    nested = render(compositor, inputs, tree)
+
+    # The first column is curvature 0, so the mask is fully on black's side and
+    # what shows there is entirely whatever black resolves to.
+    assert len(np.unique(flat[:, 0].round(2), axis=0)) == 1, "one flat colour"
+    assert len(np.unique(nested[:, 0].round(2), axis=0)) > 1, "now a noise"
+    # The white side is untouched by what happens under black.
+    assert nested[32, -1] == pytest.approx(flat[32, -1], abs=0.02)
+
+
+def test_every_mask_gets_a_thumbnail_and_colours_do_not(compositor, inputs):
+    tree = nested_tree()
+    render(compositor, inputs, tree)
+
+    assert sorted(compositor.thumbnails) == [(), ("black",)]
+    assert compositor.thumbnail(()) is not None
+    assert compositor.thumbnail(("white",)) is None, "a colour needs no preview"
+
+
+def test_thumbnails_are_dropped_when_their_branch_goes(compositor, inputs):
+    tree = nested_tree()
+    render(compositor, inputs, tree)
+    assert compositor.thumbnail(("black",)) is not None
+
+    render(compositor, inputs, set_slot(tree, ("black",), ColorSlot(BLUE)))
+    assert compositor.thumbnail(("black",)) is None
+    assert compositor.retired, "and handed over to be unregistered, not just freed"
+
+
+def test_depth_costs_passes_not_targets(compositor, inputs):
+    """The point of rendering bottom-up: a target per level in flight, and the
+    pool is reused rather than grown with the tree."""
+    tree = MaskLayer(kind="noise")
+    for _ in range(MAX_DEPTH - 1):
+        tree = MaskLayer(kind="noise", white=tree, black=ColorSlot(BLUE))
+
+    render(compositor, inputs, tree)
+    assert depth(tree) == MAX_DEPTH
+    assert compositor._pool.size <= MAX_DEPTH + 1
+    assert len(compositor.thumbnails) == MAX_DEPTH
+
+
+def test_a_tree_past_the_cap_is_refused_rather_than_rendered(compositor, inputs):
+    tree = MaskLayer(kind="noise")
+    for _ in range(MAX_DEPTH + 1):
+        tree = MaskLayer(kind="noise", white=tree)
+
+    with pytest.raises(ValueError, match="deeper"):
+        render(compositor, inputs, tree)
+
+
+def test_re_rendering_the_same_tree_is_stable(compositor, inputs):
+    tree = nested_tree()
+    first = render(compositor, inputs, tree)
+    second = render(compositor, inputs, tree)
+    assert np.array_equal(first, second)
+
+
+def test_changing_a_colour_changes_only_that_side(compositor, inputs):
+    tree = plain_wear(white=ColorSlot(RED), black=ColorSlot(BLUE))
+    before = render(compositor, inputs, tree)
+    after = render(compositor, inputs, set_slot(tree, ("black",), ColorSlot(GREEN)))
+
+    assert after[32, -1] == pytest.approx(before[32, -1], abs=0.02)
+    assert after[32, 0] == pytest.approx(GREEN, abs=0.05)
+
+
+def test_a_noise_mask_needs_no_curvature_to_say_something(compositor, inputs):
+    """Noise reads the positions, not the bake, so it patterns a surface whose
+    curvature is flat everywhere."""
+    _, position = inputs
+    ctx = compositor.ctx
+    flat = ctx.texture((RESOLUTION, RESOLUTION), 1,
+                       data=np.zeros((RESOLUTION, RESOLUTION), "f4").tobytes(), dtype="f4")
+    try:
+        tree = MaskLayer(kind="noise", noise=NoiseMaskParams(scale=15.0, contrast=10.0),
+                         white=ColorSlot(RED), black=ColorSlot(BLUE))
+        compositor.render(tree, RESOLUTION, flat, position)
+        out = compositor.read()
+    finally:
+        flat.release()
+
+    colors = np.unique(out.round(2).reshape(-1, 3), axis=0)
+    assert len(colors) > 1, "the noise has to vary across the surface"
+
+
+# --------------------------------------------------------------------------
+# through the app: creating a texture, editing it, and the one export button
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def baked_app(ctx, tmp_path):
+    """The real app, headless, with a bake behind it -- what the masks read."""
+    import time
+
+    import moderngl_window as mglw
+    import trimesh
+    from imgui_bundle import imgui
+
+    from render.viewport import MeshMapApp
+
+    mesh = trimesh.Trimesh(
+        vertices=np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=float),
+        faces=np.array([[0, 1, 2], [0, 2, 3]]),
+        process=False,
+        visual=trimesh.visual.TextureVisuals(
+            uv=np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float)
+        ),
+    )
+    mesh.export(tmp_path / "quad.obj")
+
+    MeshMapApp.initial_mesh = str(tmp_path / "quad.obj")
+    MeshMapApp.initial_resolution = 256
+    try:
+        app = mglw.create_window_config_instance(MeshMapApp, args=["-wnd", "headless"])
+    except Exception as exc:  # pragma: no cover - depends on the host
+        pytest.skip(f"no headless window available: {exc}")
+
+    app.request_bake()
+    deadline = time.monotonic() + 30.0
+    while app.controller.running and time.monotonic() < deadline:
+        app.controller.pump()
+        # The CPU stages run on a worker thread; spinning here just fights it
+        # for the GIL, which is why the app pumps once a frame rather than in a
+        # loop like this one.
+        time.sleep(0.002)
+    app.on_render(0.0, 1 / 60.0)
+
+    yield app
+    app.controller.release()
+    imgui.destroy_context()
+    MeshMapApp.initial_mesh = None
+
+
+def test_a_new_texture_is_named_and_the_names_count_up(baked_app):
+    baked_app.create_texture()
+    assert baked_app.texture.name == "Texture 01"
+    assert "Texture 01" in baked_app.status
+
+    baked_app.create_texture()
+    assert baked_app.texture.name == "Texture 02"
+
+
+def test_a_texture_can_be_renamed(baked_app):
+    baked_app.create_texture()
+    baked_app.texture.name = "Hull plate"
+    assert describe(baked_app.texture) == "Hull plate"
+
+    # And renaming changes nothing about what is rendered.
+    before = baked_app.read_color_map()
+    baked_app.texture.name = "Something else"
+    assert np.array_equal(before, baked_app.read_color_map())
+
+
+def test_starting_or_switching_texture_ends_any_rename(baked_app):
+    baked_app.create_texture()
+    baked_app.renaming_path = ()
+    baked_app.create_texture()
+    assert baked_app.renaming_path is None
+
+    baked_app.renaming_path = ()
+    baked_app.select_texture(0)
+    assert baked_app.renaming_path is None
+
+
+def test_an_app_starts_with_no_texture(baked_app):
+    """Nothing is made until it is asked for."""
+    assert baked_app.texture is None
+    assert baked_app.selected_slot is None
+    assert baked_app.read_color_map() is None
+
+
+def test_a_new_texture_composites_as_a_flat_colour(baked_app):
+    baked_app.create_texture()
+    assert isinstance(baked_app.texture, ColorSlot)
+
+    composite = baked_app.read_color_map()
+    assert composite is not None
+    expected = baked_app.texture.color
+    assert np.allclose(composite, expected, atol=2e-3), "one colour, everywhere"
+
+
+def test_turning_the_texture_into_a_mask_re_composites(baked_app):
+    baked_app.create_texture()
+    flat = baked_app.read_color_map()
+
+    baked_app.set_texture(convert_slot(baked_app.texture, "noise"))
+    patterned = baked_app.read_color_map()
+
+    assert not np.allclose(flat, patterned)
+    assert patterned.min() < 0.05 and patterned.max() > 0.95, "black and white"
+
+
+def test_removing_the_last_texture_leaves_nothing_to_composite(baked_app):
+    baked_app.create_texture()
+    assert baked_app.read_color_map() is not None
+
+    baked_app.remove_texture()
+    assert baked_app.texture is None and baked_app.textures == []
+    assert baked_app.read_color_map() is None
+    assert baked_app.compositor.texture is None
+
+
+def test_textures_are_kept_and_can_be_switched_between(baked_app):
+    """Every texture made stays around; the picker is how one is gone back to."""
+    baked_app.create_texture()
+    baked_app.set_texture(MaskLayer(
+        kind="noise", name="Speckle", white=ColorSlot(RED), black=ColorSlot(BLUE)
+    ))
+    speckled = baked_app.read_color_map()
+
+    baked_app.create_texture()
+    baked_app.set_texture(ColorSlot(GREEN, name="Flat green"))
+    assert len(baked_app.textures) == 2
+    assert np.allclose(baked_app.read_color_map(), GREEN, atol=2e-3)
+
+    baked_app.select_texture(0)
+    assert describe(baked_app.texture) == "Speckle"
+    assert np.array_equal(baked_app.read_color_map(), speckled)
+
+
+def test_removing_one_texture_falls_back_to_a_neighbour(baked_app):
+    baked_app.create_texture()
+    baked_app.create_texture()
+    second = describe(baked_app.textures[1])
+
+    baked_app.select_texture(0)
+    baked_app.remove_texture()
+
+    assert len(baked_app.textures) == 1
+    assert describe(baked_app.texture) == second, "what is left is what is shown"
+    assert baked_app.texture_path == ()
+
+
+def test_selecting_a_texture_that_is_not_there_is_ignored(baked_app):
+    baked_app.create_texture()
+    baked_app.select_texture(7)
+    assert baked_app.texture_index == 0
+
+
+def test_a_colour_slot_can_be_selected_as_well_as_a_mask(baked_app):
+    """The panel edits whichever is selected, so both have to be reachable."""
+    baked_app.create_texture()
+    baked_app.set_texture(convert_slot(baked_app.texture, "edge_wear"))
+
+    baked_app.select_slot(("white",))
+    assert baked_app.texture_path == ("white",)
+    assert isinstance(baked_app.selected_slot, ColorSlot)
+
+    baked_app.select_slot(())
+    assert isinstance(baked_app.selected_slot, MaskLayer)
+
+
+def test_selection_follows_the_tree_when_a_branch_is_removed(baked_app):
+    """The panel stands on a path. Collapsing that branch has to move it
+    somewhere that still exists, not leave it pointing at nothing."""
+    baked_app.create_texture()
+    baked_app.set_texture(convert_slot(baked_app.texture, "edge_wear"))
+    baked_app.set_texture(
+        set_slot(baked_app.texture, ("white",), MaskLayer(kind="noise"))
+    )
+    baked_app.select_slot(("white", "black"))
+    assert baked_app.texture_path == ("white", "black")
+
+    baked_app.set_texture(set_slot(baked_app.texture, ("white",), ColorSlot(RED)))
+    assert baked_app.texture_path == ("white",), "up to the nearest slot left"
+    assert isinstance(baked_app.selected_slot, ColorSlot)
+
+
+def test_selecting_a_path_that_does_not_exist_is_ignored(baked_app):
+    baked_app.create_texture()
+    baked_app.select_slot(("white", "black"))  # a flat colour has no slots
+    assert baked_app.texture_path == ()
+
+
+def test_one_export_writes_the_colour_and_the_normal_map(baked_app, tmp_path):
+    """One button, everything there is."""
+    from PIL import Image
+
+    baked_app.create_texture()
+    decal = tmp_path / "decal.png"
+    normal = np.array([0.9, 0.5, 1.0], dtype=np.float32)
+    Image.fromarray(
+        np.tile((normal * 255).astype(np.uint8), (32, 32, 1))
+    ).save(decal)
+    baked_app.open_decal(decal)
+    baked_app.on_render(0.0, 1 / 60.0)
+
+    baked_app.export_dir = str(tmp_path / "out")
+    baked_app.export()
+
+    written = sorted(p.name for p in (tmp_path / "out" / "quad").glob("*.png"))
+    assert written == ["color.png", "curvature.png", "edge_wear.png", "normal.png"]
+    assert "color.png" in baked_app.status and "normal.png" in baked_app.status
+
+
+def test_no_texture_means_no_colour_map_is_written(baked_app, tmp_path):
+    baked_app.export_dir = str(tmp_path / "out")
+    baked_app.export()
+
+    written = sorted(p.name for p in (tmp_path / "out" / "quad").glob("*.png"))
+    assert written == ["curvature.png", "edge_wear.png"]
+
+
+def test_the_exported_colours_are_the_ones_on_screen(baked_app, tmp_path):
+    from PIL import Image
+
+    baked_app.create_texture()
+    baked_app.set_texture(convert_slot(baked_app.texture, "noise"))
+    baked_app.set_texture(
+        set_slot(baked_app.texture, ("black",), ColorSlot((0.2, 0.6, 0.9)))
+    )
+    baked_app.export_dir = str(tmp_path / "out")
+    baked_app.export()
+
+    on_screen = baked_app.read_color_map()
+    written = np.asarray(
+        Image.open(tmp_path / "out" / "quad" / "color.png"), dtype=np.float32
+    ) / 255.0
+    assert np.abs(np.flipud(written) - on_screen).max() < 2.0 / 255
+
+
+def test_the_colour_map_follows_the_bake_resolution(baked_app):
+    import time
+
+    baked_app.create_texture()
+    assert baked_app.read_color_map().shape[0] == 256
+
+    baked_app.controller.bake_params.resolution = 512
+    baked_app.request_bake()
+    while baked_app.controller.running:
+        baked_app.controller.pump()
+        time.sleep(0.002)
+    baked_app.on_render(0.0, 1 / 60.0)
+
+    assert baked_app.read_color_map().shape[0] == 512
+
+
+def test_the_shaded_view_is_the_texture(baked_app):
+    """Shaded shows what the texture resolves to, which is the whole point of
+    setting colours under the masks."""
+    from render.viewport import PREVIEW_MODES, SHADED_INDEX
+
+    assert PREVIEW_MODES[SHADED_INDEX].texture == "composite"
+    baked_app.create_texture()
+    baked_app.preview_index = SHADED_INDEX
+    baked_app.on_render(0.0, 1 / 60.0)
+    assert baked_app._current_texture() is baked_app.compositor.texture
+
+
+def test_a_fresh_mask_reads_as_black_and_white(baked_app):
+    """Nothing has been coloured yet, so the shaded model shows the mask itself
+    -- white where the mask is white, black where it is black."""
+    baked_app.create_texture()
+    baked_app.set_texture(convert_slot(baked_app.texture, "noise"))
+
+    tree = baked_app.texture
+    assert tree.white.color == (1.0, 1.0, 1.0)
+    assert tree.black.color == (0.0, 0.0, 0.0)
+
+    composite = baked_app.read_color_map()
+    # Every texel is grey: the two ends and whatever the filter puts between.
+    assert np.allclose(composite[..., 0], composite[..., 1], atol=1e-3)
+    assert np.allclose(composite[..., 1], composite[..., 2], atol=1e-3)
+    assert composite.min() < 0.05 and composite.max() > 0.95, "it spans the range"
+
+
+def test_colours_under_the_mask_are_what_shaded_shows(baked_app):
+    baked_app.create_texture()
+    baked_app.set_texture(MaskLayer(
+        kind="noise", white=ColorSlot(RED), black=ColorSlot(BLUE)
+    ))
+    composite = baked_app.read_color_map()
+
+    flat = composite.reshape(-1, 3)
+    assert np.any(np.all(np.abs(flat - RED) < 0.05, axis=1)), "the white side"
+    assert np.any(np.all(np.abs(flat - BLUE) < 0.05, axis=1)), "the black side"
+    assert not np.any(flat[:, 1] > 0.5), "and nothing green anywhere"
+
+
+def test_the_picker_searches_by_name(baked_app):
+    """Half-remembered names are as often remembered by their end as their
+    start, so the search is unanchored -- and case does not matter."""
+    from ui.panel import filter_textures
+
+    textures = [
+        ColorSlot(RED, name="Hull plate 01"),
+        ColorSlot(RED, name="Hull plate 02"),
+        ColorSlot(RED, name="Rusted vent"),
+        MaskLayer(name="Panel wear"),
+    ]
+
+    assert filter_textures(textures, "") == [
+        (0, "Hull plate 01"), (1, "Hull plate 02"),
+        (2, "Rusted vent"), (3, "Panel wear"),
+    ]
+    assert [index for index, _ in filter_textures(textures, "hull")] == [0, 1]
+    assert [index for index, _ in filter_textures(textures, "  VENT ")] == [2]
+    assert [index for index, _ in filter_textures(textures, "wear")] == [3]
+    assert filter_textures(textures, "nothing like it") == []
+
+
+def test_the_picker_searches_what_a_texture_is_called_now(baked_app):
+    """An unnamed texture is searchable by the label it shows instead."""
+    from ui.panel import filter_textures
+
+    assert [index for index, _ in filter_textures([ColorSlot(RED)], "FF00")] == [0]
+
+
+def test_the_texture_tab_draws_in_every_state(baked_app):
+    """The panel's own begin/end pairing, through each shape a texture takes.
+
+    Cheap to run and the only thing that catches an unbalanced child region or
+    a control asking a colour for something only a mask has.
+    """
+    from imgui_bundle import imgui
+
+    from ui import panel
+
+    def draw() -> None:
+        imgui.new_frame()
+        imgui.begin("Parameters")
+        panel._draw_texture_tab(baked_app)
+        imgui.end()
+        imgui.end_frame()
+
+    draw()  # no texture at all
+
+    baked_app.create_texture()
+    draw()  # a flat colour, selected
+
+    baked_app.set_texture(convert_slot(baked_app.texture, "edge_wear"))
+    draw()  # a mask, selected
+
+    baked_app.set_texture(
+        set_slot(baked_app.texture, ("black",), MaskLayer(kind="noise"))
+    )
+    baked_app.select_slot(("black", "white"))
+    draw()  # a colour nested two levels down
+
+    baked_app.select_slot(("black",))
+    draw()  # and the mask above it
+
+    baked_app.renaming_path = ("black",)
+    draw()  # a row being renamed in place
+
+    baked_app.renaming_path = None
+    for _ in range(6):
+        baked_app.create_texture()
+    baked_app.texture_filter = "02"
+    draw()  # several textures, with the picker's search box in play
+
+
+def test_shaded_falls_back_to_plain_grey_before_a_bake(ctx, tmp_path):
+    """The tree has nothing to stand on until the bake exists, and a viewport
+    that renders nothing at all would read as a broken load."""
+    import moderngl_window as mglw
+    import trimesh
+    from imgui_bundle import imgui
+
+    from render.viewport import FLAT_MODE, PREVIEW_MODES, SHADED_INDEX, MeshMapApp
+
+    trimesh.creation.box().export(tmp_path / "box.obj")
+    MeshMapApp.initial_mesh = str(tmp_path / "box.obj")
+    MeshMapApp.initial_resolution = 256
+    try:
+        app = mglw.create_window_config_instance(MeshMapApp, args=["-wnd", "headless"])
+    except Exception as exc:  # pragma: no cover - depends on the host
+        pytest.skip(f"no headless window available: {exc}")
+
+    try:
+        app.preview_index = SHADED_INDEX
+        assert app.compositor.texture is None, "nothing baked"
+        assert app._current_texture() is None
+        assert FLAT_MODE.texture is None and FLAT_MODE.shader_mode == 3
+
+        app.on_render(0.0, 1 / 60.0)  # must draw rather than raise
+        assert PREVIEW_MODES[app.preview_index].texture == "composite"
+    finally:
+        app.controller.release()
+        imgui.destroy_context()
+        MeshMapApp.initial_mesh = None

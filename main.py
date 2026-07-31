@@ -131,8 +131,11 @@ def run_selftest(args: argparse.Namespace) -> int:
         return 1
 
     app.export_dir = str(output)
-    for index, mode in ((0, "edge_wear"), (1, "curvature"), (4, "shaded")):
+    from render.viewport import PREVIEW_MODES
+
+    for index, mode in enumerate(PREVIEW_MODES):
         app.preview_index = index
+        mode = mode.label.lower()
         # ImGui needs a couple of frames to size and place its windows before
         # they show up in a capture.
         for _ in range(3):
