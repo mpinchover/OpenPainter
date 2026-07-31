@@ -578,6 +578,24 @@ def _draw_mask_params(app: "MeshMapApp", node) -> bool:
     and costs a click to find out what is in there.
     """
     dirty = False
+
+    imgui.separator_text("Boundary")
+    changed, node.threshold = imgui.slider_float("Threshold", node.threshold, 0.0, 1.0)
+    dirty |= changed
+    _tooltip(
+        "Where the mask divides its two sides. A mask is a continuous field --\n"
+        "edge wear ramps up as the surface curves, noise wanders through every\n"
+        "value -- and this is the level that decides which side a texel is on.\n"
+        "Lower gives white's side more of the surface."
+    )
+    changed, node.softness = imgui.slider_float("Softness", node.softness, 0.0, 0.5)
+    dirty |= changed
+    _tooltip(
+        "How wide the crossing is. 0 is a clean division: every texel belongs\n"
+        "to one side or the other. Raise it to blend them across a band."
+    )
+
+    imgui.separator_text("Mask")
     if node.kind == "noise":
         noise = node.noise
         changed, noise.scale = imgui.slider_float(

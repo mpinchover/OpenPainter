@@ -18,6 +18,8 @@ uniform sampler2D u_white;      // used only when u_whiteIsMap is 1
 uniform sampler2D u_black;
 
 uniform int u_kind;             // 0 = edge wear, 1 = noise, 2 = flat colour
+uniform float u_threshold;      // where the two sides divide, on the mask's 0..1
+uniform float u_softness;       // how wide the crossing is; 0 is a clean split
 uniform int u_whiteIsMap;
 uniform int u_blackIsMap;
 uniform vec3 u_whiteColor;
@@ -66,6 +68,14 @@ float mask_value(vec3 bposition) {
 void main() {
     vec3 bposition = texture(u_position, v_uv).rgb;
     float mask = mask_value(bposition);
+
+    // A mask is a continuous field, so mixing by it directly blends the two
+    // sides everywhere it sits mid-way -- the colours bleed into each other
+    // instead of dividing. Cutting it at the threshold is what makes the
+    // boundary a boundary; softness feathers it back if that is wanted.
+    mask = u_softness <= 0.0
+        ? step(u_threshold, mask)
+        : smoothstep(u_threshold - u_softness, u_threshold + u_softness, mask);
 
     vec3 white = u_whiteIsMap == 1 ? texture(u_white, v_uv).rgb : u_whiteColor;
     vec3 black = u_blackIsMap == 1 ? texture(u_black, v_uv).rgb : u_blackColor;

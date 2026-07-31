@@ -228,6 +228,8 @@ class LayerCompositor:
 
         if isinstance(node, ColorSlot):
             program["u_kind"].value = _FLAT
+            program["u_threshold"].value = 0.5
+            program["u_softness"].value = 0.0
             program["u_whiteIsMap"].value = 0
             program["u_blackIsMap"].value = 0
             program["u_whiteColor"].value = tuple(float(c) for c in node.color)
@@ -238,6 +240,8 @@ class LayerCompositor:
 
         program["u_kind"].value = _KINDS.get(node.kind, 0)
 
+        for name, value in node.boundary_uniforms().items():
+            program[name].value = value
         for name, value in node.edge_wear.as_uniforms().items():
             program[name].value = value
         for name, value in node.noise.as_uniforms().items():

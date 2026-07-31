@@ -301,6 +301,46 @@ def plain_wear(**colors) -> MaskLayer:
     return tree
 
 
+def test_the_boundary_is_a_boundary_by_default(compositor, inputs):
+    """Every texel belongs to one side or the other -- no blend of the two.
+
+    A mask is a continuous field, so mixing by it directly bleeds the colours
+    into each other everywhere it sits mid-way. Cut at the threshold, the only
+    colours on the surface are the ones that were put there.
+    """
+    out = render(compositor, inputs, plain_wear(
+        white=ColorSlot(RED), black=ColorSlot(BLUE)
+    ))
+
+    colours = np.unique(out.round(3).reshape(-1, 3), axis=0)
+    assert len(colours) == 2, f"expected two colours, got {colours}"
+    assert sorted(map(tuple, colours)) == [BLUE, RED]
+
+
+def test_softness_is_what_brings_the_blend_back(compositor, inputs):
+    tree = plain_wear(white=ColorSlot(RED), black=ColorSlot(BLUE))
+    tree.softness = 0.25
+    out = render(compositor, inputs, tree)
+
+    colours = np.unique(out.round(2).reshape(-1, 3), axis=0)
+    assert len(colours) > 2, "a band of intermediate mixes"
+    # And it is a band, not the whole surface: both ends are still pure.
+    assert np.any(np.all(np.abs(out - RED) < 1e-3, axis=-1))
+    assert np.any(np.all(np.abs(out - BLUE) < 1e-3, axis=-1))
+
+
+def test_the_threshold_moves_where_the_sides_divide(compositor, inputs):
+    """The curvature ramps along u, so the split slides along with it."""
+    def white_share(threshold: float) -> float:
+        tree = plain_wear(white=ColorSlot(RED), black=ColorSlot(BLUE))
+        tree.threshold = threshold
+        out = render(compositor, inputs, tree)
+        return float(np.mean(np.all(np.abs(out - RED) < 1e-3, axis=-1)))
+
+    assert white_share(0.2) > white_share(0.5) > white_share(0.8)
+    assert white_share(0.5) == pytest.approx(0.5, abs=0.05)
+
+
 def test_a_mask_picks_between_its_two_colours(compositor, inputs):
     out = render(compositor, inputs, plain_wear(white=ColorSlot(RED), black=ColorSlot(BLUE)))
 
@@ -687,10 +727,11 @@ def test_a_fresh_mask_reads_as_black_and_white(baked_app):
     assert tree.black.color == (0.0, 0.0, 0.0)
 
     composite = baked_app.read_color_map()
-    # Every texel is grey: the two ends and whatever the filter puts between.
+    # Black and white, and nothing in between -- the boundary is a boundary.
     assert np.allclose(composite[..., 0], composite[..., 1], atol=1e-3)
     assert np.allclose(composite[..., 1], composite[..., 2], atol=1e-3)
     assert composite.min() < 0.05 and composite.max() > 0.95, "it spans the range"
+    assert set(np.unique(composite.round(3))) <= {0.0, 1.0}
 
 
 def test_colours_under_the_mask_are_what_shaded_shows(baked_app):

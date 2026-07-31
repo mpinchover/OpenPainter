@@ -114,6 +114,14 @@ and **noise** (the same field the wear pass breaks up with, thresholded by bias
 and contrast). A node keeps both sets of settings, so switching kinds and back
 finds them intact.
 
+**A mask is a continuous field, not a stencil** — edge wear ramps up as the
+surface curves, noise wanders through every value between. Mixing the two sides
+by that directly gives a blend everywhere the field sits mid-way, which reads as
+the colours bleeding into each other rather than as a boundary. So every mask
+has a **Threshold**, the level that divides its two sides, and a **Softness**
+that is zero by default: every texel belongs to one side or the other, and the
+boundary is a boundary. Raise Softness to feather it back into a band.
+
 **The Shaded view is the texture**, lit. A new mask starts as plain black and
 white, so what you see on the model is the mask itself — edge wear white on the
 edges, or a noise in black and white — until you put colours, or another mask,

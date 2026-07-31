@@ -115,6 +115,20 @@ class MaskLayer:
     kind: str = "edge_wear"
     name: str = ""
     """What to call it in the tree. Empty falls back to the kind."""
+
+    threshold: float = 0.5
+    """Where the boundary between the two sides falls, on the mask's 0..1.
+
+    A mask is a continuous field, not a stencil: edge wear ramps up as the
+    surface curves, noise wanders through every value between. Mixing the two
+    sides by that directly gives a blend everywhere the field is mid-way --
+    which reads as the colours bleeding into each other rather than as a
+    boundary. This is the level that divides them: below it is black's, above
+    it is white's."""
+
+    softness: float = 0.0
+    """How wide the crossing is, in the same 0..1. Zero is a clean division --
+    every texel belongs to one side or the other. Raise it to feather."""
     edge_wear: EdgeWearParams = field(default_factory=EdgeWearParams)
     noise: NoiseMaskParams = field(default_factory=NoiseMaskParams)
     white: "Slot" = field(default_factory=lambda: ColorSlot(_DEFAULT_WHITE))
@@ -132,6 +146,10 @@ class MaskLayer:
     def needs_bake(self) -> bool:
         """Edge wear reads the curvature bake; noise only needs the positions."""
         return self.kind == "edge_wear"
+
+    def boundary_uniforms(self) -> dict[str, float]:
+        """Where the two sides divide, for the shader. See :attr:`threshold`."""
+        return {"u_threshold": self.threshold, "u_softness": self.softness}
 
     def slot(self, name: str) -> "Slot":
         return getattr(self, _checked(name))
