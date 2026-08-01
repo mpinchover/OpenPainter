@@ -1,9 +1,11 @@
 """Orchestration for the expensive half of the pipeline.
 
-Three stages: unwrap, the UV-space curvature bake, and seam padding. Each is
-keyed on its own parameters *plus* the key of the stage before it, so nudging
-the curvature strength re-rasterises but leaves the unwrap alone, and nudging
-seam padding re-runs only the padding.
+Bevel, unwrap, the UV-space curvature bake, ambient occlusion, and seam padding.
+Each is keyed on its own parameters *plus* the key of the stage before it, so
+nudging the curvature strength re-rasterises but leaves the unwrap alone, and
+nudging seam padding re-runs only the padding. Occlusion is keyed on the
+geometry rather than on the curvature settings: it is a ray cast against the
+mesh, and no curvature slider can change what a ray hits.
 
 Stages are tagged CPU or GL. GL stages must run on the thread that owns the
 context, so :meth:`BakeController.pump` executes those inline during the render
@@ -25,10 +27,11 @@ import trimesh
 from .baking import GBuffer, UVSpaceBaker, dilate
 from .bevel import bevel
 from .edge_wear import normalize_position
+from .occlusion import DEFAULT_DISTANCE, DEFAULT_SAMPLES, bake_occlusion
 from .params import BakeParams, BevelParams, UnwrapParams
 from .uv_unwrap import UnwrapResult, source_uv_layout, unwrap
 
-STAGES = ("bevel", "unwrap", "curvature", "post")
+STAGES = ("bevel", "unwrap", "curvature", "occlusion", "post")
 
 
 @dataclass
@@ -51,6 +54,11 @@ class BakeController:
         self.bevel_params = BevelParams()
         self.unwrap_params = UnwrapParams()
         self.bake_params = BakeParams()
+        #: Whether the occlusion stage does anything. It is the one stage that
+        #: traces rays, and it costs more than all the others together, so it is
+        #: worth being able to leave out of a bake you only want curvature from.
+        #: Keyed like everything else, so turning it back on re-runs it.
+        self.bake_occlusion: bool = True
 
         # Stage outputs.
         self.beveled_mesh: Optional[trimesh.Trimesh] = None
@@ -58,6 +66,8 @@ class BakeController:
         self.gbuffer: Optional[GBuffer] = None
         self.curvature_map: Optional[np.ndarray] = None
         self.position_map: Optional[np.ndarray] = None
+        self.occlusion_map: Optional[np.ndarray] = None
+        self._raw_occlusion: Optional[np.ndarray] = None
 
         # Bumped whenever the maps change, so the viewport knows to re-upload
         # without polling the arrays themselves.
@@ -90,6 +100,8 @@ class BakeController:
         self.gbuffer = None
         self.curvature_map = None
         self.position_map = None
+        self.occlusion_map = None
+        self._raw_occlusion = None
         self.error = None
 
     @property
@@ -107,11 +119,16 @@ class BakeController:
             self.bake_params.resolution,
         )
         curvature_key = unwrap_key + self.bake_params.curvature_key()
-        post_key = curvature_key + (self.bake_params.dilation,)
+        # Rays against the geometry: the curvature sliders cannot move them.
+        occlusion_key = unwrap_key + (
+            self.bake_occlusion, DEFAULT_SAMPLES, DEFAULT_DISTANCE
+        )
+        post_key = curvature_key + occlusion_key + (self.bake_params.dilation,)
         return {
             "bevel": bevel_key,
             "unwrap": unwrap_key,
             "curvature": curvature_key,
+            "occlusion": occlusion_key,
             "post": post_key,
         }
 
@@ -136,6 +153,7 @@ class BakeController:
             "bevel": ("Bevelling edges", False, self._run_bevel),
             "unwrap": (unwrap_label, False, self._run_unwrap),
             "curvature": ("Baking curvature", True, self._run_curvature),
+            "occlusion": ("Baking occlusion", False, self._run_occlusion),
             "post": ("Padding seams", False, self._run_post),
         }
         return [
@@ -176,6 +194,36 @@ class BakeController:
         self.baker.upload(result.vertices, result.normals, result.uvs, result.faces)
         self.gbuffer = self.baker.rasterize(self.bake_params.resolution, self.bake_params)
 
+    def _run_occlusion(self) -> None:
+        """Cast rays from every covered texel and see what gets in the way.
+
+        Against the geometry the G-buffer was rasterised from -- the beveled,
+        unwrapped copy -- so a ray starts exactly on the surface the texel
+        describes. The bevel matters here as much as it does to the curvature:
+        a perfectly sharp edge occludes nothing, because there is no surface
+        turned into the corner to catch a ray.
+        """
+        if not self.bake_occlusion:
+            # Switched off: drop whatever a previous bake left, so nothing
+            # downstream carries a map the mesh may no longer match. The stage
+            # still runs and still records its key -- a stage that were skipped
+            # outright would leave the bake looking permanently stale.
+            self._raw_occlusion = None
+            return
+
+        assert self.unwrap_result is not None and self.gbuffer is not None
+        result = self.unwrap_result
+        geometry = trimesh.Trimesh(result.vertices, result.faces, process=False)
+
+        self._raw_occlusion = bake_occlusion(
+            geometry,
+            self.gbuffer.position,
+            self.gbuffer.normal,
+            self.gbuffer.mask,
+            progress=self._report,
+            should_stop=self.cancel_event.is_set,
+        )
+
     def _run_post(self) -> None:
         assert self.gbuffer is not None and self.beveled_mesh is not None
         mask = self.gbuffer.mask
@@ -191,6 +239,11 @@ class BakeController:
         extents = np.asarray(self.beveled_mesh.extents, dtype=np.float32)
         bposition = normalize_position(self.gbuffer.position, lower, extents)
         self.position_map = dilate(bposition, mask, padding)
+
+        self.occlusion_map = (
+            dilate(self._raw_occlusion, mask, padding)
+            if self._raw_occlusion is not None else None
+        )
 
         self.maps_version += 1
 

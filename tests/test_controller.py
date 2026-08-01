@@ -294,3 +294,57 @@ def test_mesh_scale_is_reported(controller):
     assert controller.mesh_scale == pytest.approx(
         float(np.linalg.norm(controller.mesh.extents))
     )
+
+
+# --------------------------------------------------------------------------
+# leaving occlusion out
+# --------------------------------------------------------------------------
+
+def test_occlusion_can_be_left_out_of_a_bake(controller):
+    """It is the one stage that traces rays and it costs more than all the rest
+    together, so a bake you only want curvature from should not pay for it."""
+    controller.bake_occlusion = False
+    controller.request_bake()
+    run_to_completion(controller)
+
+    assert controller.curvature_map is not None, "the rest of the bake still runs"
+    assert controller.occlusion_map is None, "and this one produced nothing"
+
+
+def test_a_bake_without_occlusion_is_not_left_looking_stale(controller):
+    """The stage still runs and still records its key -- one that were skipped
+    outright would leave the Bake button reporting work forever."""
+    controller.bake_occlusion = False
+    controller.request_bake()
+    run_to_completion(controller)
+
+    assert not controller.is_dirty(), controller.pending_stages()
+    assert controller.request_bake() is False
+
+
+def test_switching_occlusion_back_on_re_runs_it(controller):
+    controller.bake_occlusion = False
+    controller.request_bake()
+    run_to_completion(controller)
+
+    controller.bake_occlusion = True
+    assert "occlusion" in controller.pending_stages()
+    assert "post" in controller.pending_stages(), "the padding reads it"
+    assert "curvature" not in controller.pending_stages(), "which is untouched"
+
+    controller.request_bake()
+    run_to_completion(controller)
+    assert controller.occlusion_map is not None
+
+
+def test_switching_occlusion_off_drops_the_map_it_left(controller):
+    """Otherwise the export would keep writing an occlusion map from a bake the
+    user has since told it not to do."""
+    controller.request_bake()
+    run_to_completion(controller)
+    assert controller.occlusion_map is not None
+
+    controller.bake_occlusion = False
+    controller.request_bake()
+    run_to_completion(controller)
+    assert controller.occlusion_map is None

@@ -10,6 +10,7 @@ does the work and the numpy mirror that documents it.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -22,12 +23,17 @@ sys.path.insert(0, str(ROOT))
 
 from core.decal import (  # noqa: E402
     MAX_EDGE,
+    MAX_UV_ASPECT,
     DecalImage,
     DecalLoadError,
     composite_normal_map,
+    edge_fade,
     height_to_normals,
     load_decal,
+    uv_aspect,
 )
+from core.params import MAX_FALLOFF  # noqa: E402
+from core.picking import face_at_uv  # noqa: E402
 from core.export import export_maps, save_normal_map  # noqa: E402
 from core.params import DecalParams  # noqa: E402
 
@@ -177,7 +183,9 @@ def test_the_decal_lands_where_it_is_placed(tilted):
 
 def test_scale_sets_how_much_of_the_atlas_is_covered(tilted):
     for scale in (0.2, 0.5, 0.8):
-        params = DecalParams(path="x", scale=scale)
+        # No edge fade: this is about how much of the sheet the rectangle
+        # spans, and fading eats into the answer on purpose.
+        params = DecalParams(path="x", scale=scale, falloff=0.0)
         covered = ~is_flat(composite_normal_map(tilted, params, 128))
         # A square decal covers scale^2 of the sheet, give or take a texel row.
         assert covered.mean() == pytest.approx(scale ** 2, abs=0.02)
@@ -186,13 +194,122 @@ def test_scale_sets_how_much_of_the_atlas_is_covered(tilted):
 def test_a_wide_decal_keeps_its_aspect_ratio(tmp_path):
     """Scale is the width; the height follows the image, so a vent stays wide."""
     wide = load_decal(write_normal_map(tmp_path / "wide.png", size=(64, 16), tilt=(1, 0)))
-    covered = ~is_flat(composite_normal_map(wide, DecalParams(path="x", scale=0.8), 128))
+    covered = ~is_flat(composite_normal_map(
+        wide,
+        DecalParams(path="x", scale=0.8, falloff=0.0, image_aspect=wide.aspect),
+        128,
+    ))
 
     rows, columns = np.nonzero(covered)
     spread_u = np.ptp(columns) / 128
     spread_v = np.ptp(rows) / 128
     assert spread_u == pytest.approx(0.8, abs=0.03)
     assert spread_v / spread_u == pytest.approx(16 / 64, abs=0.05)
+
+
+def test_a_transparent_texel_is_given_a_flat_normal(tmp_path):
+    """Nothing samples a transparent texel directly -- the alpha multiplies it
+    out -- but every bilinear tap and mipmap level around the artwork averages
+    it in. Left as the white the artist's canvas happened to be, that averaging
+    invents a 45-degree tilt all round the edge of the decal."""
+    from PIL import Image
+
+    canvas = np.zeros((16, 16, 4), np.uint8)
+    canvas[..., :3] = 255          # white, the usual canvas
+    canvas[6:10, 6:10] = [128, 128, 255, 255]   # a flat, opaque patch
+    path = tmp_path / "on_white.png"
+    Image.fromarray(canvas).save(path)
+
+    image = load_decal(path)
+    assert image.alpha[0, 0] == 0.0
+    assert image.normals[0, 0] == pytest.approx([0.5, 0.5, 1.0]), "not white"
+    assert image.normals[8, 8] == pytest.approx([128 / 255, 128 / 255, 1.0], abs=0.01)
+
+
+# --------------------------------------------------------------------------
+# fading the decal's own edge
+# --------------------------------------------------------------------------
+
+def test_the_edge_fade_leaves_the_middle_alone(tilted):
+    """It takes the border off, not the subject: whatever is in the middle of
+    the image has to come through untouched."""
+    middle = 32
+    hard = composite_normal_map(tilted, DecalParams(path="x", falloff=0.0), 64)
+    faded = composite_normal_map(tilted, DecalParams(path="x", falloff=0.2), 64)
+
+    assert faded[middle, middle] == pytest.approx(hard[middle, middle], abs=1e-6)
+
+
+def test_the_edge_fade_takes_the_border_off(tilted):
+    """The reported symptom: a decal drawn on a white canvas shows its own
+    rectangle, because white decodes to a normal tilted 45 degrees each way and
+    the surface beside it is flat."""
+    params = DecalParams(path="x", scale=0.5, falloff=0.0)
+    hard = composite_normal_map(tilted, params, 128)
+    faded = composite_normal_map(tilted, replace(params, falloff=0.12), 128)
+
+    # The texels just inside the rectangle's edge, where the seam lives.
+    edge = slice(33, 36)
+    assert not is_flat(hard[64, edge]).any(), "the canvas is stamped without it"
+    assert is_flat(faded[64, edge]).all(), "and the fade has taken it away"
+    assert not is_flat(faded[64, 64]), "while the middle is still stamped"
+
+
+def test_more_falloff_eats_more_of_the_decal(tilted):
+    covered = [
+        (~is_flat(composite_normal_map(
+            tilted, DecalParams(path="x", scale=0.8, falloff=falloff), 128
+        ))).mean()
+        for falloff in (0.0, 0.1, 0.25, 0.4)
+    ]
+    assert covered == sorted(covered, reverse=True)
+    assert covered[0] > covered[-1] * 1.5
+
+
+def test_the_fade_is_the_same_width_on_every_side():
+    """Measured along whichever axis is nearer its edge, so the corners do not
+    go first and leave the decal looking like a circle."""
+    axis = np.linspace(0.0, 1.0, 101, dtype=np.float32)
+    u, v = np.meshgrid(axis, axis)
+    fade = edge_fade(u, v, 0.2)
+
+    assert fade[50, 50] == pytest.approx(1.0), "the middle survives"
+    # The same distance in from each of the four sides gives the same answer.
+    assert fade[50, 5] == pytest.approx(fade[50, -6])
+    assert fade[5, 50] == pytest.approx(fade[-6, 50])
+    assert fade[50, 5] == pytest.approx(fade[5, 50])
+
+
+def test_the_fade_cuts_the_border_rather_than_only_softening_it():
+    """A fade that merely reached zero *at* the border would leave no hard edge
+    but would still show most of the canvas just inside it -- which is the whole
+    reason the border is a problem."""
+    axis = np.linspace(0.0, 1.0, 201, dtype=np.float32)
+    u, v = np.meshgrid(axis, axis)
+    fade = edge_fade(u, v, 0.1)
+
+    # Everything in the outer tenth is gone outright, not merely dimmed.
+    outer = np.maximum(np.abs(u - 0.5), np.abs(v - 0.5)) * 2.0 >= 0.9
+    assert fade[outer].max() == 0.0
+    # And the inner four fifths are untouched.
+    inner = np.maximum(np.abs(u - 0.5), np.abs(v - 0.5)) * 2.0 <= 0.8
+    assert fade[inner].min() == pytest.approx(1.0)
+
+
+def test_no_falloff_changes_nothing():
+    axis = np.linspace(0.0, 1.0, 33, dtype=np.float32)
+    u, v = np.meshgrid(axis, axis)
+    assert (edge_fade(u, v, 0.0) == 1.0).all()
+    assert (edge_fade(u, v, -1.0) == 1.0).all(), "and nor does a negative one"
+
+
+def test_the_fade_cannot_eat_the_whole_decal():
+    axis = np.linspace(0.0, 1.0, 33, dtype=np.float32)
+    u, v = np.meshgrid(axis, axis)
+    assert edge_fade(u, v, 5.0)[16, 16] == pytest.approx(
+        edge_fade(u, v, MAX_FALLOFF)[16, 16]
+    )
+    assert edge_fade(u, v, MAX_FALLOFF).max() > 0.0, "the middle always survives"
 
 
 def test_intensity_scales_the_slope_not_the_vector(tilted):
@@ -280,6 +397,16 @@ def gpu_composite(ctx):
     program["u_decal"].value = 0
     vao = ctx.vertex_array(program, [])
 
+    # The decal pass writes a slope; a second pass turns the total into a
+    # normal map. Both are needed to compare against the numpy mirror, which
+    # does the same two steps.
+    encode = ctx.program(
+        vertex_shader=load_shader("fullscreen.vert"),
+        fragment_shader=load_shader("normal_encode.frag"),
+    )
+    encode["u_slope"].value = 0
+    encode_vao = ctx.vertex_array(encode, [])
+
     def run(image: DecalImage, params: DecalParams, resolution: int) -> np.ndarray:
         texture = ctx.texture(
             image.size, 4, data=np.ascontiguousarray(image.rgba(), "f4").tobytes(),
@@ -287,26 +414,35 @@ def gpu_composite(ctx):
         )
         texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
         texture.repeat_x = texture.repeat_y = False
+        slope = ctx.texture((resolution, resolution), 2, dtype="f4")
+        slope_fbo = ctx.framebuffer(color_attachments=[slope])
         target = ctx.texture((resolution, resolution), 3, dtype="f4")
         fbo = ctx.framebuffer(color_attachments=[target])
 
         texture.use(0)
-        for name, value in params.as_uniforms(image.aspect).items():
+        for name, value in params.as_uniforms().items():
             program[name].value = value
 
-        fbo.use()
         ctx.viewport = (0, 0, resolution, resolution)
         ctx.disable(moderngl.DEPTH_TEST | moderngl.CULL_FACE | moderngl.BLEND)
+        slope_fbo.use()
+        slope_fbo.clear(0.0, 0.0, 0.0, 0.0)
         vao.render(moderngl.TRIANGLES, vertices=3)
+
+        fbo.use()
+        slope.use(0)
+        encode_vao.render(moderngl.TRIANGLES, vertices=3)
         out = np.frombuffer(fbo.read(components=3, dtype="f4"), dtype="f4").reshape(
             resolution, resolution, 3
         )
 
-        for resource in (fbo, target, texture):
+        for resource in (fbo, target, slope_fbo, slope, texture):
             resource.release()
         return out.copy()
 
     yield run
+    encode_vao.release()
+    encode.release()
     vao.release()
     program.release()
 
@@ -319,10 +455,13 @@ def test_the_shader_agrees_with_the_numpy_mirror(gpu_composite, tmp_path):
     image = load_decal(tmp_path / "noise.png")
 
     for params in (
-        DecalParams(path="x", scale=0.5),
-        DecalParams(path="x", scale=0.3, center_u=0.3, center_v=0.7, intensity=2.5),
-        DecalParams(path="x", scale=0.7, rotation=35.0, intensity=0.4),
-        DecalParams(path="x", scale=0.45, rotation=-120.0, flip_green=True),
+        DecalParams(path="x", scale=0.5, image_aspect=image.aspect),
+        DecalParams(path="x", scale=0.3, center_u=0.3, center_v=0.7, intensity=2.5,
+                    image_aspect=image.aspect),
+        DecalParams(path="x", scale=0.7, rotation=35.0, intensity=0.4,
+                    image_aspect=image.aspect),
+        DecalParams(path="x", scale=0.45, rotation=-120.0, flip_green=True,
+                    image_aspect=image.aspect),
     ):
         gpu = gpu_composite(image, params, 64)
         cpu = composite_normal_map(image, params, 64)
@@ -372,10 +511,8 @@ def test_export_writes_the_normal_map_alongside_the_bake(tmp_path, tilted):
     gradient = np.linspace(0.0, 1.0, 16 * 16).reshape(16, 16).astype(np.float32)
     composed = composite_normal_map(tilted, DecalParams(path="x", scale=0.5), 16)
 
-    written = export_maps(tmp_path, gradient, gradient, normal=composed)
-    assert [path.name for path in written] == [
-        "edge_wear.png", "curvature.png", "normal.png"
-    ]
+    written = export_maps(tmp_path, normal=composed, occlusion=gradient)
+    assert [path.name for path in written] == ["normal.png", "ao.png"]
     assert all(path.exists() for path in written)
 
 
@@ -385,7 +522,7 @@ def test_a_decal_can_be_exported_without_any_bake(tmp_path, tilted):
     written = export_maps(tmp_path, normal=composed)
 
     assert [path.name for path in written] == ["normal.png"]
-    assert not (tmp_path / "edge_wear.png").exists()
+    assert not (tmp_path / "ao.png").exists()
 
 
 def test_the_normal_map_writer_refuses_the_wrong_shape(tmp_path):
@@ -505,10 +642,10 @@ def test_a_decal_reaches_the_export_without_any_bake(app, tmp_path):
     """The path the feature is actually used through: import, place, export."""
     write_normal_map(tmp_path / "vent.png", size=(64, 32), tilt=(0.8, 0.0))
     app.open_decal(tmp_path / "vent.png")
-    assert app.decal_image is not None, app.status
+    assert app.selected_decal is not None, app.status
 
-    app.decal_params.scale = 0.5
-    app.decal_params.intensity = 2.0
+    app.selected_decal.scale = 0.5
+    app.selected_decal.intensity = 2.0
     app.mark_normal_dirty()
     app.on_render(0.0, 1 / 60.0)
 
@@ -531,7 +668,7 @@ def test_switching_the_decal_off_flattens_the_map(app, tmp_path):
     app.on_render(0.0, 1 / 60.0)
     assert app.read_normal_map() is not None
 
-    app.decal_params.enabled = False
+    app.selected_decal.enabled = False
     app.mark_normal_dirty()
     app.on_render(0.0, 1 / 60.0)
 
@@ -559,7 +696,7 @@ def test_a_bad_image_is_reported_rather_than_raised(app, tmp_path):
     broken.write_text("not a PNG at all")
     app.open_decal(broken)
 
-    assert app.decal_image is None
+    assert app.selected_decal is None
     assert app.status_is_error
     assert app.read_normal_map() is None
 
@@ -569,8 +706,8 @@ def test_the_decal_lights_the_mesh_in_the_viewport(app, tmp_path):
     check that the decal actually reaches the shading."""
     write_normal_map(tmp_path / "vent.png", tilt=(1.5, 0.0))
     app.open_decal(tmp_path / "vent.png")
-    app.decal_params.scale = 1.0  # cover the quad entirely
-    app.decal_params.intensity = 3.0
+    app.selected_decal.scale = 1.0  # cover the quad entirely
+    app.selected_decal.intensity = 3.0
     app.mark_normal_dirty()
 
     def render() -> np.ndarray:
@@ -582,7 +719,7 @@ def test_the_decal_lights_the_mesh_in_the_viewport(app, tmp_path):
         ).astype(np.int16)
 
     lit = render()
-    app.decal_params.enabled = False
+    app.selected_decal.enabled = False
     app.mark_normal_dirty()
     flat = render()
 
@@ -599,7 +736,7 @@ def placeable(app, tmp_path):
     """An app with a decal imported and a frame drawn, ready to place."""
     write_normal_map(tmp_path / "vent.png", tilt=(1.0, 0.0))
     app.open_decal(tmp_path / "vent.png")
-    app.decal_params.scale = 0.2
+    app.selected_decal.scale = 0.2
     app.on_render(0.0, 1 / 60.0)
     return app
 
@@ -646,12 +783,12 @@ def test_placing_moves_the_decal_to_the_cursor_and_drops_it(placeable):
     placeable.on_mouse_position_event(x, y, 0, 0)
     expected = placeable.surface_uv_at((x, y))
     assert expected is not None
-    assert (placeable.decal_params.center_u, placeable.decal_params.center_v) == \
+    assert (placeable.selected_decal.center_u, placeable.selected_decal.center_v) == \
         pytest.approx(expected)
 
     placeable.on_mouse_press_event(x, y, placeable.wnd.mouse.left)
     assert not placeable.decal_placing, "the click ends the placement"
-    assert (placeable.decal_params.center_u, placeable.decal_params.center_v) == \
+    assert (placeable.selected_decal.center_u, placeable.selected_decal.center_v) == \
         pytest.approx(expected), "and leaves it where it was dropped"
 
 
@@ -669,16 +806,16 @@ def test_the_placing_click_does_not_also_orbit_the_view(placeable):
 
 
 def test_cancelling_puts_the_decal_back(placeable):
-    origin = (placeable.decal_params.center_u, placeable.decal_params.center_v)
+    origin = (placeable.selected_decal.center_u, placeable.selected_decal.center_v)
 
     placeable.begin_decal_placement()
     placeable.on_mouse_position_event(*viewport_point(placeable, 0.42, 0.6), 0, 0)
-    assert (placeable.decal_params.center_u, placeable.decal_params.center_v) != \
+    assert (placeable.selected_decal.center_u, placeable.selected_decal.center_v) != \
         pytest.approx(origin), "it moved while being placed"
 
     placeable.end_decal_placement(keep=False)
     assert not placeable.decal_placing
-    assert (placeable.decal_params.center_u, placeable.decal_params.center_v) == \
+    assert (placeable.selected_decal.center_u, placeable.selected_decal.center_v) == \
         pytest.approx(origin)
 
 
@@ -695,7 +832,7 @@ def test_escape_does_not_close_the_window(app):
 
 
 def test_escape_cancels_a_placement(placeable):
-    origin = (placeable.decal_params.center_u, placeable.decal_params.center_v)
+    origin = (placeable.selected_decal.center_u, placeable.selected_decal.center_v)
     keys = placeable.wnd.keys
 
     placeable.begin_decal_placement()
@@ -703,12 +840,12 @@ def test_escape_cancels_a_placement(placeable):
     placeable.on_key_event(keys.ESCAPE, keys.ACTION_PRESS, placeable.wnd.modifiers)
 
     assert not placeable.decal_placing
-    assert (placeable.decal_params.center_u, placeable.decal_params.center_v) == \
+    assert (placeable.selected_decal.center_u, placeable.selected_decal.center_v) == \
         pytest.approx(origin)
 
 
 def test_a_right_click_cancels_a_placement(placeable):
-    origin = (placeable.decal_params.center_u, placeable.decal_params.center_v)
+    origin = (placeable.selected_decal.center_u, placeable.selected_decal.center_v)
 
     placeable.begin_decal_placement()
     x, y = viewport_point(placeable, 0.42, 0.6)
@@ -716,7 +853,7 @@ def test_a_right_click_cancels_a_placement(placeable):
     placeable.on_mouse_press_event(x, y, placeable.wnd.mouse.right)
 
     assert not placeable.decal_placing
-    assert (placeable.decal_params.center_u, placeable.decal_params.center_v) == \
+    assert (placeable.selected_decal.center_u, placeable.selected_decal.center_v) == \
         pytest.approx(origin)
 
 
@@ -726,13 +863,13 @@ def test_dropping_it_off_the_mesh_keeps_the_last_good_spot(placeable):
     placeable.begin_decal_placement()
     x, y = viewport_point(placeable, 0.46, 0.54)
     placeable.on_mouse_position_event(x, y, 0, 0)
-    landed = (placeable.decal_params.center_u, placeable.decal_params.center_v)
+    landed = (placeable.selected_decal.center_u, placeable.selected_decal.center_v)
 
     placeable.on_mouse_position_event(2, 2, 0, 0)  # out over the background
     placeable.on_mouse_press_event(2, 2, placeable.wnd.mouse.left)
 
     assert not placeable.decal_placing
-    assert (placeable.decal_params.center_u, placeable.decal_params.center_v) == \
+    assert (placeable.selected_decal.center_u, placeable.selected_decal.center_v) == \
         pytest.approx(landed)
 
 
@@ -749,16 +886,16 @@ def test_placement_needs_a_decal_and_a_mesh(app, tmp_path):
 
 def test_placing_switches_a_disabled_decal_back_on(placeable):
     """Reaching for the placement tool means wanting to see the thing."""
-    placeable.decal_params.enabled = False
+    placeable.selected_decal.enabled = False
     placeable.begin_decal_placement()
-    assert placeable.decal_params.enabled
+    assert placeable.selected_decal.enabled
 
 
 def test_clearing_the_decal_ends_any_placement(placeable):
     placeable.begin_decal_placement()
-    placeable.clear_decal()
+    placeable.clear_decals()
     assert not placeable.decal_placing
-    assert placeable.decal_image is None
+    assert placeable.selected_decal is None and not placeable.decals
 
 
 # --------------------------------------------------------------------------
@@ -790,7 +927,259 @@ def test_active_needs_both_an_image_and_the_switch():
 
 
 def test_size_follows_the_image_aspect():
-    params = DecalParams(scale=0.6)
-    assert params.size(1.0) == pytest.approx((0.6, 0.6))
-    assert params.size(2.0) == pytest.approx((0.6, 0.3)), "twice as wide as tall"
-    assert params.size(0.5) == pytest.approx((0.6, 1.2))
+    assert DecalParams(scale=0.6, image_aspect=1.0).size() == pytest.approx((0.6, 0.6))
+    assert DecalParams(scale=0.6, image_aspect=2.0).size() == pytest.approx(
+        (0.6, 0.3)
+    ), "twice as wide as tall"
+    assert DecalParams(scale=0.6, image_aspect=0.5).size() == pytest.approx((0.6, 1.2))
+
+
+def test_size_undoes_the_surfaces_own_stretch():
+    """A UV rectangle is only the same shape on the model when a unit of u
+    covers as much of it as a unit of v. Where it does not, the rectangle has to
+    be the other shape to come out right."""
+    stretched = DecalParams(scale=0.4, surface_aspect=2.0)
+    assert stretched.size() == pytest.approx((0.4, 0.8)), "u is the wide axis"
+
+    squeezed = DecalParams(scale=0.4, surface_aspect=0.5)
+    assert squeezed.size() == pytest.approx((0.4, 0.2))
+
+    # Both aspects at once: a wide image on a stretched surface.
+    assert DecalParams(
+        scale=0.4, surface_aspect=1.5, image_aspect=2.0
+    ).size() == pytest.approx((0.4, 0.3))
+
+
+# --------------------------------------------------------------------------
+# how stretched the surface is under a decal
+# --------------------------------------------------------------------------
+
+def _sheet(uvs, size=(1.0, 1.0)):
+    """One world-space quad, mapped to whatever UV rectangle is asked for."""
+    width, height = size
+    vertices = np.array(
+        [[0, 0, 0], [width, 0, 0], [width, height, 0], [0, height, 0]], dtype=float
+    )
+    faces = np.array([[0, 1, 2], [0, 2, 3]])
+    return vertices, faces, np.asarray(uvs, dtype=float)
+
+
+SQUARE_UVS = [[0, 0], [1, 0], [1, 1], [0, 1]]
+
+
+def test_a_square_layout_measures_square():
+    assert uv_aspect(*_sheet(SQUARE_UVS)) == pytest.approx(1.0)
+
+
+def test_a_stretched_layout_is_measured():
+    """Half the u range for the same surface means a unit of u covers twice the
+    world -- which is exactly the starter cube's box unwrap, at 1.5."""
+    narrow = [[0, 0], [0.5, 0], [0.5, 1], [0, 1]]
+    assert uv_aspect(*_sheet(narrow)) == pytest.approx(2.0)
+
+    short = [[0, 0], [1, 0], [1, 0.5], [0, 0.5]]
+    assert uv_aspect(*_sheet(short)) == pytest.approx(0.5)
+
+
+def test_the_starter_cubes_own_layout_is_the_one_that_squashed_a_decal():
+    """The 3x2 box unwrap gives each face a 1/3 x 1/2 cell of a square atlas, so
+    a round decal came out 1.5 times too wide. This is that number."""
+    from core.mesh_io import default_mesh
+
+    mesh, _ = default_mesh()
+    aspect = uv_aspect(
+        np.asarray(mesh.vertices), np.asarray(mesh.faces), np.asarray(mesh.visual.uv)
+    )
+    assert aspect == pytest.approx(1.5)
+
+
+def test_one_face_can_be_asked_about_on_its_own():
+    """A layout can be dense in one island and stretched in the next, so a decal
+    asks about the triangle it is actually sitting on."""
+    vertices = np.array(
+        [[0, 0, 0], [1, 0, 0], [1, 1, 0],       # square in UV
+         [2, 0, 0], [3, 0, 0], [3, 1, 0]],      # stretched
+        dtype=float,
+    )
+    faces = np.array([[0, 1, 2], [3, 4, 5]])
+    uvs = np.array(
+        [[0, 0], [1, 0], [1, 1],
+         [0, 0], [0.5, 0], [0.5, 1]], dtype=float
+    )
+
+    assert uv_aspect(vertices, faces, uvs, face=0) == pytest.approx(1.0)
+    assert uv_aspect(vertices, faces, uvs, face=1) == pytest.approx(2.0)
+
+
+def test_the_mesh_wide_answer_is_a_geometric_mean():
+    """It is a ratio: a face at 2 and a face at 0.5 are equal and opposite, and
+    average to 1 rather than to 1.25."""
+    vertices = np.array(
+        [[0, 0, 0], [1, 0, 0], [1, 1, 0],
+         [2, 0, 0], [3, 0, 0], [3, 1, 0]], dtype=float
+    )
+    faces = np.array([[0, 1, 2], [3, 4, 5]])
+    # The same triangle stretched each way, over equal UV areas.
+    uvs = np.array(
+        [[0, 0], [0.5, 0], [0.5, 1],
+         [0, 0], [1, 0], [1, 0.5]], dtype=float
+    )
+    assert uv_aspect(vertices, faces, uvs) == pytest.approx(1.0)
+
+
+def test_an_absurd_layout_is_clamped_rather_than_obeyed():
+    hair = [[0, 0], [1e-6, 0], [1e-6, 1], [0, 1]]
+    assert uv_aspect(*_sheet(hair)) == pytest.approx(MAX_UV_ASPECT)
+
+
+def test_a_layout_with_nothing_to_measure_reads_as_square():
+    """Every fallback is 1.0, which changes nothing about the placement --
+    better than a decal that vanishes because its rectangle came out zero."""
+    collapsed = [[0.5, 0.5]] * 4
+    assert uv_aspect(*_sheet(collapsed)) == 1.0
+
+    vertices, faces, uvs = _sheet(SQUARE_UVS)
+    assert uv_aspect(vertices, faces[:0], uvs) == 1.0
+    assert uv_aspect(vertices, faces, uvs[:0]) == 1.0
+
+    # A degenerate triangle in world space: UVs fine, surface collapsed.
+    flat = np.zeros((4, 3))
+    assert uv_aspect(flat, faces, uvs) == 1.0
+
+
+# --------------------------------------------------------------------------
+# which triangle a texel belongs to
+# --------------------------------------------------------------------------
+
+def test_a_texel_finds_the_triangle_it_is_in():
+    _, faces, uvs = _sheet(SQUARE_UVS)
+    assert face_at_uv(faces, uvs, 0.8, 0.2) == 0, "the lower-right triangle"
+    assert face_at_uv(faces, uvs, 0.2, 0.8) == 1
+
+
+def test_a_texel_in_the_gutter_belongs_to_nothing():
+    """Between the charts there is no surface, and a decal centred there has no
+    local answer to fall back on but the mesh's own."""
+    _, faces, uvs = _sheet([[0, 0], [0.4, 0], [0.4, 0.4], [0, 0.4]])
+    assert face_at_uv(faces, uvs, 0.9, 0.9) is None
+    assert face_at_uv(faces, uvs, -0.1, 0.2) is None
+
+
+def test_an_empty_layout_finds_nothing():
+    _, faces, uvs = _sheet(SQUARE_UVS)
+    assert face_at_uv(faces[:0], uvs, 0.5, 0.5) is None
+    assert face_at_uv(faces, uvs[:0], 0.5, 0.5) is None
+
+
+# --------------------------------------------------------------------------
+# through the app: a round decal has to land round
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def cube_app(tmp_path):
+    """The app on its starter cube, whose box unwrap stretches u by 1.5."""
+    import moderngl_window as mglw
+
+    from render.viewport import MeshMapApp
+
+    MeshMapApp.initial_mesh = None
+    try:
+        instance = mglw.create_window_config_instance(MeshMapApp, args=["-wnd", "headless"])
+    except Exception as exc:  # pragma: no cover - depends on the host
+        pytest.skip(f"no headless window available: {exc}")
+    yield instance
+    instance.controller.release()
+    imgui.destroy_context()
+
+
+def test_a_round_decal_lands_round_on_the_starter_cube(cube_app, tmp_path):
+    """The bug this was reported as: a circular vent came out an ellipse, half
+    again as wide as it was tall, because a square of UV space is not a square
+    of that cube's surface.
+    """
+    write_normal_map(tmp_path / "vent.png", size=(64, 64), tilt=(0.6, 0.0))
+    cube_app.open_decal(tmp_path / "vent.png")
+    cube_app.selected_decal.scale = 0.25
+    cube_app.selected_decal.center_u = 1 / 6   # the middle of one face's cell
+    cube_app.selected_decal.center_v = 0.75
+    cube_app.on_render(0.0, 1 / 60.0)
+
+    assert cube_app.selected_decal.surface_aspect == pytest.approx(1.5)
+
+    width, height = cube_app.selected_decal.size()
+    # World size is the UV size times what a unit of each axis covers: 1.5
+    # across, 1.0 up, for every face of this unwrap.
+    assert width * 1.5 == pytest.approx(height * 1.0), "square on the model"
+
+
+def _two_islands(path: Path) -> Path:
+    """Two quads in one atlas: one mapped square, one stretched twice as far in
+    v, and empty space around both."""
+    import trimesh
+
+    mesh = trimesh.Trimesh(
+        vertices=np.array([
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],          # island A
+            [2, 0, 0], [3, 0, 0], [3, 1, 0], [2, 1, 0],          # island B
+        ], dtype=float),
+        faces=np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]]),
+        process=False,
+        visual=trimesh.visual.TextureVisuals(uv=np.array([
+            [0.0, 0.0], [0.4, 0.0], [0.4, 0.4], [0.0, 0.4],      # square: 1.0
+            [0.5, 0.0], [0.9, 0.0], [0.9, 0.2], [0.5, 0.2],      # squat:  0.5
+        ], dtype=float)),
+    )
+    mesh.export(path)
+    return path
+
+
+@pytest.fixture
+def islands_app(tmp_path):
+    import moderngl_window as mglw
+
+    from render.viewport import MeshMapApp
+
+    MeshMapApp.initial_mesh = str(_two_islands(tmp_path / "islands.obj"))
+    try:
+        instance = mglw.create_window_config_instance(MeshMapApp, args=["-wnd", "headless"])
+    except Exception as exc:  # pragma: no cover - depends on the host
+        pytest.skip(f"no headless window available: {exc}")
+    yield instance
+    instance.controller.release()
+    imgui.destroy_context()
+    MeshMapApp.initial_mesh = None
+
+
+def test_the_correction_follows_the_decal_rather_than_being_remembered(
+    islands_app, tmp_path
+):
+    """Measured from wherever the decal is now. Stored at placement time it
+    would go quietly wrong the moment the decal was moved to another island --
+    a layout can be square in one place and stretched in the next."""
+    write_normal_map(tmp_path / "vent.png", size=(32, 32))
+    islands_app.open_decal(tmp_path / "vent.png")
+
+    def aspect_at(u: float, v: float) -> float:
+        islands_app.selected_decal.center_u = u
+        islands_app.selected_decal.center_v = v
+        islands_app.on_render(0.0, 1 / 60.0)
+        return islands_app.selected_decal.surface_aspect
+
+    assert aspect_at(0.2, 0.2) == pytest.approx(1.0), "the square island"
+    assert aspect_at(0.7, 0.1) == pytest.approx(0.5), "the squat one"
+    assert aspect_at(0.2, 0.2) == pytest.approx(1.0), "and back again"
+
+
+def test_a_decal_in_the_gutter_falls_back_to_the_whole_mesh(islands_app, tmp_path):
+    """Between the charts there is no surface to measure, and the mesh's own
+    average is a better guess than pretending the layout is square."""
+    write_normal_map(tmp_path / "vent.png", size=(32, 32))
+    islands_app.open_decal(tmp_path / "vent.png")
+
+    islands_app.selected_decal.center_u = 0.98
+    islands_app.selected_decal.center_v = 0.98
+    islands_app.on_render(0.0, 1 / 60.0)
+
+    whole_mesh = islands_app.measure_uv_aspect()
+    assert islands_app.selected_decal.surface_aspect == pytest.approx(whole_mesh)
+    assert 0.5 < whole_mesh < 1.0, "somewhere between its two islands"

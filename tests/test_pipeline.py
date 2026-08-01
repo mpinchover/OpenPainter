@@ -27,7 +27,7 @@ from core.edge_wear import (  # noqa: E402
     tex_noise_fbm,
 )
 from core.export import export_maps  # noqa: E402
-from core.mesh_io import _fbx_unit_scale, load_mesh  # noqa: E402
+from core.mesh_io import _fbx_unit_scale, default_mesh, load_mesh  # noqa: E402
 from core.params import BakeParams, BevelParams, EdgeWearParams, UnwrapParams  # noqa: E402
 from core.uv_unwrap import (  # noqa: E402
     SourceUVError,
@@ -50,6 +50,86 @@ def bracket() -> trimesh.Trimesh:
 # --------------------------------------------------------------------------
 # import
 # --------------------------------------------------------------------------
+
+def test_a_material_exports_one_map_per_channel(tmp_path):
+    """Separate files rather than a packed ORM: they are separate inputs in
+    every shader graph they end up in, and packing is a step to undo."""
+    from PIL import Image
+
+    size = 8
+    color = np.tile(np.array([1.0, 0.5, 0.25], np.float32), (size, size, 1))
+    material = np.zeros((size, size, 4), np.float32)
+    material[..., 0] = 1.0    # metallic
+    material[..., 1] = 0.25   # roughness
+    material[..., 2] = 0.5    # alpha
+    material[..., 3] = 0.5    # emission, in its own units
+
+    written = export_maps(tmp_path, color=color, material=material)
+    assert sorted(p.name for p in written) == [
+        "color.png", "metallic.png", "roughness.png",
+    ]
+
+    def read(name):
+        return np.asarray(Image.open(tmp_path / name), dtype=np.float32) / 255.0
+
+    assert read("metallic.png").max() == pytest.approx(1.0, abs=0.01)
+    assert read("roughness.png").max() == pytest.approx(0.25, abs=0.01)
+
+
+def test_alpha_and_emission_shade_the_viewport_but_are_not_exported(tmp_path):
+    """They are there to see a material by, not to ship: the export is a
+    standard PBR set -- colour, normal, metallic, roughness, occlusion -- and
+    stops there."""
+    color = np.ones((4, 4, 3), np.float32)
+    material = np.zeros((4, 4, 4), np.float32)
+    material[..., 2] = 0.5   # alpha
+    material[..., 3] = 3.0   # emission
+
+    written = export_maps(tmp_path, color=color, material=material)
+    names = {path.name for path in written}
+    assert "alpha.png" not in names and "emission.png" not in names
+
+
+def test_a_material_of_the_wrong_shape_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="shape"):
+        export_maps(tmp_path, material=np.zeros((4, 4, 3), np.float32))
+
+
+def test_the_starter_cube_is_a_sharp_unwrapped_cube():
+    """What the app opens on. It has to go down the same path an imported mesh
+    does -- bake into its own UVs, take a decal -- rather than be a special
+    case, and it has to be sharp: the Bevel panel is what puts a bevel on."""
+    mesh, info = default_mesh()
+
+    assert info.backend == "built-in" and info.notes == []
+    assert info.faces == 12 and info.watertight, "a closed box"
+    assert info.extents == pytest.approx((0.5, 0.5, 0.5))
+
+    assert info.has_uvs
+    uvs = source_uvs(mesh)
+    assert uvs is not None and len(uvs) == len(mesh.vertices)
+    assert uvs.min() >= 0.0 and uvs.max() <= 1.0, "inside the atlas"
+    assert info.uv_density > 0.0
+
+    # Every face is flat and meets its neighbours at a right angle: no bevel.
+    angles = mesh.face_adjacency_angles
+    assert np.allclose(angles[angles > 1e-6], np.pi / 2, atol=1e-6)
+
+
+def test_the_starter_cubes_faces_each_get_their_own_uv_cell():
+    """Box-unwrapped, so a decal placed on one face stays on that face."""
+    mesh, _ = default_mesh()
+    uvs = source_uvs(mesh)
+
+    # Two triangles per side of the cube, and both land in the same cell of
+    # the 3x2 grid the unwrap lays out.
+    cells = [
+        (int(u * 3), int(v * 2))
+        for u, v in (uvs[face].mean(axis=0) for face in mesh.faces)
+    ]
+    assert len(set(cells)) == 6, f"one cell per side, got {sorted(set(cells))}"
+    assert all(cells.count(cell) == 2 for cell in cells)
+
 
 def test_fbx_import_matches_obj(bracket):
     """The FBX's centimeter metadata is converted to Blender-style metres."""
@@ -589,19 +669,26 @@ def test_shipped_defaults_match_edgewear001():
 # export
 # --------------------------------------------------------------------------
 
-def test_export_writes_both_maps(tmp_path):
+def test_export_writes_the_whole_set(tmp_path):
     from PIL import Image
 
-    gradient = np.linspace(0.0, 1.0, 32 * 32, dtype=np.float32).reshape(32, 32)
-    paths = export_maps(tmp_path, gradient, gradient, bits=8)
+    from core.export import MAP_NAMES
 
-    assert [p.name for p in paths] == ["edge_wear.png", "curvature.png"]
+    gradient = np.linspace(0.0, 1.0, 32 * 32, dtype=np.float32).reshape(32, 32)
+    rgb = np.repeat(gradient[..., None], 3, axis=2)
+    material = np.zeros((32, 32, 4), np.float32)
+
+    paths = export_maps(
+        tmp_path, color=rgb, normal=rgb, material=material, occlusion=gradient, bits=8
+    )
+
+    assert [p.name for p in paths] == [f"{name}.png" for name in MAP_NAMES]
     for path in paths:
         assert path.exists()
 
     # PNG row 0 is the top of the image, our arrays start at v=0, so the file
     # must come back flipped.
-    written = np.asarray(Image.open(paths[0]), dtype=np.float32) / 255.0
+    written = np.asarray(Image.open(tmp_path / "ao.png"), dtype=np.float32) / 255.0
     assert np.allclose(written, np.flipud(gradient), atol=1.0 / 255.0)
 
 
@@ -609,8 +696,8 @@ def test_export_16_bit_has_more_levels(tmp_path):
     from PIL import Image
 
     gradient = np.linspace(0.0, 1.0, 256 * 256, dtype=np.float32).reshape(256, 256)
-    eight = export_maps(tmp_path / "8", gradient, gradient, bits=8)[0]
-    sixteen = export_maps(tmp_path / "16", gradient, gradient, bits=16)[0]
+    eight = export_maps(tmp_path / "8", occlusion=gradient, bits=8)[0]
+    sixteen = export_maps(tmp_path / "16", occlusion=gradient, bits=16)[0]
 
     levels_8 = len(np.unique(np.asarray(Image.open(eight))))
     levels_16 = len(np.unique(np.asarray(Image.open(sixteen))))
@@ -620,4 +707,4 @@ def test_export_16_bit_has_more_levels(tmp_path):
 
 def test_export_rejects_odd_bit_depth(tmp_path):
     with pytest.raises(ValueError):
-        export_maps(tmp_path, np.zeros((4, 4)), np.zeros((4, 4)), bits=12)
+        export_maps(tmp_path, occlusion=np.zeros((4, 4)), bits=12)

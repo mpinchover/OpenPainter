@@ -114,3 +114,76 @@ def pick_uv(
     # Barycentric weights: the first corner takes whatever the other two leave.
     interpolated = corners[0] * (1.0 - u - v) + corners[1] * u + corners[2] * v
     return float(interpolated[0]), float(interpolated[1])
+
+
+def surface_at_uv(
+    vertices: np.ndarray, faces: np.ndarray, uvs: np.ndarray, u: float, v: float
+) -> Optional[np.ndarray]:
+    """Where a point of the atlas sits on the model, or None if it is gutter.
+
+    The reverse of :func:`pick_uv`: that turns a place on the surface into a
+    place in the texture, this turns a place in the texture back into one on the
+    surface. Which is what it takes to draw a decal's own border on the mesh --
+    the border is stated in UV, and the mesh is what has to show it.
+    """
+    face = face_at_uv(faces, uvs, u, v)
+    if face is None:
+        return None
+
+    corners = np.asarray(uvs, dtype=np.float64)[faces[face]]
+    edge1 = corners[1] - corners[0]
+    edge2 = corners[2] - corners[0]
+    point = np.array([u, v], dtype=np.float64) - corners[0]
+
+    determinant = edge1[0] * edge2[1] - edge2[0] * edge1[1]
+    if abs(determinant) < 1e-15:
+        return None
+
+    weight1 = (point[0] * edge2[1] - edge2[0] * point[1]) / determinant
+    weight2 = (edge1[0] * point[1] - point[0] * edge1[1]) / determinant
+
+    triangle = np.asarray(vertices, dtype=np.float64)[faces[face]]
+    return (
+        triangle[0] * (1.0 - weight1 - weight2)
+        + triangle[1] * weight1
+        + triangle[2] * weight2
+    )
+
+
+def face_at_uv(
+    faces: np.ndarray, uvs: np.ndarray, u: float, v: float
+) -> Optional[int]:
+    """The triangle covering a point in UV space, or None if it lands in the
+    gutter between charts.
+
+    The flat cousin of :func:`ray_mesh_hit`: no ray, no depth, just which
+    triangle of the atlas a texel belongs to. Barycentric coordinates in 2D,
+    vectorised over every face at once, the same way the ray test is.
+
+    An overlapping layout can put a texel inside more than one triangle -- a
+    valid atlas has none, and where one exists the first is as good an answer as
+    any, since the caller is asking about the surface *there*.
+    """
+    faces = np.asarray(faces)
+    uvs = np.asarray(uvs, dtype=np.float64)
+    if len(faces) == 0 or len(uvs) == 0:
+        return None
+
+    corners = uvs[faces]
+    edge1 = corners[:, 1] - corners[:, 0]
+    edge2 = corners[:, 2] - corners[:, 0]
+    point = np.array([u, v], dtype=np.float64) - corners[:, 0]
+
+    determinant = edge1[:, 0] * edge2[:, 1] - edge2[:, 0] * edge1[:, 1]
+    usable = np.abs(determinant) > 1e-15
+    if not usable.any():
+        return None
+
+    inverse = np.zeros_like(determinant)
+    inverse[usable] = 1.0 / determinant[usable]
+    weight1 = (point[:, 0] * edge2[:, 1] - edge2[:, 0] * point[:, 1]) * inverse
+    weight2 = (edge1[:, 0] * point[:, 1] - point[:, 0] * edge1[:, 1]) * inverse
+
+    inside = usable & (weight1 >= 0.0) & (weight2 >= 0.0) & (weight1 + weight2 <= 1.0)
+    found = np.flatnonzero(inside)
+    return int(found[0]) if len(found) else None

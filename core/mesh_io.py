@@ -317,6 +317,67 @@ def _axis_fix(mesh: trimesh.Trimesh, source_z_up: bool) -> np.ndarray:
     return Y_UP_TO_Z_UP
 
 
+#: Side of the cube the app opens on, in metres. Big enough that the bevel
+#: defaults land on it sensibly, small enough to frame like a real prop.
+DEFAULT_CUBE_SIZE = 0.5
+
+
+def default_mesh() -> tuple[trimesh.Trimesh, MeshInfo]:
+    """A plain cube, box-unwrapped, for opening on rather than an empty view.
+
+    Sharp -- no bevel. The Bevel panel is what puts one on, and starting with
+    one already there would hide what that panel is for.
+
+    Its six faces get a cell each of a 3x2 UV grid, so this goes down the same
+    path a mesh out of Blender does: bake into the mesh's own UVs, place decals
+    on it, and export maps that fit it.
+    """
+    half = DEFAULT_CUBE_SIZE / 2.0
+    directions = ((0, 0, 1), (0, 0, -1), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0))
+    corners = ((-1, -1), (1, -1), (1, 1), (-1, 1))
+    texture_corners = ((0, 0), (1, 0), (1, 1), (0, 1))
+
+    vertices: list[np.ndarray] = []
+    uvs: list[tuple[float, float]] = []
+    faces: list[tuple[int, int, int]] = []
+    for index, direction in enumerate(directions):
+        normal = np.array(direction, dtype=float)
+        # Any axis not parallel to the face's own normal will do for "up"; the
+        # cells only have to be consistent, not oriented in any particular way.
+        up = np.array([0.0, 0.0, 1.0]) if abs(normal[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        right = np.cross(up, normal)
+
+        base = len(vertices)
+        cell_u, cell_v = (index % 3) / 3.0, (index // 3) / 2.0
+        for (across, down), (tu, tv) in zip(corners, texture_corners):
+            vertices.append(normal * half + right * half * across + up * half * down)
+            uvs.append((cell_u + tu / 3.0, cell_v + tv / 2.0))
+        faces += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
+
+    mesh = trimesh.Trimesh(
+        vertices=np.array(vertices),
+        faces=np.array(faces),
+        process=False,  # welding would merge the seam vertices and their UVs
+        visual=trimesh.visual.TextureVisuals(uv=np.array(uvs)),
+    )
+    _ = mesh.vertex_normals
+
+    info = MeshInfo(
+        path="Cube",
+        backend="built-in",
+        vertices=len(mesh.vertices),
+        faces=len(mesh.faces),
+        extents=tuple(float(v) for v in mesh.extents),
+        scale=float(np.linalg.norm(mesh.extents)),
+        watertight=is_watertight(mesh),
+        has_uvs=True,
+        uv_density=uv_density(mesh),
+        to_world=np.eye(4),
+        notes=[],
+    )
+    return mesh, info
+
+
 def load_mesh(
     path: str | Path, *, source_z_up: bool = False
 ) -> tuple[trimesh.Trimesh, MeshInfo]:

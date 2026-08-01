@@ -31,11 +31,21 @@ MAX_DEPTH = 8
 #: The two slots under every mask, in the order the panel lists them.
 SLOTS = ("white", "black")
 
+#: Brightest a surface may be set to glow, in multiples of its own colour.
+#: Also what the composited emission channel is stored as a fraction of: the
+#: material map has to stay inside 0..1, because binding any other framebuffer
+#: turns fragment-colour clamping on for a float target and moderngl exposes no
+#: way to turn it back off. Nothing outside the compositor sees the packing --
+#: LayerCompositor.read_material() hands back the real thing.
+MAX_EMISSION = 16.0
+
 #: What a slot is, as ``value: label``. A colour is a leaf; the other two are
 #: masks, and choosing one grows the two slots underneath.
 COLOR_KIND = "color"
+#: The mask that reads the curvature bake -- the one this app is named for.
+EDGE_WEAR_KIND = "edge_wear"
 MASK_KINDS = {
-    "edge_wear": "Edge wear",
+    EDGE_WEAR_KIND: "Edge wear",
     "noise": "Noise",
 }
 SLOT_KINDS = {COLOR_KIND: "Colour", **MASK_KINDS}
@@ -86,13 +96,46 @@ class NoiseMaskParams:
 
 @dataclass
 class ColorSlot:
-    """A leaf: this side of the mask is simply this colour."""
+    """A leaf: this side of the mask is a material.
+
+    Colour is most of it, and the rest is what a renderer needs to know about
+    the surface: how metallic it is, how rough, how opaque, and whether it
+    gives off light. Each travels through the tree the same way the colour
+    does -- the mask blends all of them together -- and each comes out as its
+    own exported map.
+    """
 
     color: tuple[float, float, float] = (0.5, 0.5, 0.5)
+
+    metallic: float = 0.0
+    """0 is a dielectric -- paint, plastic, rust. 1 is bare metal. The values
+    in between are for a surface that is partly covered, not a material that is
+    half a metal."""
+
+    roughness: float = 0.5
+    """How wide the highlight spreads: 0 is a mirror, 1 is chalk."""
+
+    alpha: float = 1.0
+    """Opacity. 1 is solid; below that the surface lets what is behind it
+    through, and the exported alpha map says where."""
+
+    emission: float = 0.0
+    """How much light the surface gives off, in multiples of its own colour.
+    0 for anything that is only lit; above 0 for a screen, a lamp, hot metal."""
+
     name: str = ""
     """What to call it in the tree. Empty falls back to the hex code, which is
     what most slots are better off showing anyway -- a name is for the ones
     worth naming."""
+
+    def material(self) -> tuple[float, float, float, float]:
+        """The four surface channels, in the order the shader packs them."""
+        return (self.metallic, self.roughness, self.alpha, self.emission)
+
+    def packed_material(self) -> tuple[float, float, float, float]:
+        """The same four, with emission scaled into 0..1 -- see MAX_EMISSION."""
+        metallic, roughness, alpha, emission = self.material()
+        return (metallic, roughness, alpha, emission / MAX_EMISSION)
 
     @property
     def label(self) -> str:
@@ -197,10 +240,9 @@ def convert_slot(slot: Slot, kind: str) -> Slot:
         if isinstance(slot, ColorSlot):
             return slot
         white = slot.slot("white")
-        return ColorSlot(
-            white.color if isinstance(white, ColorSlot) else _DEFAULT_WHITE,
-            name=slot.name,
-        )
+        if isinstance(white, ColorSlot):
+            return replace(white, name=slot.name)
+        return ColorSlot(_DEFAULT_WHITE, name=slot.name)
 
     if kind not in MASK_KINDS:
         raise KeyError(f"no such kind: {kind!r}")
@@ -212,6 +254,36 @@ def convert_slot(slot: Slot, kind: str) -> Slot:
         name=slot.name,
         white=ColorSlot(_DEFAULT_WHITE),
         black=ColorSlot(_DEFAULT_BLACK),
+    )
+
+
+def texture_key(slot: Slot) -> tuple:
+    """Everything about a texture that changes what it renders.
+
+    The compositor re-runs when this differs from what it last drew, rather
+    than when something remembered to set a flag. A missed flag is an edit that
+    silently does nothing, and there is a control for every field below --
+    comparing the data itself is the version that cannot drift.
+
+    Names are left out on purpose: they are for reading, not rendering.
+    """
+    if isinstance(slot, ColorSlot):
+        return (
+            "color",
+            tuple(round(float(c), 6) for c in slot.color),
+            tuple(round(float(c), 6) for c in slot.material()),
+        )
+
+    wear = slot.edge_wear
+    noise = slot.noise
+    return (
+        slot.kind,
+        round(slot.threshold, 6),
+        round(slot.softness, 6),
+        tuple(round(float(value), 6) for value in wear.as_uniforms().values()),
+        tuple(round(float(value), 6) for value in noise.as_uniforms().values()),
+        texture_key(slot.white),
+        texture_key(slot.black),
     )
 
 

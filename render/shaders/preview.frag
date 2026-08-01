@@ -8,6 +8,7 @@ out vec4 out_color;
 
 uniform sampler2D u_map;
 uniform sampler2D u_normalMap;
+uniform sampler2D u_material;   // metallic, roughness, alpha, emission
 
 // 0 = sample u_map as greyscale
 // 1 = UV checker
@@ -18,7 +19,15 @@ uniform int u_mode;
 uniform float u_lighting;
 uniform float u_checkerScale;
 uniform vec3 u_lightDir;
+uniform vec3 u_eye;
 uniform float u_useNormalMap;
+uniform float u_useMaterial;
+uniform float u_emissionScale;  // the material map stores emission as a fraction
+uniform vec3 u_worldColor;      // the light everything sits in
+uniform float u_worldStrength;
+uniform float u_hdrScale;       // the headroom this target is divided down by
+
+const float PI = 3.14159265359;
 
 // Per-pixel tangent frame, from the derivatives of position and UV across the
 // triangle (Mikkelsen's cotangent frame). The mesh carries no tangent
@@ -46,6 +55,49 @@ vec3 apply_normal_map(vec3 normal, vec2 uv) {
     return normalize(tbn * tangent_normal);
 }
 
+// -- Cook-Torrance, the same specular model Blender's Principled BSDF uses ---
+//
+// GGX for the distribution of microfacets, Smith for how they shadow each
+// other, Schlick for Fresnel. Roughness is Blender's: squared into the GGX
+// alpha, so the slider's middle looks like the slider's middle there too.
+
+float distribution_ggx(float n_dot_h, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-7);
+}
+
+float geometry_smith(float n_dot_v, float n_dot_l, float roughness) {
+    float r = roughness + 1.0;
+    float k = r * r / 8.0;
+    float view = n_dot_v / (n_dot_v * (1.0 - k) + k);
+    float light = n_dot_l / (n_dot_l * (1.0 - k) + k);
+    return view * light;
+}
+
+vec3 fresnel_schlick(float cosine, vec3 f0) {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
+}
+
+// Fresnel for light arriving from the whole world rather than one direction.
+// The plain Schlick form drives a rough surface's reflection to full strength
+// at grazing angles, which a rough surface does not do; the roughness ceiling
+// holds it back. Karis' approximation, as used for image-based lighting.
+vec3 fresnel_schlick_roughness(float cosine, vec3 f0, float roughness) {
+    vec3 ceiling = max(vec3(1.0 - roughness), f0);
+    return f0 + (ceiling - f0) * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
+}
+
+// The world, as a two-colour gradient: brighter above, dimmer below. A single
+// lamp leaves a metal with nothing to reflect and a rough surface with nothing
+// to scatter, so both read as black however their sliders are set -- this is
+// what gives them something to be made of.
+vec3 world_light(vec3 direction) {
+    float up = direction.z * 0.5 + 0.5;
+    return u_worldColor * u_worldStrength * mix(0.25, 1.0, up);
+}
+
 void main() {
     vec3 base;
 
@@ -71,9 +123,65 @@ void main() {
         normal = apply_normal_map(normal, v_uv);
     }
 
-    // Headlight plus a low fill, so form reads without washing out the map.
-    float lambert = max(dot(normal, normalize(u_lightDir)), 0.0);
-    float shading = 0.35 + 0.65 * lambert;
+    float alpha = 1.0;
+    if (u_lighting < 0.5) {
+        // Unlit: the map itself, nothing added.
+        out_color = vec4(base / u_hdrScale, alpha);
+        return;
+    }
 
-    out_color = vec4(base * mix(1.0, shading, u_lighting), 1.0);
+    vec3 light = normalize(u_lightDir);
+    vec3 view = normalize(u_eye - v_world);
+    vec3 halfway = normalize(light + view);
+
+    float n_dot_l = max(dot(normal, light), 0.0);
+    float n_dot_v = max(dot(normal, view), 1e-4);
+    float n_dot_h = max(dot(normal, halfway), 0.0);
+    float v_dot_h = max(dot(view, halfway), 0.0);
+
+    float metallic = 0.0;
+    float roughness = 0.5;
+    float emission = 0.0;
+    if (u_useMaterial > 0.5) {
+        vec4 surface = texture(u_material, v_uv);
+        metallic = clamp(surface.r, 0.0, 1.0);
+        roughness = clamp(surface.g, 0.03, 1.0);
+        alpha = clamp(surface.b, 0.0, 1.0);
+        emission = max(surface.a, 0.0) * u_emissionScale;
+    }
+
+    // A metal has no diffuse of its own: its colour is what it reflects.
+    vec3 f0 = mix(vec3(0.04), base, metallic);
+    vec3 fresnel = fresnel_schlick(v_dot_h, f0);
+    vec3 diffuse_share = (1.0 - fresnel) * (1.0 - metallic);
+
+    // The lamp has a size, the way every light in Blender does. A light of no
+    // size puts a mirror's highlight inside a single pixel, so polishing a
+    // surface reads as removing the highlight rather than sharpening it; the
+    // floor is the smallest the highlight is allowed to get.
+    float direct_roughness = max(roughness, 0.07);
+    float distribution = distribution_ggx(n_dot_h, direct_roughness);
+    float geometry = geometry_smith(n_dot_v, n_dot_l, direct_roughness);
+    vec3 specular = distribution * geometry * fresnel
+                  / max(4.0 * n_dot_v * n_dot_l, 1e-4);
+
+    vec3 key = (diffuse_share * base + specular) * n_dot_l;
+
+    // The world: light arriving from every direction at once. Diffuse takes
+    // what the surface faces. The reflection looks along the mirror direction,
+    // bent back towards the normal as roughness climbs -- a rough surface
+    // gathers from everywhere rather than from one spot. Blurring the lookup
+    // rather than dimming it is what keeps a rough metal a metal: it reflects
+    // as much light as a polished one, just none of it in a straight line.
+    vec3 reflected = reflect(-view, normal);
+    vec3 gathered = normalize(mix(reflected, normal, roughness * roughness));
+    vec3 env_fresnel = fresnel_schlick_roughness(n_dot_v, f0, roughness);
+    vec3 ambient = diffuse_share * base * world_light(normal)
+                 + env_fresnel * world_light(gathered);
+
+    // Divided down into the target's headroom, not clipped at 1. An emissive
+    // surface brighter than white stays brighter than white all the way to the
+    // bloom pass, which is what makes it read as a light rather than a colour.
+    vec3 shaded = key + ambient + base * emission;
+    out_color = vec4(min(shaded, vec3(u_hdrScale)) / u_hdrScale, alpha);
 }

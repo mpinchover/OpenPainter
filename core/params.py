@@ -20,7 +20,11 @@ from typing import Any
 
 import numpy as np
 
-RESOLUTIONS = (512, 1024, 2048, 4096)
+RESOLUTIONS = (512, 1024, 2048, 4096, 8192)
+
+#: Most of a decal's half-width that its edge fade may eat. Past this the band
+#: cut from each side would meet in the middle and there would be no decal left.
+MAX_FALLOFF = 0.5
 
 #: make_bake.c's bake_axis, which masks curvature by facing direction.
 BAKE_AXES = ("XYZ", "X", "Y", "Z", "-X", "-Y", "-Z")
@@ -218,8 +222,36 @@ class DecalParams:
     """Fraction of the atlas width the decal spans. Its height follows from the
     image's own aspect ratio, so a wide vent stays wide."""
 
+    image_aspect: float = 1.0
+    """The image's own width over its height, remembered when it is placed.
+
+    A placement outlives any one look at the image, and there can be several on
+    a mesh at once, so each carries the shape of the picture it stamps rather
+    than asking a loader for it every time it is drawn."""
+
+    surface_aspect: float = 1.0
+    """World distance per unit u over world distance per unit v, where the decal
+    sits -- :func:`core.decal.uv_aspect`. A UV rectangle is only a rectangle of
+    the same shape on the model when this is 1, so it is divided back out when
+    the decal's height is worked out. Measured from the mesh, not set by hand."""
+
     rotation: float = 0.0
     """Degrees, counter-clockwise in UV space."""
+
+    falloff: float = 0.06
+    """How much of the decal's edge is dropped, as a fraction of its half-width.
+
+    A decal is a rectangle of an image and the surface it is stamped onto does
+    not stop there, so unless the image fades to a flat normal by its own border
+    the rectangle shows up as a seam. Most do not: a great many normal maps are
+    drawn on a white or a black canvas, and neither of those is flat -- white
+    decodes to a normal tilted 45 degrees along both axes.
+
+    The outer ``falloff`` is cut and the fade is spread over the same width
+    again inside it, so what is left is the middle of the image. The default is
+    enough to take a thin canvas border off; 0 turns it off for an image that
+    fades out by itself.
+    """
 
     intensity: float = 1.0
     """How deep the bump reads. Scales the decal's surface *slope* rather than
@@ -245,21 +277,34 @@ class DecalParams:
             round(self.center_u, 6),
             round(self.center_v, 6),
             round(self.scale, 6),
+            round(self.image_aspect, 6),
+            round(self.surface_aspect, 6),
             round(self.rotation, 4),
+            round(self.falloff, 6),
             round(self.intensity, 6),
             self.flip_green,
         )
 
-    def size(self, aspect: float) -> tuple[float, float]:
-        """Width and height in UV units, for an image ``aspect`` wide per tall."""
-        return (self.scale, self.scale / max(float(aspect), 1e-6))
+    def size(self) -> tuple[float, float]:
+        """Width and height in UV units.
 
-    def as_uniforms(self, aspect: float) -> dict[str, Any]:
-        width, height = self.size(aspect)
+        Two aspects to answer to. The image's own decides the shape wanted on
+        the surface -- a vent twice as wide as it is tall should read that way.
+        The surface's decides what UV rectangle produces that shape, since a UV
+        unit covers ``surface_aspect`` times as much world across as it does up.
+        """
+        width = self.scale
+        shape = max(float(self.image_aspect), 1e-6)
+        surface = max(float(self.surface_aspect), 1e-6)
+        return (width, width * surface / shape)
+
+    def as_uniforms(self) -> dict[str, Any]:
+        width, height = self.size()
         return {
             "u_center": (self.center_u, self.center_v),
             "u_size": (width, height),
             "u_rotation": float(np.radians(self.rotation)),
+            "u_falloff": float(np.clip(self.falloff, 0.0, MAX_FALLOFF)),
             "u_intensity": self.intensity,
             "u_flipGreen": 1.0 if self.flip_green else 0.0,
         }

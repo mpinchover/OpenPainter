@@ -3,6 +3,12 @@
 // The EdgeWear001 node group, decoded from ArmorPaint's
 // cloud/materials/Procedural/EdgeWear001.arm and ported node for node.
 //
+// This is the reference port, not the render path: an edge-wear layer is drawn
+// by layer.frag, which carries the same expression inline so that one pass can
+// also choose between the two things under the layer. Both are checked against
+// the numpy port in core/edge_wear.py -- this one in tests/test_gl.py, that one
+// in tests/test_layers.py -- which is what keeps them from drifting apart.
+//
 //   Group Input.Strength ─┐
 //   Group Input.Radius  ──┤
 //                         ▼

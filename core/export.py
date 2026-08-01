@@ -14,20 +14,26 @@ from __future__ import annotations
 import struct
 import zlib
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 from PIL import Image
 
-#: The product: the EdgeWear001 mask.
-EDGE_WEAR_NAME = "edge_wear"
-#: The Curvature Texture bake it is derived from.
-CURVATURE_NAME = "curvature"
 #: Tangent-space normals, carrying whatever decals are placed.
 NORMAL_NAME = "normal"
-#: The mask tree resolved to colour.
+#: The mask tree resolved to colour, and the two surface channels that travel
+#: with it. One file each rather than a packed ORM: they are separate inputs in
+#: every shader graph they end up in, and packing is a step to undo.
 COLOR_NAME = "color"
+METALLIC_NAME = "metallic"
+ROUGHNESS_NAME = "roughness"
+#: How much sky each texel can see, from the ray-cast bake.
+OCCLUSION_NAME = "ao"
 
-MAP_NAMES = (EDGE_WEAR_NAME, CURVATURE_NAME)
+#: The whole export, in the order it is written. A standard PBR set and nothing
+#: else: the edge wear is *in* the colour map, where the texture put it, and the
+#: curvature bake is an input to that rather than a product of it.
+MAP_NAMES = (COLOR_NAME, NORMAL_NAME, METALLIC_NAME, ROUGHNESS_NAME, OCCLUSION_NAME)
 
 
 def _to_image(array: np.ndarray, bits: int) -> Image.Image:
@@ -115,33 +121,73 @@ def save_normal_map(path: str | Path, array: np.ndarray, *, bits: int = 8) -> Pa
 
 def export_maps(
     output_dir: str | Path,
-    edge_wear: np.ndarray | None = None,
-    curvature: np.ndarray | None = None,
     *,
-    normal: np.ndarray | None = None,
     color: np.ndarray | None = None,
+    normal: np.ndarray | None = None,
+    material: np.ndarray | None = None,
+    occlusion: np.ndarray | None = None,
+    maps: Iterable[str] = MAP_NAMES,
     bits: int = 8,
     prefix: str = "",
 ) -> list[Path]:
     """Write whichever maps were handed over, and return what was written.
 
-    The four are independent products of independent halves of the app --
-    color.png from the mask tree, normal.png from the decals, edge_wear.png and
-    curvature.png from the bake -- so any of them may be absent and the rest
-    still get written. One export call, everything there is.
+    :data:`MAP_NAMES`, and nothing besides: colour and its metallic and
+    roughness from the texture, normals from the decals, occlusion from the
+    bake. They come from independent halves of the app, so any of them may be
+    absent and the rest still get written. One export call, everything there is.
 
-    16-bit is worth reaching for if banding shows up in the falloff -- the
-    curvature bake is a smooth gradient that 256 levels can struggle with.
+    ``maps`` narrows that to the ones asked for. It is a separate question from
+    which arrays were handed over: metallic and roughness arrive together in
+    ``material`` because they travel together through the compositor, and either
+    can be wanted without the other.
+
+    16-bit is worth reaching for if banding shows up in a gradient -- occlusion
+    is a smooth falloff that 256 levels can struggle with.
     """
     output_dir = Path(output_dir).expanduser()
-    written = [
-        save_map(output_dir / f"{prefix}{name}.png", array, bits=bits)
-        for name, array in zip(MAP_NAMES, (edge_wear, curvature))
-        if array is not None
-    ]
+    wanted = set(maps)
+    written: list[Path] = []
+
     for name, array in ((COLOR_NAME, color), (NORMAL_NAME, normal)):
-        if array is not None:
+        if array is not None and name in wanted:
             written.append(
                 save_rgb_map(output_dir / f"{prefix}{name}.png", array, bits=bits)
             )
+
+    if material is not None:
+        written.extend(
+            _write_material(output_dir, material, wanted, bits=bits, prefix=prefix)
+        )
+
+    if occlusion is not None and OCCLUSION_NAME in wanted:
+        written.append(
+            save_map(output_dir / f"{prefix}{OCCLUSION_NAME}.png", occlusion, bits=bits)
+        )
     return written
+
+
+def _write_material(
+    output_dir: Path,
+    material: np.ndarray,
+    wanted: set[str],
+    *,
+    bits: int,
+    prefix: str,
+) -> list[Path]:
+    """Metallic and roughness, one map each.
+
+    ``material`` is (h, w, 4): metallic, roughness, alpha, emission, in the
+    order :meth:`core.layers.ColorSlot.material` packs them. Only the first two
+    are written -- alpha and emission are there for the viewport to shade with,
+    not for the export, which is a standard PBR set and stops at that.
+    """
+    material = np.asarray(material, dtype=np.float32)
+    if material.ndim != 3 or material.shape[2] != 4:
+        raise ValueError(f"a material needs shape (h, w, 4), got {material.shape}")
+
+    return [
+        save_map(output_dir / f"{prefix}{name}.png", material[..., index], bits=bits)
+        for index, name in enumerate((METALLIC_NAME, ROUGHNESS_NAME))
+        if name in wanted
+    ]

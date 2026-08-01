@@ -25,6 +25,22 @@ from imgui_bundle import imgui
 from moderngl_window.integrations.imgui_bundle import ModernglWindowRenderer
 
 
+#: What ImGui asks for, and what pyglet calls the same cursor. ImGui records a
+#: cursor per frame and expects the platform layer to apply it; moderngl-window
+#: never does, so a widget that asks for a resize arrow silently gets none.
+_CURSORS = {
+    imgui.MouseCursor_.arrow: None,  # pyglet's own default
+    imgui.MouseCursor_.text_input: "text",
+    imgui.MouseCursor_.resize_all: "size",
+    imgui.MouseCursor_.resize_ns: "size_up_down",
+    imgui.MouseCursor_.resize_ew: "size_left_right",
+    imgui.MouseCursor_.resize_nesw: "size_down_left",
+    imgui.MouseCursor_.resize_nwse: "size_down_right",
+    imgui.MouseCursor_.hand: "hand",
+    imgui.MouseCursor_.not_allowed: "no",
+}
+
+
 class ImGuiRenderer(ModernglWindowRenderer):
     """ModernglWindowRenderer with ImGui 1.92 backend-managed textures."""
 
@@ -32,6 +48,42 @@ class ImGuiRenderer(ModernglWindowRenderer):
         super().__init__(window)
         self.io.backend_flags |= imgui.BackendFlags_.renderer_has_textures
         self.resize(*window.buffer_size)
+        self._cursor: object = None
+        self._cursor_cache: dict[str, object] = {}
+
+    # -- cursors ----------------------------------------------------------
+
+    def sync_mouse_cursor(self, override=None) -> None:
+        """Put on screen whichever cursor this frame's widgets asked for.
+
+        Call after the frame is built. ImGui only *records* the request --
+        ``set_mouse_cursor`` writes a field and expects the platform layer to
+        act on it, and moderngl-window's integration has no cursor handling at
+        all. Without this, hovering a resize edge changes nothing on screen and
+        the edge reads as dead.
+
+        ``override`` wins when the app is hit-testing something ImGui knows
+        nothing about, such as the sidebar's own edge.
+        """
+        native = getattr(self.wnd, "_window", None)
+        if native is None or not hasattr(native, "set_mouse_cursor"):
+            return  # headless, or a backend with no cursor of its own
+
+        wanted = override if override is not None else imgui.get_mouse_cursor()
+        if wanted == self._cursor:
+            return
+        self._cursor = wanted
+
+        if wanted == imgui.MouseCursor_.none:
+            self.wnd.cursor = False
+            return
+
+        # Anything unmapped falls back to the arrow, which pyglet spells None.
+        name = _CURSORS.get(wanted, None)
+        self.wnd.cursor = True
+        if name not in self._cursor_cache:
+            self._cursor_cache[name] = native.get_system_mouse_cursor(name)
+        native.set_mouse_cursor(self._cursor_cache[name])
 
     # -- high-DPI ---------------------------------------------------------
 

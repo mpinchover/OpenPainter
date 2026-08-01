@@ -10,12 +10,19 @@
 // real texture the panel can show as a thumbnail.
 
 in vec2 v_uv;
-out vec4 out_color;
+
+// Two attachments: the colour, and the four surface channels that travel with
+// it -- metallic, roughness, alpha, emission. The mask blends both the same
+// way, so a material follows its colour wherever the tree puts it.
+layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_material;
 
 uniform sampler2D u_curvature;  // the bake, for an edge wear node
 uniform sampler2D u_position;   // bposition: object position over the bbox, 0..1
-uniform sampler2D u_white;      // used only when u_whiteIsMap is 1
+uniform sampler2D u_white;          // used only when u_whiteIsMap is 1
+uniform sampler2D u_whiteMaterial;
 uniform sampler2D u_black;
+uniform sampler2D u_blackMaterial;
 
 uniform int u_kind;             // 0 = edge wear, 1 = noise, 2 = flat colour
 uniform float u_threshold;      // where the two sides divide, on the mask's 0..1
@@ -24,6 +31,8 @@ uniform int u_whiteIsMap;
 uniform int u_blackIsMap;
 uniform vec3 u_whiteColor;
 uniform vec3 u_blackColor;
+uniform vec4 u_whiteSurface;   // metallic, roughness, alpha, emission
+uniform vec4 u_blackSurface;
 
 // Edge wear, the EdgeWear001 group: see render/shaders/edge_wear.frag.
 uniform float u_value;
@@ -80,5 +89,11 @@ void main() {
     vec3 white = u_whiteIsMap == 1 ? texture(u_white, v_uv).rgb : u_whiteColor;
     vec3 black = u_blackIsMap == 1 ? texture(u_black, v_uv).rgb : u_blackColor;
 
+    vec4 white_surface = u_whiteIsMap == 1
+        ? texture(u_whiteMaterial, v_uv) : u_whiteSurface;
+    vec4 black_surface = u_blackIsMap == 1
+        ? texture(u_blackMaterial, v_uv) : u_blackSurface;
+
     out_color = vec4(mix(black, white, mask), 1.0);
+    out_material = mix(black_surface, white_surface, mask);
 }

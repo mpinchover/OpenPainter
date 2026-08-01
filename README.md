@@ -7,9 +7,30 @@ export the mask as a texture you can drop straight onto the original mesh.
 
 Same algorithm, same parameters, same shipped defaults.
 
+The window's name, its icon and the decal shelf come from **`metadata.json`** at
+the project root:
+
+```json
+{
+    "title": "OpenPainter",
+    "application_icon": "./assets/application_icon.png",
+    "decals": "./assets/decals"
+}
+```
+
+Every field is optional and none of them can stop the app opening — a file that
+is missing, malformed or full of the wrong types falls back to the built-in name,
+no icon and an empty shelf, because a typo in a branding file is not a reason to
+refuse to start. Paths are resolved against the metadata file's own directory, so
+the relative forms above mean the same thing wherever the app is launched from,
+and the icon is resolved to an absolute path before it is handed over so that
+moderngl-window's resource finders are bypassed rather than consulted. Whether
+the icon shows at all is the platform's business: the headless backend has no
+window to put one on and says so, which is caught rather than raised.
+
 ```bash
 cd meshmap && source myenv/bin/activate
-python main.py                       # empty, then drag an FBX onto the window
+python main.py                       # opens on a starter cube; drag an FBX on to swap it
 python main.py cube.fbx              # load on startup
 python main.py cube.fbx --resolution 2048 --z-up
 python main.py cube.fbx --auto-unwrap   # for a mesh with no UVs at all
@@ -17,6 +38,13 @@ python main.py --ui-scale 1.8        # bigger panel and text
 ```
 
 Press **B** to bake, build a texture in the sidebar, press **E** to export.
+
+It opens on a plain 0.5 m cube with a texture already on it — *Texture 01*, a
+flat colour to build up from. The cube is box-unwrapped, so it takes the same
+path an imported mesh does — bake into its own UVs, place decals on it, export maps that
+fit it. It is deliberately **sharp**: the Bevel panel is what puts a bevel on,
+and edge wear finds nothing to grip until it does. Drop a mesh on the window at
+any point to work on that instead.
 
 ### The window
 
@@ -26,8 +54,10 @@ map. Those are the two things the app makes, so those are the two things to
 look at.
 
 The sidebar down the left is the parameters, tabbed by which half of the
-pipeline they belong to, and the status bar sits along the bottom. Nothing
-floats: all three are part of the frame, the 3D view is laid out in what is
+pipeline they belong to, and the status bar sits along the bottom. Drag the
+sidebar's right edge to widen or narrow it — up to half the window, since the
+model is the thing being worked on — and the 3D view is re-laid out around
+whatever is left. Nothing floats: all three are part of the frame, the 3D view is laid out in what is
 left, and the projection and the cursor rays are built from that rect rather
 than from the whole window — so nothing is ever hidden behind a panel and
 pointing at the model lands where you point.
@@ -41,10 +71,10 @@ everything else -- at the size and on the surface it will be seen at.
 
 MeshMap bakes into **the UV map already on the mesh**. Unwrap in Blender before
 exporting (UV Editing workspace, or `U` → Smart UV Project); the FBX exporter
-always includes UV layers, so nothing else is needed. Then `edge_wear.png`
-applies directly to your original mesh — plug it into a `Mix Color` factor or
-into Roughness, and set the image's **Color Space to Non-Color**, because it is
-a mask and not a colour.
+always includes UV layers, so nothing else is needed. Then the exported maps
+apply directly to your original mesh — plug `color.png` into Base Color and the
+rest into the sockets they are named after, and set everything except
+`color.png` to **Color Space: Non-Color**, because they are data and not colour.
 
 ### Bevel sharp edges before baking
 
@@ -82,10 +112,37 @@ three or more beveled edges meet are fanned onto the corner sphere rather than
 Grid Filled, so the topology there differs. Since the geometry only ever feeds
 the bake, that costs a little accuracy in the corner falloff and nothing else.
 
-**Export** is one button and writes everything there is: `color.png` from the
-mask tree, `normal.png` from any decals, and `edge_wear.png` and `curvature.png`
-from the bake. All four address your original mesh through its own UV map, so
-there is nothing to ship alongside them.
+**File → Export textures** (or **E**) writes a standard PBR set and nothing
+else: `color.png`, `metallic.png` and `roughness.png` from the texture,
+`normal.png` from any decals, and `ao.png` from the bake. They all address your
+original mesh through its own UV map, so there is nothing to ship alongside
+them.
+
+The edge wear is not a file of its own, because it is not a separate product:
+it is *in* `color.png`, wherever the texture put it. Nor is the curvature bake,
+which is an input to that rather than an output of it. Alpha and emission are
+there to shade the viewport by and stop at the window — a PBR set is these five.
+
+The export itself asks one question — where to put things — and that is the only
+one it asks: a folder chooser, opening wherever the last export went, with the
+maps landing in a folder named after the mesh. Everything else about it is
+answered in advance under **Settings → Export**: the folder it starts from, the
+bit depth, and **which of the five to write**. The export lives in the **File**
+menu next to **Import mesh**, because it belongs to no single tab — it takes what
+the Bake, Texture and Decal tabs have each produced.
+
+**Four of the five cost nothing to leave out and one costs a great deal.**
+Colour, metallic and roughness are one composite pass over the texture; normals
+are one pass over the decal. Switching those off only stops a file being
+written. Ambient occlusion is the one stage that traces rays, and it is most of
+what a bake costs — 4.5s of a 4.9s bake at 1024, 96s of 103s at 4096 — so
+switching it off takes it out of the bake as well, which is the point of being
+able to. Switching it back on needs a re-bake, and the Bake button says so.
+
+The stage still *runs* when it is off; it just clears its map and records its
+key. One that were skipped outright would leave the bake looking permanently
+stale, since a stage that never records a key is a stage that is always
+pending.
 
 ### Textures
 
@@ -102,8 +159,81 @@ rather than something to lose; past five it grows a search box, which matches
 anywhere in the name and ignores case. *Remove* drops the active one and falls
 back to its neighbour.
 
+A colour is a **material**, not just an RGB: alongside the colour sit
+**metallic**, **roughness**, **alpha** and **emission**, and the mask blends
+all five the same way — one pass with two attachments, so a surface follows its
+colour wherever the tree puts it. Each comes out as its own map rather than a
+packed ORM, because they are separate inputs in every shader graph they end up
+in and packing is a step to undo. Emission is written as a colour (the
+surface's own, times how much light it gives off), so strengths above 1 clip
+there — a PNG stops at white — while the viewport keeps showing the difference.
+
+The Shaded view shades it the way Blender's Principled BSDF does:
+**Cook-Torrance** specular with a GGX distribution, Smith geometry and Schlick
+Fresnel, roughness squared into the GGX alpha so the middle of the slider looks
+like the middle of Blender's. Metal takes its colour from what it reflects
+rather than from a diffuse term; roughness decides how sharply. The lamp is
+given a small size — a light of no size puts a mirror's highlight inside a
+single pixel, so polishing a surface would read as *removing* the highlight
+instead of sharpening it.
+
+**Emission is a light, not a bright colour.** Past white a surface cannot get
+any brighter on screen, so cranking the slider used to do nothing but drive the
+colour to white: each channel clipped at 1 in turn and the hue climbed to the
+corner of the cube. Now the scene is drawn into a target with room above white,
+whatever is brighter than white is blurred and added back, and the result rolls
+off as a whole colour rather than channel by channel. An emissive red surface
+stays red and spills a red glow, and the glow is what carries how bright it is.
+The blur runs at a quarter resolution, which is most of the cost of a bloom and
+none of the detail.
+
+**World lighting**, under **Settings**, is both lights: the key light, and the
+world it stands in.
+
+**Rotation** walks the key light around the model — 0° puts it on the +X axis
+and it turns towards +Y, counting the way the gizmo in the corner does. A line
+under the slider names where it is standing and which way it is therefore
+shining (*Light at +X, shining toward −X*), rounded to the nearest eighth,
+because the exact angle is already on the slider and what you want from a line
+of text is which side of the model is lit.
+
+And while you are moving it, **an arrow appears in the viewport**: a lamp
+standing at the light's own position, an arrow from it into the model, and the
+faint ring of the path it travels as the slider turns. Text can say *+X*, but a
+model is a 3D thing seen from an angle, and *which side of what I am looking at
+is this* is answered fastest by pointing at it. It comes up on hover rather than
+on the first pixel of movement — otherwise you are turning something you cannot
+see yet — and fades out a second or so after you let go, so it is not another
+thing permanently in the way.
+
+It is drawn in ImGui's background draw list, above the 3D view and below every
+panel, exactly as the navigation gizmo is: no shader, no depth buffer, no GL
+state to hand back. Unlike the gizmo it is projected through the camera's
+matrices rather than by its axes alone, because it is a thing standing in the
+scene at a place rather than a widget pinned to a corner — which also means a
+lamp behind the camera has to be dropped rather than divided by a negative `w`
+and drawn mirrored through the middle of the view.
+
+The light is **anchored to the model, not to the camera**. It used to be a
+headlight — `eye - target`, plus an offset up and to the right — which meant it
+could not be moved at all: orbiting took it along, and every view was lit
+identically from the same relative angle. Anchoring it is what makes putting the
+light somewhere mean anything, and it is why orbiting now shows you a
+differently lit side rather than the same one from further round. Elevation is
+fixed at 38°, which is where the headlight already sat; the useful control is
+which side the light comes from, not how steeply.
+
+**Strength** and **Colour** are the world around it — not an HDRI, just a
+two-tone gradient, brighter above than below. Without it a metal has nothing to
+reflect and a rough surface has nothing to scatter, and both render black
+however their own sliders are set. A rough surface reflects as much light as a
+polished one, so roughness blurs the direction it gathers from rather than
+dimming what it gathers — fading it out instead is what once made a fully rough
+metal a black hole.
+
 Everything in the tree can be **renamed** by double-clicking its row — the
-texture itself included, since that is the row at the top. A name describes the
+texture itself included, since that is the row at the top. A renamed row shows
+that name and nothing else; the row being renamed shows only the field. A name describes the
 part of the texture rather than the kind of thing it currently is, so it
 survives changing a colour into a mask and back, and the automatic label (the
 mask's kind, or the colour's hex code) follows it in brackets. Clear the name
@@ -131,11 +261,18 @@ undo. Before a bake, or with no texture at all, Shaded draws plain grey.
 **The sidebar's two halves do different jobs.** The tree is binary and its
 depth is unbounded, so indenting the whole thing runs out of panel before it
 runs out of tree — a node graph is the usual escape and this is the other one.
-The top edits whatever is *selected*: its type, and either a colour picker or
-that mask's own sliders -- all of them, laid out flat, nothing folded behind a
-header. The bottom is the tree itself, one line per slot with a swatch or a
-thumbnail, for selecting with, scrolling on its own so a deep tree cannot push
-the controls off the top. Depth costs a line rather than a column.
+**Inspector** on top edits whatever is *selected*: its type, and either its
+colour — a swatch that opens the picker in a popup, since a picker is as tall
+as it is wide and is used in bursts — or that mask's own sliders, all of them,
+laid out flat with nothing folded behind a header. **Texture tree** underneath
+is the tree itself, one line per slot with a swatch or a thumbnail, for
+selecting with. Depth costs a line rather than a column.
+
+The two split the tab evenly, each scrolling on its own, and the divider
+between them drags to give one more room than the other — which is remembered
+between runs. Fixed shares rather than "whatever the contents need": the
+inspector's height changes with what is selected, and a tree that jumped about
+as it did would be a tree you could not keep your place in.
 
 The thumbnails come free from how the tree is rendered: **one full-screen pass per node, bottom up**
 (`render/composite.py`). Everything here is UV space already, so a node's
@@ -145,9 +282,42 @@ node therefore ends up holding a real texture, which is exactly what the panel
 wants to show. Targets are recycled, so a tree of depth *d* needs *d + 1* of
 them however wide it is, and nesting stops at 8.
 
-The Bake tab's own *Edge wear* sliders are a separate thing: they shape
-`edge_wear.png`, the mask on its own. The texture's edge-wear masks carry their
-own settings.
+**Edge wear is tuned on the layer that uses it**, and nowhere else. The Bake tab
+used to carry a second copy of the same sliders, driving a set of settings that
+belonged to nothing in particular — two places to change one thing, disagreeing
+by default. The layer is the only copy now, and what it produces reaches the
+export the same way every other layer does: through `color.png`.
+
+### Ambient occlusion
+
+`ao.png` is the one map here that is not arithmetic on the G-buffer. Curvature
+is a derivative of the normals at a texel — it says what the surface does
+*there*. Occlusion depends on geometry that may be nowhere near it, on the
+surface or in the atlas, so it is a real ray cast: 32 rays per covered texel,
+into the hemisphere it faces, against the same beveled and unwrapped geometry
+the bake rasterised. Through Embree where `embreex` is installed, which is what
+makes a million texels a few seconds rather than a coffee break.
+
+Three things make a modest ray count usable. The rays are **cosine-weighted**,
+so an unoccluded surface comes back at exactly 1 without a `dot(n, l)` term.
+They are **stratified in both directions** — elevation walks outwards one ring
+per sample, azimuth turns by the golden angle — so they spread over the
+hemisphere instead of clumping the way chance leaves them, and each texel's
+spiral starts at its own angle so the residue looks like grain rather than a
+pattern. Then a **3×3 average over covered texels only** takes the grain out,
+which is far cheaper than the rays that would smooth it. The blur does not wrap
+at the edges of the map: an atlas is not a tiling texture, and a chart against
+the left border has nothing to do with one against the right.
+
+Rays stop at **20% of the model's bounding-box diagonal**. Without a limit,
+occlusion means "is there anything at all in this direction", which on a closed
+model darkens every concave surface no matter how far away the far side is; with
+one, it means "is there anything *nearby*", which is what reads as contact. A
+fraction rather than a distance, so the same setting suits a bolt and a bridge.
+
+The bevel matters here as much as it does to the curvature: a perfectly sharp
+edge occludes nothing, because there is no surface turned into the corner to
+catch a ray.
 
 ### Decals
 
@@ -168,11 +338,48 @@ in perspective or in an orthographic axis view alike. Two-finger orbiting still
 works while placing, so you can turn the model to reach the far side.
 
 The placement itself is stated in UV space — **Position U/V**, **Scale** (the
-fraction of the atlas it spans across, with its height following the image's
-aspect) and **Rotation** — and the sliders stay live for nudging afterwards.
-Substance Painter projects through a 3D gizmo instead; for anything with a sane
-UV layout these come to the same thing, and the *UV checker* preview shows which
-part of the mesh a given placement lands on.
+fraction of the atlas it spans across) and **Rotation** — and the sliders stay
+live for nudging afterwards. Substance Painter projects through a 3D gizmo
+instead; for anything with a sane UV layout these come to the same thing.
+
+**The decal's own edge is faded out.** A decal is a rectangle of an image, and
+the surface it lands on does not stop there — so unless the image fades to a
+flat normal by its own border, the rectangle shows up as a seam around it. Most
+do not: a great many normal maps are drawn on a canvas, and neither white nor
+black is a flat normal (white decodes to one tilted 45° along both axes). **Edge
+falloff** cuts the outer fraction of the decal and feathers the fade over the
+same width again inside it, so what is stamped is the middle of the image.
+Cutting rather than merely ramping to zero at the border matters: a ramp leaves
+no hard edge but still shows most of the canvas just inside it, and the canvas is
+the problem. 0 turns it off for an image that fades out by itself.
+
+A transparent texel gets a **flat normal** before upload, too. Nothing samples
+one directly — the alpha multiplies it out — but every bilinear tap and every
+mipmap level around the edge of the artwork averages it in, and left as the
+white the canvas happened to be, that averaging invents a tilt that was never
+drawn.
+
+**A square of UV space is not a square of the model**, and that difference is
+what the decal's height is worked out from. A unit of u need not cover as much
+surface as a unit of v: the starter cube's box unwrap gives each face a 1/3 × 1/2
+cell of a square atlas, so one unit of u spans 1.5× the world one unit of v does,
+and a round decal stamped into a square UV rectangle came out an ellipse half
+again as wide as it was tall. `uv_aspect` measures that ratio off the mesh —
+the tangent and bitangent lengths implied by each triangle's positions and UVs —
+and the height is divided by it, so a round decal is round. The image's own
+aspect still decides the shape wanted; the surface's decides what UV rectangle
+produces it.
+
+The ratio is **measured from wherever the decal is now**, not remembered from
+where it was placed: `face_at_uv` finds the triangle under its centre each time
+the placement moves. A layout can be dense in one island and stretched in the
+next, so a number stored at placement time goes quietly wrong the moment the
+decal is dragged onto another island or the mesh is re-baked into a different
+atlas. A decal centred in the gutter between charts has no triangle to ask, and
+falls back to the mesh's own average — a UV-area-weighted *geometric* mean,
+because it is a ratio: a face at 2.0 and a face at 0.5 average to 1.0, not 1.25.
+The Decal tab says when a correction is in effect rather than applying it
+silently.
 
 **Height intensity** scales the *slope* the map describes, `xy/z`, rather than
 the stored vector. That is what makes 2.0 genuinely twice as steep: scaling the
@@ -197,7 +404,7 @@ mesh. Unwrapping in Blender is almost always the better answer.
 | Key | Action |
 | --- | --- |
 | `1` / `2` | Preview: shaded (the mask tree) / normals (the decals) |
-| `B` / `E` / `F` | Bake / export maps / frame the mesh (also resets the view) |
+| `B` / `E` / `F` | Bake / export maps (asks where) / frame the mesh (also resets the view) |
 | `W` / `L` | Wireframe / lighting |
 | `+` / `-` | Bigger / smaller UI |
 | `Esc` | Cancel a decal placement |
@@ -230,6 +437,7 @@ trackpad's stream of small deltas and a wheel's whole notches rarely want the
 same rate. There are invert-axis toggles for natural scrolling. Everything is
 remembered between launches in `prefs.json`. A speed of 1.0 orbits at 0.4
 degrees per pixel, which is Blender's own `view_rotate_sensitivity_turntable`.
+The same tab carries **World lighting** — see above — and the interface scale.
 
 **Smoothing** is there for one specific defect. macOS reports scrolling one
 pixel of finger travel at a time — `[NSEvent deltaY]`, which pyglet reads
@@ -492,11 +700,15 @@ FBX / OBJ / GLB
       ▼  core/baking.py       ══ CPU, on a worker thread ══
    dilate() pads chart borders outward past the seams
       │
-      ▼  render/shaders/edge_wear.frag   ══ every frame ══
+      ▼  core/occlusion.py    ══ CPU, on a worker thread ══
+   cast rays into the hemisphere at every covered texel ──▶ ao.png
+      │
+      ▼  render/shaders/layer.frag  ══ once per layer, on every edit ══
    mask = clamp((curvature - noise * wear) * contrast, 0, 1)
+   then choose between the two things under it
       │
       ├──▶ viewport preview, on the mesh
-      └──▶ edge_wear.png  +  curvature.png
+      └──▶ color.png + metallic.png + roughness.png
 ```
 
 ## The expensive/cheap split
@@ -515,14 +727,20 @@ bake stage. A test asserts exactly that (`test_wear_params_never_dirty_the_bake`
 
 ## Stage keying
 
-The bake is three stages, and each is keyed on its own parameters **plus the key
+The bake is five stages, and each is keyed on its own parameters **plus the key
 of the stage before it**:
 
 ```python
 unwrap_key    = (mesh_token, unwrap_params.key(), resolution)
 curvature_key = unwrap_key + bake_params.curvature_key()
-post_key      = curvature_key + (dilation,)
+occlusion_key = unwrap_key + (samples, distance)
+post_key      = curvature_key + occlusion_key + (dilation,)
 ```
+
+Occlusion hangs off the *unwrap* rather than off the curvature: it is a ray cast
+against the geometry, and no curvature slider can change what a ray hits. So
+nudging Strength re-rasterises and re-pads without spending the seconds that
+re-casting would cost.
 
 Cascading, so invalidation flows forward automatically and never backward:
 
@@ -531,7 +749,11 @@ Cascading, so invalidation flows forward automatically and never backward:
 | Seam padding | `post` |
 | Strength / Radius / Offset / Smooth / Axis | `curvature`, `post` |
 | Bake resolution, atlas settings, or the mesh | everything |
-| Any *Edge wear* slider | nothing — it is not a bake stage |
+| Any edge-wear setting on a layer | nothing — it is not a bake stage |
+
+Occlusion is the slowest of them by a wide margin — seconds against fractions of
+one, since it is the only stage that traces rays. It reports progress per ray
+batch and honours Cancel between them, like every other CPU stage.
 
 The Bake button reports how many stages are stale before you commit. A test
 sweeps every bake field and asserts it is keyed; another asserts `dilation` is
@@ -562,13 +784,9 @@ compounding the dilation. (That was a real bug, found and fixed; it has a test.)
 
 ## Preview and export are the same pixels
 
-The viewport samples `tex_output`, and export reads that same framebuffer back
-off the GPU rather than recomputing on the CPU. The PNG is exactly what you
-tuned, by construction.
-
-`edge_wear.png` is the product. `curvature.png` is the bake behind it, exported
-alongside because it is the lossless input — you can re-derive any wear from it,
-but not the reverse.
+The viewport samples the compositor's own targets, and export reads those same
+framebuffers back off the GPU rather than recomputing on the CPU. The PNG is
+exactly what you tuned, by construction.
 
 ---
 
@@ -586,7 +804,8 @@ but not the reverse.
 | Axis | XYZ | Anything else multiplies by `dot(n, axis)` — only edges facing that way wear. |
 | Seam padding | 4 | Texels of dilation past each chart border. Under *Advanced*. |
 
-**Edge wear — the node group. Live, no re-bake.**
+**Edge wear — the node group. Live, no re-bake.** On an edge-wear layer, in the
+Texture tab.
 
 | Parameter | Default | What it does |
 | --- | --- | --- |
@@ -595,12 +814,9 @@ but not the reverse.
 | Contrast | 3.0 | Final multiply, clamped to 0..1. |
 | Detail / Roughness / Lacunarity / Distortion | 5.0 / 0.7 / 5.0 / 0.15 | The Wear Noise `TEX_NOISE` settings, as shipped. |
 
-*Reset to EdgeWear001* restores every value decoded from the `.arm` file.
-
-**If the bake comes out black:** switch to preview `2` (Curvature texture) to see
-what the bake actually found before the wear graph touches it. Then raise
-Strength toward 1.5–2.0 and Radius toward 3–4. If it is *still* black, your mesh
-has no bevels — see "What this method needs from your mesh".
+**If the wear comes out black:** the curvature bake behind it probably found
+nothing. Raise Strength toward 1.5–2.0 and Radius toward 3–4. If it is *still*
+black, your mesh has no bevels — see "What this method needs from your mesh".
 
 ---
 
@@ -638,18 +854,27 @@ core/
   bevel.py               Blender's Bevel modifier, approximated
   uv_unwrap.py           source UV layout, or the xatlas fallback + vmapping
   baking.py              the UV-space curvature bake, the 95% blur, dilation
+  occlusion.py           the ray-cast ambient occlusion bake
+  metadata.py            the title, icon and decal shelf, from metadata.json
   pipeline.py            stage keying, CPU/GL split, threading, cancel
   edge_wear.py           the EdgeWear001 graph and tex_noise, in numpy
+  layers.py              the texture tree: colours, masks, and their materials
   export.py              PNG writers, 8- and 16-bit
   params.py              BakeParams / EdgeWearParams, split by cost
 render/
-  viewport.py            window, orbit/pan camera, live EdgeWear001 pass
+  viewport.py            window, orbit/pan camera, the frame
+  composite.py           the texture tree, one full-screen pass per layer
   imgui_renderer.py      ImGui 1.92 texture backend (see below)
   shaders/
     gbuffer.vert/.frag   UV-space rasterisation + the curvature formula
-    edge_wear.frag       the node group + ArmorPaint's tex_noise
+    layer.frag           one layer of the texture tree: mask, then choose
+    decal.frag           one decal, as a slope added into the atlas
+    normal_encode.frag   the accumulated slopes, back into a normal map
+    edge_wear.frag       the node group as the reference port, not the path
+    noise.glsl           ArmorPaint's tex_noise, shared by both
     copy.frag            the 95% round-trip blur
-    preview.frag         viewport shading modes
+    preview.frag         viewport shading, Cook-Torrance
+    bright/blur/tonemap  the glow around an emissive surface
 ui/panel.py              the slider panel
 ui/gizmo.py              the clickable axis gizmo
 tests/                   pipeline, GL, controller, and UI-scale tests

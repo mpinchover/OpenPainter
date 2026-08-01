@@ -23,8 +23,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "mesh",
         nargs="?",
-        help="Mesh to load on startup (.fbx, .obj, .glb, ...). "
-             "Files can also be dropped onto the window.",
+        help="Mesh to load on startup (.fbx, .obj, .glb, ...). Without one the "
+             "app opens on a starter cube; files can also be dropped onto the "
+             "window.",
     )
     parser.add_argument(
         "--z-up",
@@ -95,7 +96,8 @@ def run_selftest(args: argparse.Namespace) -> int:
     """Drive the real app through a headless context and dump the results.
 
     This exercises the same code path the window does -- bake controller,
-    shaping pass, preview shader, ImGui -- without needing a display.
+    shaping pass, preview shader, ImGui -- without needing a display. With no
+    mesh argument it runs on the same starter cube the window opens on.
     """
     from PIL import Image
 
@@ -162,9 +164,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.selftest:
-        if not args.mesh:
-            print("error: --selftest needs a mesh argument", file=sys.stderr)
-            return 2
         return run_selftest(args)
 
     MeshMapApp.initial_mesh = args.mesh

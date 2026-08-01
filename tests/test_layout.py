@@ -125,6 +125,308 @@ def test_every_preview_mode_has_a_number_key_and_no_more(app):
         assert app.preview_index < len(PREVIEW_MODES)
 
 
+@pytest.fixture
+def starter_app():
+    """The app as it opens with no mesh argument at all."""
+    import moderngl_window as mglw
+    from imgui_bundle import imgui
+
+    from render.viewport import MeshMapApp
+
+    MeshMapApp.initial_mesh = None
+    MeshMapApp.initial_resolution = 256
+    try:
+        instance = mglw.create_window_config_instance(MeshMapApp, args=["-wnd", "headless"])
+    except Exception as exc:  # pragma: no cover - depends on the host
+        pytest.skip(f"no headless window available: {exc}")
+    yield instance
+    instance.controller.release()
+    imgui.destroy_context()
+
+
+def test_the_app_opens_on_the_starter_cube(starter_app):
+    """No mesh argument, no empty viewport -- something to work on straight
+    away, without importing anything."""
+    assert starter_app.mesh is not None
+    assert starter_app.mesh_info.path == "Cube"
+    assert starter_app.mesh_info.has_uvs, "so the bake goes into its own UVs"
+    assert not starter_app.controller.bevel_params.enabled, "sharp, as asked"
+    assert "cube" in starter_app.status.lower()
+
+
+def test_the_app_opens_with_a_texture_to_work_on(starter_app):
+    """Both ends ready: a mesh to bake, and a texture to put on it."""
+    assert starter_app.texture is not None
+    assert starter_app.texture.name == "Texture 01"
+
+
+def test_the_double_click_thresholds_are_loosened(starter_app):
+    """Renaming is a double-click, and ImGui's defaults make it a hard one:
+    6 physical pixels of travel is a third of a hand's on a HiDPI display,
+    and 0.30s is quicker than a comfortable double-click."""
+    from imgui_bundle import imgui
+
+    io = imgui.get_io()
+    assert io.mouse_double_click_time >= 0.5
+    assert io.mouse_double_click_max_dist >= 6.0 * starter_app.ui_pixel_scale - 1e-6
+
+    starter_app.set_ui_scale(2.5)
+    assert io.mouse_double_click_max_dist == pytest.approx(
+        6.0 * starter_app.ui_pixel_scale
+    ), "and the distance follows the scale, since ImGui is driven in pixels"
+
+
+def test_the_sidebar_can_be_resized_and_the_view_follows(starter_app):
+    """One number decides the sidebar's width: the panel draws itself that
+    wide and the 3D view starts where it ends, so the two cannot disagree."""
+    from ui.panel import PANEL_WIDTH
+
+    assert starter_app.sidebar_width == pytest.approx(PANEL_WIDTH)
+    before_x, _, before_width, _ = starter_app.viewport_rect
+
+    starter_app.set_sidebar_width(PANEL_WIDTH - 120)
+    x, _, width, _ = starter_app.viewport_rect
+    assert x == starter_app.sidebar_pixels
+    assert x < before_x and width > before_width, "the view takes what it gives up"
+
+    starter_app.on_render(0.0, 1 / 60.0)
+    assert starter_app.camera.projection.aspect_ratio == pytest.approx(
+        width / starter_app.viewport_rect[3]
+    )
+
+
+def test_the_edge_is_grabbable_from_either_side_of_it(starter_app):
+    """Nothing is drawn there: hovering the sidebar's own border is what makes
+    it live. The band straddles the edge, biased outward so a press meant for
+    the edge does not land on a control near the panel's border."""
+    edge = starter_app.sidebar_pixels
+    middle = starter_app.wnd.buffer_size[1] * 0.5
+
+    assert starter_app.over_sidebar_edge((edge, middle))
+    assert starter_app.over_sidebar_edge((edge - 3, middle)), "just inside"
+    assert starter_app.over_sidebar_edge((edge + 3, middle)), "just outside"
+    assert not starter_app.over_sidebar_edge((edge - 40, middle)), "over the panel"
+    assert not starter_app.over_sidebar_edge((edge + 40, middle)), "over the model"
+
+    # And it does not reach far into the view: a resize arrow while the cursor
+    # is plainly over the model reads as the app losing track of the panel.
+    from ui.panel import SIDEBAR_GRAB_OUTSIDE
+
+    assert SIDEBAR_GRAB_OUTSIDE * starter_app.ui_pixel_scale <= 16
+
+    # Not above the navigation bar or below the status bar either.
+    assert not starter_app.over_sidebar_edge((edge, 2))
+    assert not starter_app.over_sidebar_edge((edge, starter_app.wnd.buffer_size[1] - 2))
+
+
+def test_hovering_the_edge_asks_for_the_resize_cursor(starter_app):
+    """ImGui only records a cursor request and expects the platform layer to
+    act on it -- moderngl-window's integration has none, so the app applies it
+    itself. Without that, the edge changes nothing on screen and reads as dead.
+    """
+    from imgui_bundle import imgui
+
+    asked: list = []
+    starter_app.gui.sync_mouse_cursor = lambda override=None: asked.append(override)
+    middle = int(starter_app.wnd.buffer_size[1] * 0.5)
+
+    starter_app.on_mouse_position_event(int(starter_app.sidebar_pixels), middle, 0, 0)
+    starter_app.on_render(0.0, 1 / 60.0)
+    assert asked[-1] == imgui.MouseCursor_.resize_ew
+
+    starter_app.on_mouse_position_event(int(starter_app.sidebar_pixels * 0.5), middle, 0, 0)
+    starter_app.on_render(0.0, 1 / 60.0)
+    assert asked[-1] is None, "elsewhere, whatever ImGui asked for stands"
+
+
+def test_the_edge_is_claimed_before_imgui_sees_the_press(starter_app):
+    """Half the band lies over the panel's last pixels, and ImGui captures
+    anything inside its own window -- so asking it first leaves the edge
+    working only from the outside, which is not where a hand aims. Nothing is
+    forwarded either, or a control near the border reacts to the grab.
+    """
+    middle = int(starter_app.wnd.buffer_size[1] * 0.5)
+    inside = int(starter_app.sidebar_pixels - 4)
+
+    seen: list[str] = []
+    starter_app.gui.mouse_press_event = lambda *a: seen.append("press")
+    starter_app.gui.mouse_drag_event = lambda *a: seen.append("drag")
+    starter_app.gui.mouse_release_event = lambda *a: seen.append("release")
+
+    before = starter_app.sidebar_width
+    starter_app.on_mouse_position_event(inside, middle, 0, 0)
+    starter_app.on_mouse_press_event(inside, middle, starter_app.wnd.mouse.left)
+    assert starter_app._drag_owner == "sidebar", "not handed to the panel"
+
+    starter_app.on_mouse_drag_event(inside + 20, middle, 20, 0)
+    starter_app.on_mouse_release_event(inside + 20, middle, starter_app.wnd.mouse.left)
+
+    assert starter_app.sidebar_width > before
+    assert seen == [], "ImGui was told nothing about the grab"
+
+
+def test_a_press_well_inside_the_panel_still_belongs_to_the_panel(starter_app):
+    middle = int(starter_app.wnd.buffer_size[1] * 0.5)
+    inside = int(starter_app.sidebar_pixels * 0.5)
+    before = starter_app.sidebar_width
+
+    starter_app.on_mouse_position_event(inside, middle, 0, 0)
+    starter_app.on_render(0.0, 1 / 60.0)
+    starter_app.on_mouse_press_event(inside, middle, starter_app.wnd.mouse.left)
+    starter_app.on_mouse_drag_event(inside + 30, middle, 30, 0)
+
+    assert starter_app._drag_owner != "sidebar"
+    assert starter_app.sidebar_width == pytest.approx(before)
+
+
+def test_dragging_the_edge_resizes_and_nothing_else(starter_app):
+    """The press belongs to the edge: it must not also orbit the camera or
+    land on whatever the panel has near its border."""
+    middle = int(starter_app.wnd.buffer_size[1] * 0.5)
+    before_width = starter_app.sidebar_width
+    before_eye = tuple(starter_app.camera.eye.to_list())
+
+    starter_app.on_mouse_position_event(int(starter_app.sidebar_pixels), middle, 0, 0)
+    starter_app.on_mouse_press_event(int(starter_app.sidebar_pixels), middle,
+                                     starter_app.wnd.mouse.left)
+    assert starter_app._drag_owner == "sidebar"
+
+    for _ in range(4):
+        starter_app.on_mouse_drag_event(
+            int(starter_app.sidebar_pixels + 12), middle, 12, 3
+        )
+    starter_app.on_mouse_release_event(int(starter_app.sidebar_pixels), middle,
+                                       starter_app.wnd.mouse.left)
+
+    assert starter_app.sidebar_width > before_width
+    assert tuple(starter_app.camera.eye.to_list()) == pytest.approx(before_eye)
+    assert starter_app._drag_owner is None
+
+
+def test_the_sidebar_stays_between_useful_widths(starter_app):
+    from render.viewport import SIDEBAR_MAX, SIDEBAR_MIN
+
+    starter_app.set_sidebar_width(10.0)
+    assert starter_app.sidebar_width == pytest.approx(SIDEBAR_MIN)
+
+    starter_app.set_sidebar_width(5000.0)
+    assert starter_app.sidebar_width == pytest.approx(SIDEBAR_MAX)
+    # And however wide it is asked to be, it never takes more than half the
+    # window -- the model is the thing being worked on.
+    assert starter_app.sidebar_pixels <= starter_app.wnd.buffer_size[0] * 0.5
+
+
+def test_the_sidebar_width_is_measured_in_unscaled_pixels(starter_app):
+    """So it means the same thing at any UI scale, like every other panel
+    dimension in the app."""
+    starter_app.set_sidebar_width(400.0)
+    narrow = starter_app.sidebar_pixels
+
+    starter_app.set_ui_scale(starter_app.ui_scale * 1.5)
+    assert starter_app.sidebar_width == pytest.approx(400.0), "unchanged in itself"
+    assert starter_app.sidebar_pixels > narrow, "but bigger on screen"
+
+
+def test_the_texture_panes_start_even_and_stay_usable(starter_app):
+    """Half each, and neither draggable shut -- a pane too short to show a row
+    has been closed by accident, and the splitter is the only way back."""
+    from render.viewport import MIN_SPLIT
+
+    assert starter_app.texture_split == pytest.approx(0.5)
+
+    starter_app.set_texture_split(0.9)
+    assert starter_app.texture_split == pytest.approx(1.0 - MIN_SPLIT)
+    starter_app.set_texture_split(-2.0)
+    assert starter_app.texture_split == pytest.approx(MIN_SPLIT)
+
+    starter_app.set_texture_split(0.7)
+    assert starter_app.texture_split == pytest.approx(0.7)
+
+
+def test_the_layout_is_remembered_between_runs(starter_app, isolated_settings):
+    """Preferences like the UI scale, not something to set up again every
+    session."""
+    import json
+
+    starter_app.set_texture_split(0.32)
+    starter_app.set_sidebar_width(512.0)
+    starter_app.save_prefs()
+
+    stored = json.loads((isolated_settings / "prefs.json").read_text())
+    assert stored["texture_split"] == pytest.approx(0.32)
+    assert stored["sidebar_width"] == pytest.approx(512.0)
+
+    from render.viewport import _load_prefs
+
+    assert _load_prefs()["texture_split"] == pytest.approx(0.32)
+
+
+def test_a_rename_cannot_get_stuck(starter_app):
+    """The field takes focus once, when it opens. Asking every frame is what
+    makes a rename impossible to leave: if something else held focus at the
+    time, the field would never activate, never report being deactivated, and
+    grab at the keyboard for the rest of the session."""
+    from imgui_bundle import imgui
+
+    from ui import panel
+
+    def draw_texture_tab() -> None:
+        imgui.new_frame()
+        imgui.begin("Parameters")
+        panel._draw_texture_tab(starter_app)
+        imgui.end()
+        imgui.end_frame()
+
+    starter_app.begin_rename(())
+    assert starter_app.renaming_opened, "focus is owed"
+
+    draw_texture_tab()
+    assert not starter_app.renaming_opened, "and taken exactly once"
+    assert starter_app.renaming_path == (), "still renaming, now holding focus"
+
+    starter_app.end_rename()
+    assert starter_app.renaming_path is None
+
+
+def test_an_explicit_mesh_wins_over_the_starter_cube(tmp_path):
+    import moderngl_window as mglw
+    import trimesh
+    from imgui_bundle import imgui
+
+    from render.viewport import MeshMapApp
+
+    trimesh.creation.icosphere(subdivisions=1).export(tmp_path / "ball.obj")
+    MeshMapApp.initial_mesh = str(tmp_path / "ball.obj")
+    try:
+        instance = mglw.create_window_config_instance(MeshMapApp, args=["-wnd", "headless"])
+    except Exception as exc:  # pragma: no cover - depends on the host
+        pytest.skip(f"no headless window available: {exc}")
+
+    try:
+        assert instance.mesh_info.path.endswith("ball.obj")
+        assert instance.mesh_info.faces > 12
+    finally:
+        instance.controller.release()
+        imgui.destroy_context()
+        MeshMapApp.initial_mesh = None
+
+
+def test_the_starter_cube_bakes_into_its_own_uvs(starter_app):
+    """The whole point of unwrapping it: no xatlas atlas, so anything exported
+    fits the cube itself."""
+    import time
+
+    starter_app.request_bake()
+    deadline = time.monotonic() + 30.0
+    while starter_app.controller.running and time.monotonic() < deadline:
+        starter_app.controller.pump()
+        time.sleep(0.002)
+
+    assert starter_app.controller.error is None
+    assert starter_app.controller.unwrap_result.source == "source"
+    assert starter_app.controller.curvature_map is not None
+
+
 def test_the_shaded_and_normals_modes_are_the_whole_list():
     from render.viewport import PREVIEW_MODES
 

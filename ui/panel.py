@@ -20,6 +20,7 @@ from imgui_bundle import portable_file_dialogs as pfd
 
 from core.layers import (
     MAX_DEPTH,
+    MAX_EMISSION,
     SLOT_KINDS,
     ColorSlot,
     MaskLayer,
@@ -45,6 +46,12 @@ DECAL_THUMBNAIL = 92
 STATUS_BAR_HEIGHT = 34
 #: The bar across the top of the window: what to look at, and how to draw it.
 NAVBAR_HEIGHT = 46
+#: How far either side of the sidebar's edge counts as grabbing it, in unscaled
+#: pixels. Narrow and even: reaching further into the view means the cursor
+#: turns into a resize arrow while it is plainly over the model, which reads as
+#: the app being confused about where the panel ends.
+SIDEBAR_GRAB_INSIDE = 6
+SIDEBAR_GRAB_OUTSIDE = 6
 #: Textures beyond which the picker grows a search box. Below it, a list this
 #: short is quicker to read than to filter.
 _SEARCHABLE_FROM = 5
@@ -67,6 +74,19 @@ def _tooltip(text: str) -> None:
     imgui.set_item_tooltip(text)
 
 
+def _muted_wrapped(text: str) -> None:
+    """Muted text that folds at the panel's edge rather than running past it.
+
+    For lines whose length is not known when they are written -- a list of file
+    names, say, which grows with what there is to export.
+    """
+    imgui.push_style_color(imgui.Col_.text, MUTED_COLOR)
+    imgui.push_text_wrap_pos(0.0)
+    imgui.text_wrapped(text)
+    imgui.pop_text_wrap_pos()
+    imgui.pop_style_color()
+
+
 def draw_panel(app: "MeshMapApp") -> None:
     _draw_navbar(app)
     _draw_parameters(app)
@@ -85,6 +105,49 @@ _CHROME_FLAGS = (
 )
 
 
+def exportable_maps(app: "MeshMapApp") -> list[str]:
+    """What an export would write right now. See ``MeshMapApp.exportable``."""
+    return app.exportable()
+
+
+def _draw_file_menu(app: "MeshMapApp") -> None:
+    """Opening a mesh and writing the maps out: the two ends of the app.
+
+    Both are here rather than in the tabs because neither belongs to one. The
+    mesh is what every tab is about, and an export takes whatever each of them
+    has produced -- putting either inside one tab makes it look like that tab's
+    business.
+    """
+    if imgui.button("File"):
+        imgui.open_popup("##file")
+    # Hung under the button, the way a menu is. Left to itself the popup opens
+    # at the cursor, which up here means straight over the bar it came from.
+    corner = imgui.get_item_rect_min()
+    bottom = imgui.get_item_rect_max().y
+    imgui.set_next_window_pos(imgui.ImVec2(corner.x, bottom))
+
+    if imgui.begin_popup("##file"):
+        if imgui.menu_item_simple("Import mesh..."):
+            app.file_dialog = pfd.open_file("Import mesh", str(Path.home()), MESH_FILTERS)
+
+        imgui.separator()
+
+        maps = exportable_maps(app)
+        if imgui.menu_item_simple("Export textures...", "E", False, bool(maps)):
+            app.request_export()
+        if maps:
+            _tooltip(
+                "Writes " + ", ".join(f"{name}.png" for name in maps) + ".\n\n"
+                "All of them in one go: there is nothing to answer here because\n"
+                "the answering is done in Settings, where the maps to write, the\n"
+                "depth and the default folder live. They all address your\n"
+                "original mesh directly, since they all use its own UV map."
+            )
+        else:
+            _tooltip("Nothing to write yet - bake a mesh, or import a decal.")
+        imgui.end_popup()
+
+
 def _draw_navbar(app: "MeshMapApp") -> None:
     """The bar across the top: what to look at, and how it is drawn.
 
@@ -101,6 +164,9 @@ def _draw_navbar(app: "MeshMapApp") -> None:
     imgui.set_next_window_pos(imgui.ImVec2(0, 0))
     imgui.set_next_window_size(imgui.ImVec2(width, height))
     imgui.begin("##navbar", None, _CHROME_FLAGS | imgui.WindowFlags_.no_decoration)
+
+    _draw_file_menu(app)
+    imgui.same_line()
 
     imgui.set_next_item_width(220 * scale)
     _, app.preview_index = imgui.combo(
@@ -141,12 +207,11 @@ def _draw_parameters(app: "MeshMapApp") -> None:
     """
     width, height = app.wnd.buffer_size
     scale = app.ui_pixel_scale
-    sidebar = min(PANEL_WIDTH * scale, width * 0.5)
     top = NAVBAR_HEIGHT * scale
 
     imgui.set_next_window_pos(imgui.ImVec2(0, top))
     imgui.set_next_window_size(
-        imgui.ImVec2(sidebar, height - top - STATUS_BAR_HEIGHT * scale)
+        imgui.ImVec2(app.sidebar_pixels, height - top - STATUS_BAR_HEIGHT * scale)
     )
     imgui.begin("Parameters", None, _CHROME_FLAGS | imgui.WindowFlags_.no_title_bar)
     if imgui.begin_tab_bar("panel_tabs"):
@@ -180,9 +245,6 @@ def _draw_bake_tab(app: "MeshMapApp") -> None:
     bake = controller.bake_params
 
     # -- mesh ------------------------------------------------------------
-    if imgui.button("Open mesh..."):
-        app.file_dialog = pfd.open_file("Open mesh", str(Path.home()), MESH_FILTERS)
-    imgui.same_line()
     changed, app.source_z_up = imgui.checkbox("Source is Z-up", app.source_z_up)
     _tooltip(
         "Tick only if the file itself stores Z as up, in which case it is used\n"
@@ -323,91 +385,6 @@ def _draw_bake_tab(app: "MeshMapApp") -> None:
 
     _draw_bake_controls(app)
 
-    # -- EdgeWear001 node group ------------------------------------------
-    imgui.separator_text("Edge wear  (live)")
-    wear = app.wear_params
-    dirty = False
-
-    changed, wear.value = imgui.slider_float("Value", wear.value, 0.0, 5.0)
-    dirty |= changed
-    _tooltip(
-        "Group Input.Value. Feeds a x10 Math node into the noise Scale, so the\n"
-        "noise runs at value * 10. Higher = finer, busier break-up."
-    )
-
-    changed, wear.wear_amount = imgui.slider_float("Wear amount", wear.wear_amount, 0.0, 2.0)
-    dirty |= changed
-    _tooltip(
-        "The \"Wear Amount\" multiply. How hard the noise erodes the curvature\n"
-        "before the subtract -- raise it and the wear gets patchier."
-    )
-
-    changed, wear.contrast = imgui.slider_float("Contrast", wear.contrast, 0.0, 10.0)
-    dirty |= changed
-    _tooltip(
-        "The \"Contrast\" multiply, clamped to 0..1 after.\n"
-        "mask = clamp((curvature - noise * wear_amount) * contrast, 0, 1)"
-    )
-
-    if imgui.collapsing_header("Wear Noise (TEX_NOISE)"):
-        changed, wear.detail = imgui.slider_float("Detail", wear.detail, 0.0, 8.0)
-        dirty |= changed
-        _tooltip("fBM octaves.")
-        changed, wear.roughness = imgui.slider_float("Roughness", wear.roughness, 0.0, 1.0)
-        dirty |= changed
-        _tooltip("Amplitude falloff per octave.")
-        changed, wear.lacunarity = imgui.slider_float("Lacunarity", wear.lacunarity, 0.0, 8.0)
-        dirty |= changed
-        _tooltip("Frequency step per octave.")
-        changed, wear.distortion = imgui.slider_float("Distortion", wear.distortion, 0.0, 2.0)
-        dirty |= changed
-        _tooltip("Warps the sample position by the noise itself before evaluating.")
-
-    if imgui.button("Reset to EdgeWear001"):
-        app.wear_params = type(wear)()
-        dirty = True
-    _tooltip("Back to the values shipped in EdgeWear001.arm.")
-
-    if dirty:
-        app.mark_output_dirty()
-
-    # -- export ----------------------------------------------------------
-    imgui.separator_text("Export")
-    _, app.export_dir = imgui.input_text("Folder", app.export_dir)
-    imgui.same_line()
-    if imgui.button("..."):
-        app.folder_dialog = pfd.select_folder("Export folder", app.export_dir)
-
-    bit_index = 0 if app.export_bits == 8 else 1
-    changed, bit_index = imgui.combo("Depth", bit_index, ["8-bit PNG", "16-bit PNG"])
-    if changed:
-        app.export_bits = 8 if bit_index == 0 else 16
-    _tooltip("Reach for 16-bit if you see banding in the gradients.")
-
-    baked = controller.curvature_map is not None
-    maps = [name for name, present in (
-        ("color", baked),                          # the mask tree reads the bake
-        ("normal", app.decal_params.active()),
-        ("edge_wear", baked),
-        ("curvature", baked),
-    ) if present]
-
-    imgui.begin_disabled(not maps)
-    if imgui.button("Export textures", imgui.ImVec2(-1, 0)):
-        app.export()
-    _tooltip(
-        "One button, every map there is: color.png from the mask tree,\n"
-        "normal.png for any decal, and edge_wear.png and curvature.png from the\n"
-        "bake. All four address your original mesh directly, because all four\n"
-        "use its own UV map."
-    )
-    imgui.end_disabled()
-    imgui.text_colored(
-        MUTED_COLOR,
-        ("Writes " + ", ".join(f"{name}.png" for name in maps)) if maps
-        else "Nothing to write yet - bake a mesh, or import a decal.",
-    )
-
     imgui.pop_item_width()
 
 
@@ -438,19 +415,81 @@ def _draw_texture_tab(app: "MeshMapApp") -> None:
         return
 
     _draw_texture_picker(app)
+    if app.texture is None:
+        # Remove was just pressed. Everything below describes the texture that
+        # has this moment stopped existing, and an ImGui frame is drawn top to
+        # bottom -- so stop here and let the next frame draw the empty state.
+        return
+
+    masks = mask_count(app.texture)
     imgui.text_colored(
-        MUTED_COLOR, f"{mask_count(app.texture)} masks, {depth(app.texture)} deep"
+        MUTED_COLOR,
+        f"{masks} mask{'' if masks == 1 else 's'}, {depth(app.texture)} deep"
+        if masks else "a flat colour",
     )
 
-    # The selection's controls take the room they need -- every one of them is
-    # visible, none folded away -- and the tree fills whatever is left below,
-    # scrolling on its own so a deep tree cannot push the controls off the top.
+    _draw_texture_warnings(app)
+
+    # Two panes, each with its own scrollbar and its own header, splitting the
+    # room evenly until the divider between them is dragged. Fixed shares
+    # rather than "whatever the contents need": the inspector's height changes
+    # with what is selected, and a tree that jumped about as it did would be a
+    # tree you could not keep your place in.
+    scale = app.ui_pixel_scale
+    splitter = 8.0 * scale
+    header = imgui.get_frame_height_with_spacing()
+    usable = max(imgui.get_content_region_avail().y - 2 * header - splitter,
+                 4 * header)
+    inspector_height = usable * app.texture_split
+
+    imgui.separator_text("Inspector")
+    imgui.begin_child("texture_inspector", imgui.ImVec2(0, inspector_height))
     _draw_slot_params(app)
+    imgui.end_child()
+
+    _draw_splitter(app, splitter, usable)
 
     imgui.separator_text("Texture tree")
     imgui.begin_child("texture_tree", imgui.ImVec2(0, 0))
     _draw_texture_tree(app)
     imgui.end_child()
+
+
+def _draw_splitter(
+    app: "MeshMapApp", height: float, usable: float,
+    name: str = "texture", setter=None,
+) -> None:
+    """The draggable divider between a tab's two panes.
+
+    ImGui has no splitter of its own; the idiom is an invisible button that
+    reports being dragged, which is all a splitter is. The line is drawn by
+    hand so there is something to aim at, and the cursor changes on hover so it
+    is discoverable without a tooltip nobody reads mid-drag.
+    """
+    setter = setter or app.set_texture_split
+    share = app.texture_split if name == "texture" else app.decal_split
+    imgui.invisible_button(f"##{name}_split", imgui.ImVec2(-1, height))
+
+    hovered = imgui.is_item_hovered()
+    active = imgui.is_item_active()
+    if hovered or active:
+        imgui.set_mouse_cursor(imgui.MouseCursor_.resize_ns)
+    if active:
+        setter(share + imgui.get_io().mouse_delta.y / max(usable, 1.0))
+    if imgui.is_item_deactivated():
+        app.save_prefs()  # on release, rather than on every pixel of the drag
+
+    top_left, bottom_right = imgui.get_item_rect_min(), imgui.get_item_rect_max()
+    middle = (top_left.y + bottom_right.y) * 0.5
+    colour = imgui.get_color_u32(
+        imgui.Col_.separator_active if active
+        else imgui.Col_.separator_hovered if hovered
+        else imgui.Col_.separator
+    )
+    imgui.get_window_draw_list().add_line(
+        imgui.ImVec2(top_left.x, middle), imgui.ImVec2(bottom_right.x, middle),
+        colour, max(1.0, height * 0.25),
+    )
 
 
 def filter_textures(textures, needle: str) -> list[tuple[int, str]]:
@@ -466,6 +505,39 @@ def filter_textures(textures, needle: str) -> list[tuple[int, str]]:
         for index, texture in enumerate(textures)
         if not wanted or wanted in describe(texture).lower()
     ]
+
+
+def _draw_texture_warnings(app: "MeshMapApp") -> None:
+    """Why the model might not look like the texture says it should.
+
+    Above the tree rather than below it: a texture that renders black because
+    its mask found nothing is exactly when the panel needs to be read, and the
+    tree scrolls.
+    """
+    if depth(app.texture) >= MAX_DEPTH:
+        imgui.text_colored(WARN_COLOR, f"! Nesting stops at {MAX_DEPTH} levels.")
+
+    if app.controller.curvature_map is None:
+        imgui.text_colored(
+            WARN_COLOR, "! Bake first - the masks read the curvature and positions."
+        )
+    elif app.texture_is_flat and mask_count(app.texture) > 0:
+        # Every texel landing on the same side of the mask paints the whole
+        # model in one colour, which reads as broken rather than as empty.
+        wears = any(
+            isinstance(slot, MaskLayer) and slot.kind == "edge_wear"
+            for _, slot in walk(app.texture)
+        )
+        remedy = (
+            "  Lower its Threshold, or turn on Bevel:\n"
+            "  wear needs a rounded edge to grip." if wears else
+            "  Lower its Threshold, or raise Contrast."
+        )
+        imgui.text_colored(
+            WARN_COLOR,
+            "! One flat colour: every texel lands on\n"
+            "  the same side of its mask.\n" + remedy,
+        )
 
 
 def _draw_texture_picker(app: "MeshMapApp") -> None:
@@ -550,24 +622,64 @@ def _draw_slot_params(app: "MeshMapApp") -> None:
 
     imgui.separator()
     if isinstance(slot, ColorSlot):
-        # A picker is as tall as it is wide, so it is sized deliberately rather
-        # than given the panel's width -- the tree underneath needs the room
-        # more than the wheel does.
-        imgui.set_next_item_width(210 * scale)
-        changed, color = imgui.color_picker3(
+        # The swatch is the button: clicking it opens the picker in a popup,
+        # and clicking away or pressing Escape closes it again. A picker is as
+        # tall as it is wide, so leaving one open permanently would spend half
+        # the sidebar on a control that is used in bursts.
+        changed, color = imgui.color_edit3(
             "##color", list(slot.color),
-            imgui.ColorEditFlags_.no_side_preview
-            | imgui.ColorEditFlags_.no_small_preview
-            | imgui.ColorEditFlags_.display_rgb
-            | imgui.ColorEditFlags_.display_hex,
+            imgui.ColorEditFlags_.no_inputs | imgui.ColorEditFlags_.no_label,
         )
         if changed:
             slot.color = (float(color[0]), float(color[1]), float(color[2]))
-            app.mark_texture_dirty()
+        imgui.same_line()
+        imgui.text(f"Colour  {slot.auto_label}")
+        _tooltip(
+            "Click the swatch to open the picker.\n"
+            "Click away or press Escape to close it again."
+        )
+
+        _draw_surface_params(app, slot)
     elif _draw_mask_params(app, slot):
         app.mark_texture_dirty()
 
     imgui.pop_item_width()
+
+
+def _draw_surface_params(app: "MeshMapApp", slot) -> None:
+    """What the surface is made of, beyond its colour.
+
+    These ride through the tree exactly as the colour does -- the mask blends
+    them the same way -- and each comes out as its own exported map, so what is
+    dialled in here is what the renderer at the other end receives.
+    """
+    imgui.separator_text("Surface")
+
+    _, slot.metallic = imgui.slider_float("Metallic", slot.metallic, 0.0, 1.0)
+    _tooltip(
+        "0 is a dielectric -- paint, plastic, rust. 1 is bare metal.\n"
+        "In between is for a surface partly covered by something else, not for\n"
+        "a material that is half a metal."
+    )
+    _, slot.roughness = imgui.slider_float("Roughness", slot.roughness, 0.0, 1.0)
+    _tooltip("How wide the highlight spreads: 0 is a mirror, 1 is chalk.")
+    _, slot.alpha = imgui.slider_float("Alpha", slot.alpha, 0.0, 1.0)
+    _tooltip(
+        "Opacity. Below 1 the surface lets what is behind it through.\n"
+        "Shading only -- the export is a PBR set of five, and this is not\n"
+        "one of them."
+    )
+    _, slot.emission = imgui.slider_float(
+        "Emission", slot.emission, 0.0, MAX_EMISSION, "%.2f",
+        imgui.SliderFlags_.logarithmic,
+    )
+    _tooltip(
+        "Light the surface gives off, in multiples of its own colour. Past 1\n"
+        "the surface is brighter than white can show, and the extra turns into\n"
+        "the glow spilling past its edge -- which is what carries the difference\n"
+        "between a lit surface and a light. Shading only, like Alpha: the\n"
+        "export is a PBR set of five, and this is not one of them."
+    )
 
 
 def _draw_mask_params(app: "MeshMapApp", node) -> bool:
@@ -595,7 +707,7 @@ def _draw_mask_params(app: "MeshMapApp", node) -> bool:
         "to one side or the other. Raise it to blend them across a band."
     )
 
-    imgui.separator_text("Mask")
+    imgui.separator_text(SLOT_KINDS[node.kind])
     if node.kind == "noise":
         noise = node.noise
         changed, noise.scale = imgui.slider_float(
@@ -625,16 +737,30 @@ def _draw_mask_params(app: "MeshMapApp", node) -> bool:
         _tooltip("Warps the sample position by the noise itself before evaluating.")
         return dirty
 
+    _muted_wrapped(
+        "The EdgeWear001 node group, on this layer. What it produces reaches "
+        "the export the way every layer does: through color.png."
+    )
+
     wear = node.edge_wear
     changed, wear.value = imgui.slider_float("Value", wear.value, 0.0, 5.0)
     dirty |= changed
-    _tooltip("Noise scale for the break-up: the group's Value x10.")
+    _tooltip(
+        "Group Input.Value. Feeds a x10 Math node into the noise Scale, so the\n"
+        "noise runs at value * 10. Higher = finer, busier break-up."
+    )
     changed, wear.wear_amount = imgui.slider_float("Wear amount", wear.wear_amount, 0.0, 2.0)
     dirty |= changed
-    _tooltip("How hard the noise erodes the curvature before the subtract.")
+    _tooltip(
+        "The \"Wear Amount\" multiply. How hard the noise erodes the curvature\n"
+        "before the subtract -- raise it and the wear gets patchier."
+    )
     changed, wear.contrast = imgui.slider_float("Contrast", wear.contrast, 0.0, 10.0)
     dirty |= changed
-    _tooltip("mask = clamp((curvature - noise * wear_amount) * contrast, 0, 1)")
+    _tooltip(
+        "The \"Contrast\" multiply, clamped to 0..1 after.\n"
+        "mask = clamp((curvature - noise * wear_amount) * contrast, 0, 1)"
+    )
 
     imgui.separator_text("Wear noise")
     changed, wear.detail = imgui.slider_float("Detail", wear.detail, 0.0, 8.0)
@@ -666,20 +792,21 @@ def _draw_texture_tree(app: "MeshMapApp") -> None:
         if indent:
             imgui.indent(indent)
 
-        if isinstance(slot, ColorSlot):
-            imgui.color_button("##swatch", imgui.ImVec4(*slot.color, 1.0))
-        else:
-            thumbnail = app.compositor.thumbnail(path)
-            size = imgui.get_frame_height()
-            if thumbnail is not None:
-                imgui.image(imgui.ImTextureRef(thumbnail.glo), imgui.ImVec2(size, size))
-            else:
-                imgui.dummy(imgui.ImVec2(size, size))
-        imgui.same_line()
-
         if app.renaming_path == path:
+            # No swatch, no thumbnail: while a row is being renamed it is the
+            # name and nothing else, so what is typed is what is read back.
             _draw_rename_field(app, slot)
         else:
+            if isinstance(slot, ColorSlot):
+                imgui.color_button("##swatch", imgui.ImVec4(*slot.color, 1.0))
+            else:
+                thumbnail = app.compositor.thumbnail(path)
+                size = imgui.get_frame_height()
+                if thumbnail is not None:
+                    imgui.image(imgui.ImTextureRef(thumbnail.glo), imgui.ImVec2(size, size))
+                else:
+                    imgui.dummy(imgui.ImVec2(size, size))
+            imgui.same_line()
             _draw_tree_row(app, path, slot)
 
         if indent:
@@ -688,19 +815,23 @@ def _draw_texture_tree(app: "MeshMapApp") -> None:
 
 
 def _draw_tree_row(app: "MeshMapApp", path, slot) -> None:
-    """One row: which side it is, what it is called, and what kind it is."""
+    """One row: which side of its mask it is, and what it is called.
+
+    What it is called and nothing else -- a named slot shows its name, not the
+    hex code or the kind it happens to be. That is what the Type dropdown above
+    is for, and a row that argues with the name given to it reads as the rename
+    not having taken.
+    """
     side = f"{path[-1][0].upper()}  " if path else ""
-    named = slot.name and slot.name != slot.auto_label
-    kind = f"   ({slot.auto_label})" if named else ""
 
     clicked, _ = imgui.selectable(
-        f"{side}{describe(slot)}{kind}##row", path == app.texture_path
+        f"{side}{describe(slot)}##row", path == app.texture_path,
+        imgui.SelectableFlags_.allow_double_click,
     )
     if clicked:
         app.select_slot(path)
-    if imgui.is_item_hovered() and imgui.is_mouse_double_clicked(0):
-        app.select_slot(path)
-        app.renaming_path = path
+        if imgui.is_mouse_double_clicked(0):
+            app.begin_rename(path)
     _tooltip("Double-click to rename.")
 
 
@@ -710,9 +841,17 @@ def _draw_rename_field(app: "MeshMapApp", slot) -> None:
     Seeded with the name rather than the automatic label, so a slot that has
     never been named starts empty and typing replaces nothing. Clearing it puts
     the automatic label back.
+
+    Focus is taken once, on the frame the field appears. Asking for it every
+    frame is what makes a rename impossible to leave: if anything else held
+    focus when the field opened it would never activate, never report being
+    deactivated, and sit there grabbing at the keyboard for the rest of the
+    session. Taking it once and closing the moment it is lost cannot stick.
     """
-    if not imgui.is_any_item_active():
+    just_opened = app.renaming_opened
+    if just_opened:
         imgui.set_keyboard_focus_here()
+        app.renaming_opened = False
 
     imgui.set_next_item_width(-1)
     entered, text = imgui.input_text(
@@ -721,102 +860,214 @@ def _draw_rename_field(app: "MeshMapApp", slot) -> None:
     )
     if entered or imgui.is_item_deactivated_after_edit():
         slot.name = text.strip()
-        app.renaming_path = None
-    elif imgui.is_item_deactivated():
-        app.renaming_path = None  # clicked away without changing anything
+        app.end_rename()
+    elif not just_opened and not imgui.is_item_active():
+        app.end_rename()  # focus went somewhere else
 
-    if depth(app.texture) >= MAX_DEPTH:
-        imgui.text_colored(WARN_COLOR, f"! Nesting stops at {MAX_DEPTH} levels.")
-    if app.controller.curvature_map is None:
-        imgui.text_colored(
-            WARN_COLOR, "! Bake first - the masks read the curvature and positions."
-        )
+
+def _draw_tree_row(app: "MeshMapApp", path, slot) -> None:
+    """One row: which side of its mask it is, and what it is called.
+
+    What it is called and nothing else -- a named slot shows its name, not the
+    hex code or the kind it happens to be. That is what the Type dropdown above
+    is for, and a row that argues with the name given to it reads as the rename
+    not having taken.
+    """
+    side = f"{path[-1][0].upper()}  " if path else ""
+
+    clicked, _ = imgui.selectable(
+        f"{side}{describe(slot)}##row", path == app.texture_path,
+        imgui.SelectableFlags_.allow_double_click,
+    )
+    if clicked:
+        app.select_slot(path)
+        if imgui.is_mouse_double_clicked(0):
+            app.begin_rename(path)
+    _tooltip("Double-click to rename.")
+
+
+def _draw_rename_field(app: "MeshMapApp", slot) -> None:
+    """The row being renamed, as a text field.
+
+    Seeded with the name rather than the automatic label, so a slot that has
+    never been named starts empty and typing replaces nothing. Clearing it puts
+    the automatic label back.
+
+    Focus is taken once, on the frame the field appears. Asking for it every
+    frame is what makes a rename impossible to leave: if anything else held
+    focus when the field opened it would never activate, never report being
+    deactivated, and sit there grabbing at the keyboard for the rest of the
+    session. Taking it once and closing the moment it is lost cannot stick.
+    """
+    just_opened = app.renaming_opened
+    if just_opened:
+        imgui.set_keyboard_focus_here()
+        app.renaming_opened = False
+
+    imgui.set_next_item_width(-1)
+    entered, text = imgui.input_text(
+        "##rename", slot.name,
+        imgui.InputTextFlags_.enter_returns_true | imgui.InputTextFlags_.auto_select_all,
+    )
+    if entered or imgui.is_item_deactivated_after_edit():
+        slot.name = text.strip()
+        app.end_rename()
+    elif not just_opened and not imgui.is_item_active():
+        app.end_rename()  # focus went somewhere else
 
 
 def _draw_decal_tab(app: "MeshMapApp") -> None:
-    """Place an imported normal map into the mesh's UV layout.
+    """The decals on the mesh, and the shelf of them to drag from.
 
-    Every control here is live: the composite is one full-screen pass over the
-    atlas, so the mesh in the viewport re-lights as the handle moves.
+    Two panes, like the Texture tab and for the same reason: the top edits
+    whichever decal is selected, at a fixed size, and the bottom is the library
+    from metadata.json -- pictures to drag onto the model. Selecting is done by
+    clicking the decal itself in the viewport, which is where you are looking.
     """
-    from render.viewport import PREVIEW_MODES  # local import avoids a cycle
-
     scale = app.ui_pixel_scale
-    imgui.push_item_width(-170 * scale)
 
-    decal = app.decal_params
-    image = app.decal_image
-    dirty = False
+    splitter = 8.0 * scale
+    header = imgui.get_frame_height_with_spacing()
+    usable = max(imgui.get_content_region_avail().y - 2 * header - splitter,
+                 4 * header)
+    inspector_height = usable * app.decal_split
 
-    if imgui.button("Import normal map..."):
-        app.decal_dialog = pfd.open_file("Import decal", str(Path.home()), DECAL_FILTERS)
-    _tooltip(
-        "A tangent-space normal map -- a scifi vent, a hatch, a panel seam.\n"
-        "A grayscale image is read as a height map and converted, since that is\n"
-        "the only reading of it that describes a surface."
-    )
-    if image is not None:
-        imgui.same_line()
-        if imgui.button("Clear"):
-            app.clear_decal()
-            image = None
+    imgui.separator_text("Decal")
+    imgui.begin_child("decal_inspector", imgui.ImVec2(0, inspector_height))
+    _draw_decal_inspector(app)
+    imgui.end_child()
 
-    if image is None:
-        imgui.text_colored(
-            MUTED_COLOR,
-            "No decal loaded.\n"
-            "The decal is stamped into the mesh's UV layout and exported as\n"
-            "normal.png, alongside the bake's own maps.",
+    _draw_splitter(app, splitter, usable, "decal", app.set_decal_split)
+
+    imgui.separator_text(f"Library  ({len(app.decal_library)})")
+    imgui.begin_child("decal_library", imgui.ImVec2(0, 0))
+    _draw_decal_library(app)
+    imgui.end_child()
+
+
+def _draw_decal_library(app: "MeshMapApp") -> None:
+    """The shelf: every image in the folder metadata.json points at.
+
+    Dragging one onto the model places it there. Dragging rather than clicking
+    because a decal has to land *somewhere*, and the somewhere is on the mesh --
+    a click would have to invent a position and then ask you to move it.
+    """
+    scale = app.ui_pixel_scale
+    if not app.decal_library:
+        _muted_wrapped(
+            'No decal library. Point "decals" in metadata.json at a folder of '
+            "normal maps and they will appear here."
         )
-        imgui.pop_item_width()
+        if imgui.button("Import one instead...", imgui.ImVec2(-1, 0)):
+            app.decal_dialog = pfd.open_file(
+                "Import decal", str(Path.home()), DECAL_FILTERS
+            )
+        return
+
+    _muted_wrapped("Drag one onto the model to place it.")
+
+    thumbnail = DECAL_THUMBNAIL * scale
+    across = max(1, int(imgui.get_content_region_avail().x // (thumbnail + 8 * scale)))
+    for index, path in enumerate(app.decal_library):
+        if index % across:
+            imgui.same_line()
+        imgui.push_id(f"library{index}")
+        _draw_library_item(app, path, thumbnail)
+        imgui.pop_id()
+
+    imgui.dummy(imgui.ImVec2(0, 4 * scale))
+    if imgui.button("Import another...", imgui.ImVec2(-1, 0)):
+        app.decal_dialog = pfd.open_file("Import decal", str(Path.home()), DECAL_FILTERS)
+
+
+def _draw_library_item(app: "MeshMapApp", path: Path, size: float) -> None:
+    """One picture on the shelf, loaded the first time it is looked at.
+
+    Reading every image in the folder at startup would stall the window on a
+    large library for pictures that may never be used, so each is read when it
+    first needs drawing and kept from then on.
+    """
+    image = app.load_decal_image(path)
+    texture = app.decal_textures.get(str(path)) if image else None
+    if texture is None:
+        imgui.dummy(imgui.ImVec2(size, size))
         return
 
     width, height = image.size
-    origin = "height map, converted" if image.from_height else "normal map"
+    imgui.image_button(
+        "##thumb",
+        imgui.ImTextureRef(texture.glo),
+        imgui.ImVec2(size, size * height / max(width, 1)),
+    )
+    # Dragged out of the panel and onto the model: the app watches for the
+    # release, because ImGui's own drag-and-drop only reaches ImGui targets and
+    # the 3D view is not one.
+    if imgui.is_item_active() and imgui.is_mouse_dragging(0):
+        app.begin_decal_drag(path)
+    _tooltip(f"{path.name}\nDrag onto the model to place it.")
 
-    # The map itself, clickable: picking it up is the quickest way to place it,
-    # and pointing at the model beats reasoning about UV coordinates.
-    if app.tex_decal is not None:
-        thumbnail = DECAL_THUMBNAIL * scale
-        imgui.begin_group()
-        if imgui.image_button(
-            "##decal_pick",
-            imgui.ImTextureRef(app.tex_decal.glo),
-            imgui.ImVec2(thumbnail, thumbnail * height / max(width, 1)),
-        ):
-            app.begin_decal_placement()
-        _tooltip(
-            "Click to pick the decal up, then move the cursor over the mesh --\n"
-            "it follows the surface under it. Click again to drop it there.\n"
-            "Esc or right-click puts it back where it was."
+
+def _draw_decal_inspector(app: "MeshMapApp") -> None:
+    """The selected decal's own controls."""
+    scale = app.ui_pixel_scale
+    imgui.push_item_width(-170 * scale)
+    decal = app.selected_decal
+    dirty = False
+
+    if decal is None:
+        _muted_wrapped(
+            "Nothing selected. Drag a decal from the library below onto the "
+            "model, or click one already on it."
         )
-        imgui.end_group()
+        if app.decals:
+            _muted_wrapped(f"{len(app.decals)} on the mesh.")
+        imgui.pop_item_width()
+        return
+
+    image = app.decal_image_for(decal)
+    texture = app.decal_textures.get(decal.path)
+    if image is not None and texture is not None:
+        thumbnail = DECAL_THUMBNAIL * scale
+        width, height = image.size
+        imgui.image(
+            imgui.ImTextureRef(texture.glo),
+            imgui.ImVec2(thumbnail, thumbnail * height / max(width, 1)),
+        )
         imgui.same_line()
 
     imgui.begin_group()
+    origin = "height map, converted" if image and image.from_height else "normal map"
     imgui.text_colored(
         MUTED_COLOR,
-        f"{Path(decal.path).name}\n{width} x {height}\n({origin})",
+        f"{Path(decal.path).name}\n"
+        f"{decal.image_aspect:.2f} : 1  ({origin})\n"
+        f"{app.decal_index + 1} of {len(app.decals)} on the mesh",
     )
     changed, decal.enabled = imgui.checkbox("Enabled", decal.enabled)
     dirty |= changed
-    _tooltip("Off leaves the normal map flat, and stops normal.png being written.")
+    _tooltip("Off leaves this decal out of the normal map, without removing it.")
     imgui.end_group()
 
+    if imgui.button("Remove"):
+        app.remove_decal()
+        imgui.pop_item_width()
+        return
+    imgui.same_line()
     if app.decal_placing:
-        imgui.text_colored(
-            WARN_COLOR, "Placing: click on the mesh to drop it, Esc to cancel"
-        )
-        if imgui.button("Cancel placement", imgui.ImVec2(-1, 0)):
+        if imgui.button("Cancel move"):
             app.end_decal_placement(keep=False)
     else:
         imgui.begin_disabled(app.mesh is None)
-        if imgui.button("Place on the mesh", imgui.ImVec2(-1, 0)):
+        if imgui.button("Move on the mesh"):
             app.begin_decal_placement()
         imgui.end_disabled()
         _tooltip(
-            "Point at the model instead of typing coordinates. The decal rides\n"
-            "the surface under the cursor; click to drop it, Esc to cancel."
+            "Pick it up and put it somewhere else. It rides the surface under\n"
+            "the cursor; click to drop it, Esc to put it back."
+        )
+    if app.decal_placing:
+        imgui.text_colored(
+            WARN_COLOR, "Moving: click on the mesh to drop it, Esc to cancel"
         )
 
     imgui.begin_disabled(not decal.enabled)
@@ -848,7 +1099,32 @@ def _draw_decal_tab(app: "MeshMapApp") -> None:
     dirty |= changed
     _tooltip(
         "Fraction of the atlas the decal spans across. Its height follows from\n"
-        "the image's own aspect ratio, so a wide vent stays wide."
+        "two things: the image's own aspect ratio, so a wide vent stays wide,\n"
+        "and how stretched the mesh's UVs are where the decal sits, so a round\n"
+        "one comes out round."
+    )
+
+    stretch = float(decal.surface_aspect)
+    if abs(stretch - 1.0) > 0.02:
+        wider = "across" if stretch > 1.0 else "up"
+        _muted_wrapped(
+            f"UV here is {max(stretch, 1 / stretch):.2f}x stretched {wider}; "
+            "the decal's shape is corrected for it."
+        )
+
+    changed, decal.falloff = imgui.slider_float(
+        "Edge falloff", decal.falloff, 0.0, 1.0, "%.2f"
+    )
+    dirty |= changed
+    _tooltip(
+        "Fades the decal out towards its own border, as a fraction of its\n"
+        "half-width.\n\n"
+        "A decal is a rectangle of an image and the surface does not stop\n"
+        "there, so unless the image fades to a flat normal by its own edge the\n"
+        "rectangle shows up as a seam. Most do not -- a great many normal maps\n"
+        "are drawn on a white or a black canvas, and neither of those is flat.\n"
+        "Raise this until the join disappears; 0 turns it off for an image that\n"
+        "needs no help."
     )
 
     changed, decal.center_u = imgui.slider_float("Position U", decal.center_u, 0.0, 1.0, "%.3f")
@@ -882,23 +1158,6 @@ def _draw_decal_tab(app: "MeshMapApp") -> None:
             MUTED_COLOR, f"About {span:.3g} m across on the mesh at this scale"
         )
 
-    imgui.separator_text("Preview")
-    decal_mode = next(
-        (index for index, mode in enumerate(PREVIEW_MODES) if mode.texture == "normal"),
-        None,
-    )
-    if decal_mode is not None and imgui.button("Show the normal map", imgui.ImVec2(-1, 0)):
-        app.preview_index = decal_mode
-    _tooltip(
-        "Switch the view to the normal map itself. The decal lights the mesh in\n"
-        "the Shaded view too, exactly as it will once exported."
-    )
-
-    imgui.text_colored(
-        MUTED_COLOR,
-        "Exported as normal.png with the other maps. The bake is not involved:\n"
-        "the decal is placed in UV space, so it needs no geometry pass.",
-    )
     if info is not None and not info.has_uvs:
         imgui.text_colored(
             WARN_COLOR,
@@ -913,8 +1172,50 @@ def _draw_decal_tab(app: "MeshMapApp") -> None:
     imgui.pop_item_width()
 
 
+#: The five maps, and what to call them in the interface.
+_MAP_LABELS = (
+    ("color", "Colour"),
+    ("normal", "Normal"),
+    ("metallic", "Metallic"),
+    ("roughness", "Roughness"),
+    ("ao", "Ambient occlusion"),
+)
+
+
+def _draw_map_switches(app: "MeshMapApp") -> None:
+    """Which of the five an export writes.
+
+    Four of them cost nothing to produce -- colour, metallic and roughness are
+    one composite pass over the texture, normals one pass over the decal -- so
+    switching those off only stops a file being written. Occlusion is the one
+    stage that traces rays and costs more than the whole rest of the bake, so
+    switching it off takes it out of the bake as well. That is the difference
+    the note below is for: the others are free either way.
+    """
+    imgui.text_colored(MUTED_COLOR, "Maps to write")
+
+    scale = app.ui_pixel_scale
+    for index, (name, label) in enumerate(_MAP_LABELS):
+        if index % 2:
+            imgui.same_line(200 * scale)
+        changed, enabled = imgui.checkbox(label, app.map_enabled(name))
+        if changed:
+            app.set_map_enabled(name, enabled)
+
+    if not app.map_enabled("ao"):
+        _muted_wrapped(
+            "Occlusion is switched off, so the bake skips it -- which is most "
+            "of what a bake costs. Switching it back on needs a re-bake."
+        )
+
+
 def _draw_settings_tab(app: "MeshMapApp") -> None:
-    """Viewport navigation speeds and interface scale, all persisted."""
+    """Viewport navigation, world lighting and interface scale, all persisted."""
+    from render.viewport import (  # local import avoids a cycle
+        MAX_WORLD_STRENGTH,
+        bearing,
+    )
+
     scale = app.ui_pixel_scale
     imgui.push_item_width(-170 * scale)
 
@@ -988,12 +1289,101 @@ def _draw_settings_tab(app: "MeshMapApp") -> None:
 
     if dirty:
         app.apply_navigation()
+    dirty = False
+
+    imgui.separator_text("World lighting")
+    imgui.text_colored(
+        MUTED_COLOR,
+        "Where the key light stands, and the light the\nmodel sits in beyond it.",
+    )
+
+    world = app.world
+    changed, world.rotation = imgui.slider_float(
+        "Rotation", world.rotation, 0.0, 360.0, "%.0f deg"
+    )
+    dirty |= changed
+    # While it is being moved, and for a moment after: an arrow in the viewport
+    # standing where the light is and pointing at the model. Asked for on hover
+    # as well as on drag, so it appears before the first pixel of movement --
+    # otherwise you are turning something you cannot see yet.
+    if changed or imgui.is_item_active() or imgui.is_item_hovered():
+        app.flash_light_gizmo()
+    _tooltip(
+        "Walks the key light around the model. 0 puts it on the +X axis and it\n"
+        "turns towards +Y, counting the way the gizmo in the corner does.\n\n"
+        "The light is anchored to the model, not to the camera, so orbiting\n"
+        "moves your view of the lighting rather than the lighting itself --\n"
+        "which is the only way putting the light somewhere can mean anything."
+    )
+
+    stands, shines = bearing(world.rotation)
+    _muted_wrapped(f"Light at {stands}, shining toward {shines}.")
+
+    changed, world.strength = imgui.slider_float(
+        "Strength", world.strength, 0.0, MAX_WORLD_STRENGTH, "%.2f"
+    )
+    dirty |= changed
+    _tooltip(
+        "How much of the world reaches the surface. A single lamp leaves a\n"
+        "metal with nothing to reflect and a rough surface with nothing to\n"
+        "scatter, so both go black at 0 however their own sliders are set.\n"
+        "Turn it up for an overcast look, down for a dramatic one."
+    )
+
+    changed, color = imgui.color_edit3(
+        "Colour", list(world.color), imgui.ColorEditFlags_.no_inputs
+    )
+    if changed:
+        world.color = (float(color[0]), float(color[1]), float(color[2]))
+        dirty = True
+    _tooltip("What colour that light is. Tints every surface it falls on.")
+
+    if imgui.button("Reset lighting"):
+        app.world = type(world)()
+        dirty = True
+
+    if dirty:
+        app.save_prefs()
+
+    imgui.separator_text("Export")
+    imgui.text_colored(
+        MUTED_COLOR,
+        "What File > Export textures writes, and where\nit starts looking.",
+    )
+
+    _, app.export_dir = imgui.input_text("Folder", app.export_dir)
+    _tooltip(
+        "Where the folder chooser opens. Exporting somewhere else moves this\n"
+        "here, so the next export starts from where the last one went. The maps\n"
+        "land in a folder named after the mesh."
+    )
+    imgui.same_line()
+    if imgui.button("..."):
+        app.folder_dialog = pfd.select_folder("Export folder", app.export_dir)
+
+    bit_index = 0 if app.export_bits == 8 else 1
+    changed, bit_index = imgui.combo("Depth", bit_index, ["8-bit PNG", "16-bit PNG"])
+    if changed:
+        app.export_bits = 8 if bit_index == 0 else 16
+    _tooltip("Reach for 16-bit if you see banding in the gradients.")
+
+    _draw_map_switches(app)
+
+    maps = exportable_maps(app)
+    _muted_wrapped(
+        ("Ready to write " + ", ".join(f"{name}.png" for name in maps) + ".") if maps
+        else "Nothing to write yet - bake a mesh, import a decal, or switch a "
+             "map back on above."
+    )
 
     imgui.separator_text("Interface")
     changed, requested = imgui.slider_float("UI scale", app.ui_scale, 0.6, 3.0, "%.2fx")
     if changed:
         app.set_ui_scale(requested)
     _tooltip("Size of this panel and its text. Remembered between launches.")
+
+    if dirty:
+        app.save_prefs()
 
     imgui.text_colored(MUTED_COLOR, "Settings are saved between launches.")
     imgui.pop_item_width()
@@ -1046,6 +1436,17 @@ def _draw_status_bar(app: "MeshMapApp") -> None:
 
 def _pump_dialogs(app: "MeshMapApp") -> None:
     """Native file dialogs are async, so poll them once a frame."""
+    # Asked for from the File menu or the E key. Where to put them is the only
+    # question an export has, so it is asked first and answering it writes them.
+    if app.export_pending:
+        app.export_pending = False
+        if exportable_maps(app):
+            app.export_dialog = pfd.select_folder("Export textures to", app.export_dir)
+        else:
+            app.set_status(
+                "Nothing to export - bake a mesh, or import a decal", error=True
+            )
+
     if app.file_dialog is not None and app.file_dialog.ready():
         selection = app.file_dialog.result()
         app.file_dialog = None
@@ -1057,6 +1458,15 @@ def _pump_dialogs(app: "MeshMapApp") -> None:
         app.folder_dialog = None
         if selection:
             app.export_dir = selection
+
+    # Chosen from the File menu: where to put them was the only question, so
+    # answering it is the whole gesture -- the export follows immediately.
+    if app.export_dialog is not None and app.export_dialog.ready():
+        selection = app.export_dialog.result()
+        app.export_dialog = None
+        if selection:
+            app.export_dir = selection
+            app.export()
 
     if app.decal_dialog is not None and app.decal_dialog.ready():
         selection = app.decal_dialog.result()
