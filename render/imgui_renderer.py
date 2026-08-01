@@ -106,6 +106,45 @@ class ImGuiRenderer(ModernglWindowRenderer):
         ratio = self.wnd.pixel_ratio
         return int(logical_x * ratio), int(logical_y * ratio)
 
+    # -- mouse input ------------------------------------------------------
+
+    def _queue_mouse_position(self, x: int, y: int) -> None:
+        px, py = self._mouse_pos_viewport(x, y)
+        self.io.add_mouse_pos_event(float(px), float(py))
+
+    def mouse_position_event(self, x: int, y: int, dx: int, dy: int) -> None:
+        self._queue_mouse_position(x, y)
+
+    def mouse_drag_event(self, x: int, y: int, dx: int, dy: int) -> None:
+        # The press event already put the button-down transition in ImGui's
+        # queue. A drag contributes positions only; repeating button events on
+        # every movement can manufacture extra transitions on some backends.
+        self._queue_mouse_position(x, y)
+
+    def mouse_press_event(self, x: int, y: int, button: int) -> None:
+        self._queue_mouse_position(x, y)
+        index = self._mouse_button_index(button)
+        if index is not None:
+            self.io.add_mouse_button_event(index, True)
+
+    def mouse_release_event(self, x: int, y: int, button: int) -> None:
+        self._queue_mouse_position(x, y)
+        index = self._mouse_button_index(button)
+        if index is not None:
+            self.io.add_mouse_button_event(index, False)
+
+    def mouse_scroll_event(self, x_offset: float, y_offset: float) -> None:
+        self.io.add_mouse_wheel_event(float(x_offset), float(y_offset))
+
+    def _mouse_button_index(self, button: int) -> int | None:
+        if button == self.wnd.mouse.left:
+            return 0
+        if button == self.wnd.mouse.right:
+            return 1
+        if button == self.wnd.mouse.middle:
+            return 2
+        return None
+
     # -- texture protocol -------------------------------------------------
 
     def refresh_font_texture(self) -> None:
