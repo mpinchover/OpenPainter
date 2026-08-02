@@ -274,6 +274,8 @@ class DecalParams:
     projector_up: tuple[float, float, float] | None = None
     projector_forward: tuple[float, float, float] | None = None
     projector_size: tuple[float, float] | None = None
+    texture_index: int = -1
+    """Optional index of a Texture-tab material used to colour this decal."""
 
     def loaded(self) -> bool:
         return bool(self.path)
@@ -303,6 +305,7 @@ class DecalParams:
             self.projector_up,
             self.projector_forward,
             self.projector_size,
+            self.texture_index,
         )
 
     def size(self) -> tuple[float, float]:

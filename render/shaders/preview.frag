@@ -18,6 +18,8 @@ uniform vec3 u_projectorForward;
 uniform vec2 u_projectorSize;
 uniform float u_projectorIntensity;
 uniform float u_projectorFlipGreen;
+uniform float u_liveProjectorUseColor;
+uniform vec3 u_liveProjectorColor;
 
 const int MAX_VIEW_PROJECTORS = 8;
 uniform int u_viewProjectorCount;
@@ -29,6 +31,8 @@ uniform vec3 u_viewProjectorForwards[MAX_VIEW_PROJECTORS];
 uniform vec2 u_viewProjectorSizes[MAX_VIEW_PROJECTORS];
 uniform float u_viewProjectorIntensities[MAX_VIEW_PROJECTORS];
 uniform float u_viewProjectorFlipGreens[MAX_VIEW_PROJECTORS];
+uniform float u_viewProjectorUseColors[MAX_VIEW_PROJECTORS];
+uniform vec3 u_viewProjectorColors[MAX_VIEW_PROJECTORS];
 
 // 0 = sample u_map as greyscale
 // 1 = UV checker
@@ -75,7 +79,7 @@ vec3 apply_normal_map(vec3 normal, vec2 uv) {
     return normalize(tbn * tangent_normal);
 }
 
-vec3 apply_live_decal(vec3 normal) {
+vec3 apply_live_decal(vec3 normal, inout vec3 base_color) {
     vec3 offset = v_world - u_projectorCenter;
     vec2 decal_uv = vec2(
         dot(offset, u_projectorRight) / u_projectorSize.x + 0.5,
@@ -106,10 +110,13 @@ vec3 apply_live_decal(vec3 normal) {
     vec3 projected = normalize(normal + tangent * slope.x + bitangent * slope.y);
     float edge = min(min(decal_uv.x, decal_uv.y), min(1.0 - decal_uv.x, 1.0 - decal_uv.y));
     float weight = decal.a * smoothstep(0.0, 0.025, edge);
+    if (u_liveProjectorUseColor > 0.5) {
+        base_color = mix(base_color, u_liveProjectorColor, weight);
+    }
     return normalize(mix(normal, projected, weight));
 }
 
-vec3 apply_view_projector(vec3 normal, int index) {
+vec3 apply_view_projector(vec3 normal, int index, inout vec3 base_color) {
     vec3 offset = v_world - u_viewProjectorCenters[index];
     vec2 decal_uv = vec2(
         dot(offset, u_viewProjectorRights[index]) / u_viewProjectorSizes[index].x + 0.5,
@@ -133,7 +140,11 @@ vec3 apply_view_projector(vec3 normal, int index) {
     vec3 bitangent = normalize(cross(normal, tangent));
     vec3 projected = normalize(normal + tangent * slope.x + bitangent * slope.y);
     float edge = min(min(decal_uv.x, decal_uv.y), min(1.0 - decal_uv.x, 1.0 - decal_uv.y));
-    return normalize(mix(normal, projected, decal.a * smoothstep(0.0, 0.025, edge)));
+    float weight = decal.a * smoothstep(0.0, 0.025, edge);
+    if (u_viewProjectorUseColors[index] > 0.5) {
+        base_color = mix(base_color, u_viewProjectorColors[index], weight);
+    }
+    return normalize(mix(normal, projected, weight));
 }
 
 // -- Cook-Torrance, the same specular model Blender's Principled BSDF uses ---
@@ -204,11 +215,11 @@ void main() {
         normal = apply_normal_map(normal, v_uv);
     }
     if (u_useLiveDecal > 0.5) {
-        normal = apply_live_decal(normal);
+        normal = apply_live_decal(normal, base);
     }
     for (int projector = 0; projector < MAX_VIEW_PROJECTORS; ++projector) {
         if (projector >= u_viewProjectorCount) break;
-        normal = apply_view_projector(normal, projector);
+        normal = apply_view_projector(normal, projector, base);
     }
 
     float alpha = 1.0;

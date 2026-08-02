@@ -973,6 +973,37 @@ def test_r_rotates_around_the_surface_normal_and_escape_restores_it(placeable):
     assert decal.rotation == pytest.approx(original_rotation)
 
 
+def test_pressing_the_same_scale_constraint_again_returns_to_uniform_scale(placeable):
+    decal = placeable.selected_decal
+    original_scale = decal.scale
+
+    placeable.begin_decal_transform("scale")
+    placeable.constrain_decal_transform("x")
+    placeable.transform_decal_with_pointer(30.0, 0.0)
+    placeable.constrain_decal_transform("x")
+
+    assert placeable._decal_transform_axis is None
+    assert decal.scale > original_scale
+    assert decal.scale_x == pytest.approx(1.0)
+    assert decal.scale_y == pytest.approx(1.0)
+
+
+def test_decal_transform_undo_and_redo(placeable):
+    decal = placeable.selected_decal
+    original_scale = decal.scale
+
+    placeable.begin_decal_transform("scale")
+    placeable.transform_decal_with_pointer(30.0, 0.0)
+    changed_scale = decal.scale
+    placeable.end_decal_transform(keep=True)
+
+    assert changed_scale > original_scale
+    assert placeable.undo_decal_action()
+    assert placeable.selected_decal.scale == pytest.approx(original_scale)
+    assert placeable.redo_decal_action()
+    assert placeable.selected_decal.scale == pytest.approx(changed_scale)
+
+
 def test_escape_restores_a_keyboard_transform(placeable):
     decal = placeable.selected_decal
     origin = (decal.center_u, decal.center_v)
@@ -985,6 +1016,16 @@ def test_escape_restores_a_keyboard_transform(placeable):
 
     placeable.on_key_event(keys.ESCAPE, keys.ACTION_PRESS, placeable.wnd.modifiers)
     assert (decal.center_u, decal.center_v) == pytest.approx(origin)
+
+
+def test_x_requests_confirmation_before_deleting_selected_decal(placeable):
+    keys = placeable.wnd.keys
+    count = len(placeable.decals)
+
+    placeable.on_key_event(keys.X, keys.ACTION_PRESS, placeable.wnd.modifiers)
+
+    assert placeable._delete_decal_index == placeable.decal_index
+    assert len(placeable.decals) == count, "the shortcut itself must not delete"
 
 
 # --------------------------------------------------------------------------

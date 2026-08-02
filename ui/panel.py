@@ -91,7 +91,46 @@ def draw_panel(app: "MeshMapApp") -> None:
     _draw_navbar(app)
     _draw_parameters(app)
     _draw_status_bar(app)
+    _draw_delete_confirmation(app)
     _pump_dialogs(app)
+
+
+def _draw_delete_confirmation(app: "MeshMapApp") -> None:
+    """Modal confirmation for the keyboard delete shortcut."""
+    popup = "Delete selected decal?"
+    if app._delete_decal_index is not None and not imgui.is_popup_open(popup):
+        imgui.open_popup(popup)
+
+    opened, _ = imgui.begin_popup_modal(
+        popup, None, imgui.WindowFlags_.always_auto_resize
+    )
+    if not opened:
+        return
+
+    index = app._delete_decal_index
+    valid = index is not None and 0 <= index < len(app.decals)
+    name = Path(app.decals[index].path).name if valid else "the selected decal"
+    imgui.text(f"Delete {name}?")
+    imgui.text_colored(MUTED_COLOR, "This cannot be undone.")
+    imgui.spacing()
+
+    confirm = imgui.button("OK", imgui.ImVec2(100 * app.ui_pixel_scale, 0))
+    confirm = confirm or imgui.is_key_pressed(imgui.Key.enter, False)
+    confirm = confirm or imgui.is_key_pressed(imgui.Key.keypad_enter, False)
+    imgui.set_item_default_focus()
+    imgui.same_line()
+    cancel = imgui.button("Cancel", imgui.ImVec2(100 * app.ui_pixel_scale, 0))
+    cancel = cancel or imgui.is_key_pressed(imgui.Key.escape, False)
+
+    if confirm:
+        if valid:
+            app.remove_decal(index)
+        app._delete_decal_index = None
+        imgui.close_current_popup()
+    elif cancel:
+        app._delete_decal_index = None
+        imgui.close_current_popup()
+    imgui.end_popup()
 
 
 #: Windows that make up the frame rather than float inside it: fixed where the
@@ -174,7 +213,7 @@ def _draw_navbar(app: "MeshMapApp") -> None:
     )
     _tooltip(
         "Shaded is the mask tree, lit: the mask itself in black and white until\n"
-        "you put colours -- or another mask -- under it in the Texture tab.\n"
+        "you put colours -- or another mask -- under it in the Material tab.\n"
         "Normals is the decal normal map. Keys 1 and 2 switch between them."
     )
 
@@ -219,7 +258,7 @@ def _draw_parameters(app: "MeshMapApp") -> None:
         if selected:
             _draw_bake_tab(app)
             imgui.end_tab_item()
-        selected, _ = imgui.begin_tab_item("Texture")
+        selected, _ = imgui.begin_tab_item("Material")
         if selected:
             _draw_texture_tab(app)
             imgui.end_tab_item()
@@ -405,12 +444,12 @@ def _draw_texture_tab(app: "MeshMapApp") -> None:
     if app.texture is None:
         imgui.text_colored(
             MUTED_COLOR,
-            "No texture yet.\n\n"
-            "A texture starts as a single colour. Change its type to a mask --\n"
+            "No material yet.\n\n"
+            "A material starts as a single colour. Change its type to a mask --\n"
             "edge wear or noise -- and it grows a white and a black side, each\n"
             "of which can be another colour or another mask.",
         )
-        if imgui.button("New texture", imgui.ImVec2(-1, 0)):
+        if imgui.button("New material", imgui.ImVec2(-1, 0)):
             app.create_texture()
         return
 
@@ -449,7 +488,7 @@ def _draw_texture_tab(app: "MeshMapApp") -> None:
 
     _draw_splitter(app, splitter, usable)
 
-    imgui.separator_text("Texture tree")
+    imgui.separator_text("Material tree")
     imgui.begin_child("texture_tree", imgui.ImVec2(0, 0))
     _draw_texture_tree(app)
     imgui.end_child()
@@ -551,13 +590,13 @@ def _draw_texture_picker(app: "MeshMapApp") -> None:
 
     if imgui.button("New"):
         app.create_texture()
-    _tooltip("Add a texture: a single flat colour, to build up from.")
+    _tooltip("Add a material: a single flat colour, to build up from.")
     imgui.same_line()
     if imgui.button("Remove"):
         app.remove_texture()
         return
     _tooltip(
-        "Drop this texture. The others stay; with none left, nothing is\n"
+        "Drop this material. The others stay; with none left, nothing is\n"
         "written to color.png."
     )
 
@@ -583,7 +622,7 @@ def _draw_texture_picker(app: "MeshMapApp") -> None:
     else:
         app.texture_filter = ""
     _tooltip(
-        "Every texture made this session. Double-click its row in the tree\n"
+        "Every material made this session. Double-click its row in the tree\n"
         "below to rename it."
     )
 
@@ -1067,6 +1106,24 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
         )
 
     imgui.begin_disabled(not decal.enabled)
+
+    imgui.separator_text("Appearance")
+    texture_labels = ["None"] + [describe(texture) for texture in app.textures]
+    current_texture = (
+        decal.texture_index + 1
+        if 0 <= decal.texture_index < len(app.textures)
+        else 0
+    )
+    changed, current_texture = imgui.combo(
+        "Material", current_texture, texture_labels
+    )
+    if changed:
+        decal.texture_index = current_texture - 1
+        dirty = True
+    _tooltip(
+        "Use a material created in the Material tab to colour this decal.\n"
+        "None changes only the surface normal."
+    )
 
     imgui.separator_text("Depth")
     changed, decal.intensity = imgui.slider_float(
