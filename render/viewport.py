@@ -810,6 +810,7 @@ class MeshMapApp(mglw.WindowConfig):
         #: Last known keyboard modifiers. pyglet clears them on scroll events,
         #: so scroll reads this rather than ``wnd.modifiers``.
         self._modifiers = self.wnd.modifiers
+        self._shift_down = False
 
         self._prefs = _load_prefs()
         self.navigation = NavigationPrefs.from_dict(self._prefs.get("navigation", {}))
@@ -2659,10 +2660,12 @@ class MeshMapApp(mglw.WindowConfig):
     def on_key_event(self, key, action, modifiers) -> None:
         self.gui.key_event(key, action, modifiers)
         self._modifiers = modifiers
+        keys = self.wnd.keys
+        if key in (getattr(keys, "LEFT_SHIFT", None), getattr(keys, "RIGHT_SHIFT", None)):
+            self._shift_down = action != keys.ACTION_RELEASE
         if imgui.get_io().want_capture_keyboard:
             return
 
-        keys = self.wnd.keys
         if action != keys.ACTION_PRESS:
             return
 
@@ -3171,7 +3174,7 @@ class MeshMapApp(mglw.WindowConfig):
         modifiers = self._modifiers
         if modifiers.ctrl or modifiers.alt:
             self._queue_scroll(zoom=y_offset * self.navigation.scroll_speed)
-        elif modifiers.shift:
+        elif self._shift_down or modifiers.shift:
             self._queue_scroll(pan=(x_offset * step, y_offset * step))
         else:
             # Same units and sign as a left-drag, so both gestures feel alike.
