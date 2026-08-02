@@ -2830,22 +2830,40 @@ class MeshMapApp(mglw.WindowConfig):
             triangle = vertices[faces[int(face)]]
             normal = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
             normal /= max(float(np.linalg.norm(normal)), 1e-12)
-            camera_right, camera_up, _ = self.camera._axes()
-            right_hint = np.asarray(
-                (float(camera_right.x), float(camera_right.y), float(camera_right.z))
-            )
-            tangent = right_hint - normal * float(np.dot(right_hint, normal))
-            if np.linalg.norm(tangent) < 1e-8:
-                up_hint = np.asarray(
-                    (float(camera_up.x), float(camera_up.y), float(camera_up.z))
+            continuing = existing is not None and existing["path"] == image.path
+            if continuing:
+                old_normal = np.asarray(existing["forward"], dtype=np.float64)
+                old_normal /= max(float(np.linalg.norm(old_normal)), 1e-12)
+                old_right = np.asarray(existing["right"], dtype=np.float64)
+                old_up = np.asarray(existing["up"], dtype=np.float64)
+                rotated_right = self._transport_surface_axis(
+                    old_right, old_normal, normal, old_up
                 )
-                tangent = up_hint - normal * float(np.dot(up_hint, normal))
-            tangent /= max(float(np.linalg.norm(tangent)), 1e-12)
-            bitangent = np.cross(normal, tangent)
-            angle = math.radians(float(params.rotation))
-            cosine, sine = math.cos(angle), math.sin(angle)
-            rotated_right = tangent * cosine + bitangent * sine
-            rotated_up = bitangent * cosine - tangent * sine
+                # Rebuild up exactly orthogonal after transport so thousands
+                # of pointer updates cannot accumulate numerical skew.
+                rotated_up = np.cross(normal, rotated_right)
+                if np.dot(rotated_up, self._transport_surface_axis(
+                    old_up, old_normal, normal, old_right
+                )) < 0.0:
+                    rotated_right = -rotated_right
+                    rotated_up = -rotated_up
+            else:
+                camera_right, camera_up, _ = self.camera._axes()
+                right_hint = np.asarray(
+                    (float(camera_right.x), float(camera_right.y), float(camera_right.z))
+                )
+                tangent = right_hint - normal * float(np.dot(right_hint, normal))
+                if np.linalg.norm(tangent) < 1e-8:
+                    up_hint = np.asarray(
+                        (float(camera_up.x), float(camera_up.y), float(camera_up.z))
+                    )
+                    tangent = up_hint - normal * float(np.dot(up_hint, normal))
+                tangent /= max(float(np.linalg.norm(tangent)), 1e-12)
+                bitangent = np.cross(normal, tangent)
+                angle = math.radians(float(params.rotation))
+                cosine, sine = math.cos(angle), math.sin(angle)
+                rotated_right = tangent * cosine + bitangent * sine
+                rotated_up = bitangent * cosine - tangent * sine
             projected_right = tuple(float(value) for value in rotated_right)
             projected_up = tuple(float(value) for value in rotated_up)
             projected_forward = tuple(float(value) for value in normal)
@@ -2880,6 +2898,34 @@ class MeshMapApp(mglw.WindowConfig):
             "intensity": float(params.intensity),
             "flip_green": 1.0 if params.flip_green else 0.0,
         }
+
+    @staticmethod
+    def _transport_surface_axis(axis, old_normal, new_normal, fallback_axis):
+        """Carry an in-plane axis across a bend with no extra twist."""
+        cosine = float(np.clip(np.dot(old_normal, new_normal), -1.0, 1.0))
+        cross = np.cross(old_normal, new_normal)
+        sine = float(np.linalg.norm(cross))
+        if sine > 1e-8:
+            rotation_axis = cross / sine
+            transported = (
+                axis * cosine
+                + np.cross(rotation_axis, axis) * sine
+                + rotation_axis * np.dot(rotation_axis, axis) * (1.0 - cosine)
+            )
+        elif cosine >= 0.0:
+            transported = np.asarray(axis, dtype=np.float64)
+        else:
+            # Opposite normals have no unique shortest rotation. The other
+            # decal axis supplies a stable hinge instead of choosing at random.
+            rotation_axis = np.asarray(fallback_axis, dtype=np.float64)
+            rotation_axis /= max(float(np.linalg.norm(rotation_axis)), 1e-12)
+            transported = 2.0 * rotation_axis * np.dot(rotation_axis, axis) - axis
+        transported -= new_normal * float(np.dot(transported, new_normal))
+        length = float(np.linalg.norm(transported))
+        if length < 1e-10:
+            transported = np.cross(new_normal, fallback_axis)
+            length = float(np.linalg.norm(transported))
+        return transported / max(length, 1e-12)
 
     @staticmethod
     def _commit_live_projector(params: DecalParams, projector: dict) -> None:
