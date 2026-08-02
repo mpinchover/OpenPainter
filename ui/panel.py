@@ -284,6 +284,18 @@ def _draw_sidebar_icon(kind: int, selected: bool, size: float) -> bool:
         draw.add_line(bottom, left, color, thickness)
         draw.add_line(left, top, color, thickness)
         draw.add_circle_filled(imgui.ImVec2(cx, cy), radius * 0.18, color, 10)
+    elif kind == 3:  # Library: a shelf of four assets.
+        cell = radius * 0.72
+        gap = radius * 0.20
+        for row in (-1, 1):
+            for column in (-1, 1):
+                cell_cx = cx + column * (cell + gap) * 0.5
+                cell_cy = cy + row * (cell + gap) * 0.5
+                draw.add_rect(
+                    imgui.ImVec2(cell_cx - cell * 0.5, cell_cy - cell * 0.5),
+                    imgui.ImVec2(cell_cx + cell * 0.5, cell_cy + cell * 0.5),
+                    color, 1.5, thickness=thickness,
+                )
     else:  # Settings: sliders.
         for offset, knob in ((-0.55, -0.35), (0.0, 0.42), (0.55, -0.05)):
             y = cy + radius * offset
@@ -316,8 +328,14 @@ def _draw_parameters(app: "MeshMapApp") -> None:
 
     rail_width = SIDEBAR_ICON_RAIL * scale
     button_size = 34 * scale
-    labels = ("Bake", "Material", "Decal", "Settings")
-    drawers = (_draw_bake_tab, _draw_texture_tab, _draw_decal_tab, _draw_settings_tab)
+    labels = ("Bake", "Material", "Decal", "Library", "Settings")
+    drawers = (
+        _draw_bake_tab,
+        _draw_texture_tab,
+        _draw_decal_tab,
+        _draw_decal_library_tab,
+        _draw_settings_tab,
+    )
     app.sidebar_view = max(0, min(int(getattr(app, "sidebar_view", 0)), len(labels) - 1))
 
     imgui.begin_child("##sidebar_icon_rail", imgui.ImVec2(rail_width, 0))
@@ -1018,12 +1036,10 @@ def _draw_rename_field(app: "MeshMapApp", slot) -> None:
 
 
 def _draw_decal_tab(app: "MeshMapApp") -> None:
-    """The decals on the mesh, and the shelf of them to drag from.
+    """The selected decal's controls and every decal currently on the mesh.
 
-    Two panes, like the Texture tab and for the same reason: the top edits
-    whichever decal is selected, at a fixed size, and the bottom is the library
-    from metadata.json -- pictures to drag onto the model. Selecting is done by
-    clicking the decal itself in the viewport, which is where you are looking.
+    The two panes share selection with the viewport: clicking a row below makes
+    that decal the inspector's subject and gives it the viewport outline.
     """
     scale = app.ui_pixel_scale
 
@@ -1039,10 +1055,34 @@ def _draw_decal_tab(app: "MeshMapApp") -> None:
 
     _draw_splitter(app, splitter, usable, "decal", app.set_decal_split)
 
-    imgui.separator_text(f"Library  ({len(app.decal_library)})")
-    imgui.begin_child("decal_library", imgui.ImVec2(0, 0))
-    _draw_decal_library(app)
+    imgui.separator_text(f"In use  ({len(app.decals)})")
+    imgui.begin_child("decals_in_use", imgui.ImVec2(0, 0))
+    _draw_decals_in_use(app)
     imgui.end_child()
+
+
+def _draw_decals_in_use(app: "MeshMapApp") -> None:
+    """Selectable scene list backed by the viewport's decal selection."""
+    if not app.decals:
+        _muted_wrapped("No decals on the mesh. Drag one onto it from the Library view.")
+        return
+
+    for index, decal in enumerate(app.decals):
+        imgui.push_id(f"decal_in_use_{index}")
+        name = Path(decal.path).name or f"Decal {index + 1}"
+        state = "" if decal.enabled else "  (disabled)"
+        clicked, _ = imgui.selectable(
+            f"{index + 1}.  {name}{state}", index == app.decal_index
+        )
+        if clicked:
+            app.select_decal(index)
+        _tooltip("Select this decal in the inspector and viewport.")
+        imgui.pop_id()
+
+
+def _draw_decal_library_tab(app: "MeshMapApp") -> None:
+    """The decal shelf, kept separate from decals already on the mesh."""
+    _draw_decal_library(app)
 
 
 def _draw_decal_library(app: "MeshMapApp") -> None:
@@ -1112,8 +1152,8 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
 
     if decal is None:
         _muted_wrapped(
-            "Nothing selected. Drag a decal from the library below onto the "
-            "model, or click one already on it."
+            "Nothing selected. Choose a decal from the list below, click one "
+            "on the model, or drag a new one from the Library view."
         )
         if app.decals:
             _muted_wrapped(f"{len(app.decals)} on the mesh.")
