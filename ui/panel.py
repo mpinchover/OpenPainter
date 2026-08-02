@@ -52,6 +52,8 @@ NAVBAR_HEIGHT = 46
 #: the app being confused about where the panel ends.
 SIDEBAR_GRAB_INSIDE = 6
 SIDEBAR_GRAB_OUTSIDE = 6
+#: Width of the vertical view switcher on the sidebar's left edge.
+SIDEBAR_ICON_RAIL = 44
 #: Textures beyond which the picker grows a search box. Below it, a list this
 #: short is quicker to read than to filter.
 _SEARCHABLE_FROM = 5
@@ -236,6 +238,64 @@ def _draw_navbar(app: "MeshMapApp") -> None:
 
 # --------------------------------------------------------------------------
 
+def _draw_sidebar_icon(kind: int, selected: bool, size: float) -> bool:
+    """Draw one glyph-only navigation button without relying on icon fonts."""
+    clicked = imgui.invisible_button(f"##sidebar_view_{kind}", imgui.ImVec2(size, size))
+    start = imgui.get_item_rect_min()
+    end = imgui.get_item_rect_max()
+    hovered = imgui.is_item_hovered()
+    draw = imgui.get_window_draw_list()
+
+    if selected:
+        background = imgui.ImVec4(0.10, 0.48, 0.58, 0.92)
+    elif hovered:
+        background = imgui.ImVec4(0.30, 0.32, 0.36, 0.85)
+    else:
+        background = imgui.ImVec4(0.16, 0.17, 0.20, 0.55)
+    draw.add_rect_filled(start, end, imgui.get_color_u32(background), 5.0)
+
+    color = imgui.get_color_u32(
+        imgui.ImVec4(0.95, 0.98, 1.0, 1.0) if selected
+        else imgui.ImVec4(0.72, 0.75, 0.80, 1.0)
+    )
+    cx = (start.x + end.x) * 0.5
+    cy = (start.y + end.y) * 0.5
+    radius = size * 0.23
+    thickness = max(1.5, size * 0.055)
+
+    if kind == 0:  # Bake: a small mesh.
+        left = imgui.ImVec2(cx - radius, cy + radius * 0.72)
+        right = imgui.ImVec2(cx + radius, cy + radius * 0.72)
+        top = imgui.ImVec2(cx, cy - radius)
+        draw.add_line(left, right, color, thickness)
+        draw.add_line(right, top, color, thickness)
+        draw.add_line(top, left, color, thickness)
+        draw.add_line(top, imgui.ImVec2(cx, cy + radius * 0.72), color, thickness)
+    elif kind == 1:  # Material: a colour swatch.
+        draw.add_circle(imgui.ImVec2(cx, cy), radius, color, 24, thickness)
+        draw.add_circle_filled(imgui.ImVec2(cx, cy), radius * 0.48, color, 20)
+    elif kind == 2:  # Decal: a projected diamond.
+        top = imgui.ImVec2(cx, cy - radius)
+        right = imgui.ImVec2(cx + radius, cy)
+        bottom = imgui.ImVec2(cx, cy + radius)
+        left = imgui.ImVec2(cx - radius, cy)
+        draw.add_line(top, right, color, thickness)
+        draw.add_line(right, bottom, color, thickness)
+        draw.add_line(bottom, left, color, thickness)
+        draw.add_line(left, top, color, thickness)
+        draw.add_circle_filled(imgui.ImVec2(cx, cy), radius * 0.18, color, 10)
+    else:  # Settings: sliders.
+        for offset, knob in ((-0.55, -0.35), (0.0, 0.42), (0.55, -0.05)):
+            y = cy + radius * offset
+            draw.add_line(
+                imgui.ImVec2(cx - radius, y), imgui.ImVec2(cx + radius, y),
+                color, thickness,
+            )
+            draw.add_circle_filled(
+                imgui.ImVec2(cx + radius * knob, y), thickness * 1.45, color, 10
+            )
+    return clicked
+
 def _draw_parameters(app: "MeshMapApp") -> None:
     """The sidebar: everything that is a parameter, filling the left edge.
 
@@ -253,24 +313,26 @@ def _draw_parameters(app: "MeshMapApp") -> None:
         imgui.ImVec2(app.sidebar_pixels, height - top - STATUS_BAR_HEIGHT * scale)
     )
     imgui.begin("Parameters", None, _CHROME_FLAGS | imgui.WindowFlags_.no_title_bar)
-    if imgui.begin_tab_bar("panel_tabs"):
-        selected, _ = imgui.begin_tab_item("Bake")
-        if selected:
-            _draw_bake_tab(app)
-            imgui.end_tab_item()
-        selected, _ = imgui.begin_tab_item("Material")
-        if selected:
-            _draw_texture_tab(app)
-            imgui.end_tab_item()
-        selected, _ = imgui.begin_tab_item("Decal")
-        if selected:
-            _draw_decal_tab(app)
-            imgui.end_tab_item()
-        selected, _ = imgui.begin_tab_item("Settings")
-        if selected:
-            _draw_settings_tab(app)
-            imgui.end_tab_item()
-        imgui.end_tab_bar()
+
+    rail_width = SIDEBAR_ICON_RAIL * scale
+    button_size = 34 * scale
+    labels = ("Bake", "Material", "Decal", "Settings")
+    drawers = (_draw_bake_tab, _draw_texture_tab, _draw_decal_tab, _draw_settings_tab)
+    app.sidebar_view = max(0, min(int(getattr(app, "sidebar_view", 0)), len(labels) - 1))
+
+    imgui.begin_child("##sidebar_icon_rail", imgui.ImVec2(rail_width, 0))
+    for index, label in enumerate(labels):
+        if _draw_sidebar_icon(index, app.sidebar_view == index, button_size):
+            app.sidebar_view = index
+        _tooltip(label)
+        imgui.spacing()
+    imgui.end_child()
+
+    imgui.same_line()
+    imgui.begin_child("##sidebar_view", imgui.ImVec2(0, 0))
+    imgui.separator_text(labels[app.sidebar_view])
+    drawers[app.sidebar_view](app)
+    imgui.end_child()
     imgui.end()
 
 
@@ -967,11 +1029,10 @@ def _draw_decal_tab(app: "MeshMapApp") -> None:
 
     splitter = 8.0 * scale
     header = imgui.get_frame_height_with_spacing()
-    usable = max(imgui.get_content_region_avail().y - 2 * header - splitter,
+    usable = max(imgui.get_content_region_avail().y - header - splitter,
                  4 * header)
     inspector_height = usable * app.decal_split
 
-    imgui.separator_text("Decal")
     imgui.begin_child("decal_inspector", imgui.ImVec2(0, inspector_height))
     _draw_decal_inspector(app)
     imgui.end_child()

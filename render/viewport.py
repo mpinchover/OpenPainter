@@ -780,6 +780,8 @@ class MeshMapApp(mglw.WindowConfig):
         self.mesh: Optional[trimesh.Trimesh] = None
 
         self.preview_index = 0
+        #: Active view in the sidebar's vertical icon rail.
+        self.sidebar_view = 0
         self.lighting = True
         self.checker_scale = 24.0
         self.wireframe = False
