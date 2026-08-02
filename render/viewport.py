@@ -93,6 +93,7 @@ PREVIEW_MODES = (
 # Full export resolution is unnecessary while a decal follows the pointer.
 # Keeping the live target bounded prevents 4K/8K float-buffer work per frame.
 DECAL_INTERACTIVE_RESOLUTION = 2048
+MAX_VIEW_PROJECTORS = 8
 
 #: Drawn in place of any mode whose map does not exist yet -- an unbaked mesh
 #: under the Shaded view, mostly. Plain grey, so the geometry still reads.
@@ -901,6 +902,9 @@ class MeshMapApp(mglw.WindowConfig):
         self.preview_program["u_normalMap"].value = 1
         self.preview_program["u_material"].value = 2
         self.preview_program["u_liveDecal"].value = 3
+        self.preview_program["u_viewProjectorTextures"].value = tuple(
+            range(4, 4 + MAX_VIEW_PROJECTORS)
+        )
         self.preview_program["u_emissionScale"].value = MAX_EMISSION
         self.decal_program["u_decal"].value = 0
         self.decal_wrap_program["u_decal"].value = 0
@@ -1829,6 +1833,18 @@ class MeshMapApp(mglw.WindowConfig):
         placements = list(self.decals)
         if self._decal_transform_mode is not None and 0 <= self.decal_index < len(placements):
             del placements[self.decal_index]
+        if not self._full_decal_render_requested:
+            # The newest projectors are sampled from their source images in
+            # the mesh shader, preserving detail at any on-screen size. Keep
+            # only overflow/legacy decals in the working UV normal target.
+            direct = [
+                params for params in placements
+                if params.projector_center is not None
+                and params.active()
+                and params.path in self.decal_textures
+            ][-MAX_VIEW_PROJECTORS:]
+            direct_ids = {id(params) for params in direct}
+            placements = [params for params in placements if id(params) not in direct_ids]
         if self.dragging_decal_preview is not None:
             placements.append(self.dragging_decal_preview)
         for params in placements:
@@ -2518,6 +2534,45 @@ class MeshMapApp(mglw.WindowConfig):
             self.preview_program["u_projectorIntensity"].value = projector["intensity"]
             self.preview_program["u_projectorFlipGreen"].value = projector["flip_green"]
 
+        view_projectors = []
+        for index, params in enumerate(self.decals):
+            if params.projector_center is None or not params.active():
+                continue
+            if self._decal_transform_mode is not None and index == self.decal_index:
+                continue
+            decal_texture = self.decal_textures.get(params.path)
+            if decal_texture is not None:
+                view_projectors.append((params, decal_texture))
+        view_projectors = view_projectors[-MAX_VIEW_PROJECTORS:]
+        self.preview_program["u_viewProjectorCount"].value = len(view_projectors)
+        if view_projectors:
+            centers, rights, ups, forwards, sizes, intensities, flips = [], [], [], [], [], [], []
+            for unit, (params, decal_texture) in enumerate(view_projectors, start=4):
+                decal_texture.use(unit)
+                centers.append(params.projector_center)
+                rights.append(params.projector_right)
+                ups.append(params.projector_up)
+                forwards.append(params.projector_forward)
+                sizes.append(params.projector_size)
+                intensities.append(float(params.intensity))
+                flips.append(1.0 if params.flip_green else 0.0)
+            program = self.preview_program
+            def padded(values, width=1):
+                shape = (MAX_VIEW_PROJECTORS,) if width == 1 else (MAX_VIEW_PROJECTORS, width)
+                result = np.zeros(shape, dtype="f4")
+                result[:len(values)] = np.asarray(values, dtype="f4")
+                return result.tobytes()
+
+            # ModernGL validates writes against the declared GLSL array size,
+            # not u_viewProjectorCount, so every upload must contain all slots.
+            program["u_viewProjectorCenters"].write(padded(centers, 3))
+            program["u_viewProjectorRights"].write(padded(rights, 3))
+            program["u_viewProjectorUps"].write(padded(ups, 3))
+            program["u_viewProjectorForwards"].write(padded(forwards, 3))
+            program["u_viewProjectorSizes"].write(padded(sizes, 2))
+            program["u_viewProjectorIntensities"].write(padded(intensities))
+            program["u_viewProjectorFlipGreens"].write(padded(flips))
+
         # Anchored to the model, not to the camera: orbiting moves your view of
         # the lighting rather than the lighting itself, which is the only way
         # "put the light over there" can mean anything.
@@ -3099,10 +3154,9 @@ class MeshMapApp(mglw.WindowConfig):
         if imgui.get_io().want_capture_mouse:
             return
 
-        # Blender's own trackpad bindings for the 3D viewport, from
-        # blender_default.py: TRACKPADPAN orbits, +shift pans, +ctrl zooms, and a
-        # pinch (TRACKPADZOOM) zooms. macOS delivers a pinch as ctrl+scroll, so
-        # the ctrl branch covers both.
+        # Blender-style trackpad navigation: translating two fingers orbits,
+        # Shift translates the view, and the distinct native magnification
+        # gesture handled by :meth:`on_pinch_zoom` changes zoom.
         x_offset = float(np.clip(x_offset, -_MAX_SCROLL_STEP, _MAX_SCROLL_STEP))
         y_offset = float(np.clip(y_offset, -_MAX_SCROLL_STEP, _MAX_SCROLL_STEP))
 

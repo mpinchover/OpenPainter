@@ -19,6 +19,17 @@ uniform vec2 u_projectorSize;
 uniform float u_projectorIntensity;
 uniform float u_projectorFlipGreen;
 
+const int MAX_VIEW_PROJECTORS = 8;
+uniform int u_viewProjectorCount;
+uniform sampler2D u_viewProjectorTextures[MAX_VIEW_PROJECTORS];
+uniform vec3 u_viewProjectorCenters[MAX_VIEW_PROJECTORS];
+uniform vec3 u_viewProjectorRights[MAX_VIEW_PROJECTORS];
+uniform vec3 u_viewProjectorUps[MAX_VIEW_PROJECTORS];
+uniform vec3 u_viewProjectorForwards[MAX_VIEW_PROJECTORS];
+uniform vec2 u_viewProjectorSizes[MAX_VIEW_PROJECTORS];
+uniform float u_viewProjectorIntensities[MAX_VIEW_PROJECTORS];
+uniform float u_viewProjectorFlipGreens[MAX_VIEW_PROJECTORS];
+
 // 0 = sample u_map as greyscale
 // 1 = UV checker
 // 2 = world normals
@@ -98,6 +109,33 @@ vec3 apply_live_decal(vec3 normal) {
     return normalize(mix(normal, projected, weight));
 }
 
+vec3 apply_view_projector(vec3 normal, int index) {
+    vec3 offset = v_world - u_viewProjectorCenters[index];
+    vec2 decal_uv = vec2(
+        dot(offset, u_viewProjectorRights[index]) / u_viewProjectorSizes[index].x + 0.5,
+        dot(offset, u_viewProjectorUps[index]) / u_viewProjectorSizes[index].y + 0.5
+    );
+    float depth = abs(dot(offset, u_viewProjectorForwards[index]));
+    if (any(lessThan(decal_uv, vec2(0.0))) || any(greaterThan(decal_uv, vec2(1.0)))
+            || depth > max(u_viewProjectorSizes[index].x, u_viewProjectorSizes[index].y)
+            || abs(dot(normal, u_viewProjectorForwards[index])) < 0.08) {
+        return normal;
+    }
+    vec4 decal = texture(u_viewProjectorTextures[index], decal_uv);
+    vec3 encoded = decal.rgb * 2.0 - 1.0;
+    if (u_viewProjectorFlipGreens[index] > 0.5) encoded.y = -encoded.y;
+    vec2 slope = encoded.xy / max(encoded.z, 0.05)
+                 * u_viewProjectorIntensities[index];
+    vec3 tangent = u_viewProjectorRights[index]
+                 - normal * dot(u_viewProjectorRights[index], normal);
+    if (dot(tangent, tangent) < 1e-8) return normal;
+    tangent = normalize(tangent);
+    vec3 bitangent = normalize(cross(normal, tangent));
+    vec3 projected = normalize(normal + tangent * slope.x + bitangent * slope.y);
+    float edge = min(min(decal_uv.x, decal_uv.y), min(1.0 - decal_uv.x, 1.0 - decal_uv.y));
+    return normalize(mix(normal, projected, decal.a * smoothstep(0.0, 0.025, edge)));
+}
+
 // -- Cook-Torrance, the same specular model Blender's Principled BSDF uses ---
 //
 // GGX for the distribution of microfacets, Smith for how they shadow each
@@ -167,6 +205,10 @@ void main() {
     }
     if (u_useLiveDecal > 0.5) {
         normal = apply_live_decal(normal);
+    }
+    for (int projector = 0; projector < MAX_VIEW_PROJECTORS; ++projector) {
+        if (projector >= u_viewProjectorCount) break;
+        normal = apply_view_projector(normal, projector);
     }
 
     float alpha = 1.0;
