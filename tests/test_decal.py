@@ -961,6 +961,18 @@ def test_s_then_y_scales_only_the_decal_height(placeable):
     assert placeable._decal_transform_mode is None
 
 
+def test_r_rotates_around_the_surface_normal_and_escape_restores_it(placeable):
+    decal = placeable.selected_decal
+    original_rotation = decal.rotation
+
+    assert placeable.begin_decal_transform("rotate")
+    placeable.transform_decal_with_pointer(30.0, 0.0)
+
+    assert decal.rotation == pytest.approx((original_rotation - 15.0) % 360.0)
+    placeable.end_decal_transform(keep=False)
+    assert decal.rotation == pytest.approx(original_rotation)
+
+
 def test_escape_restores_a_keyboard_transform(placeable):
     decal = placeable.selected_decal
     origin = (decal.center_u, decal.center_v)

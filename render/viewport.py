@@ -760,11 +760,11 @@ class MeshMapApp(mglw.WindowConfig):
         self.decal_placing = False
         #: Where it was before that started, to put back if the user cancels.
         self._decal_anchor: Optional[tuple[float, float]] = None
-        #: Blender-style keyboard transform: G moves, S scales, with an
-        #: optional X/Y constraint. Scroll events supply the motion.
+        #: Blender-style keyboard transforms: G moves, S scales and R rotates
+        #: around the surface normal. Pointer events supply the motion.
         self._decal_transform_mode: Optional[str] = None
         self._decal_transform_axis: Optional[str] = None
-        self._decal_transform_anchor: Optional[tuple[float, float, int, float, float, float]] = None
+        self._decal_transform_anchor: Optional[tuple] = None
         self._decal_transform_last_hit: Optional[tuple[tuple[float, float], int]] = None
         self.mesh_info: Optional[MeshInfo] = None
         self.mesh: Optional[trimesh.Trimesh] = None
@@ -1434,13 +1434,19 @@ class MeshMapApp(mglw.WindowConfig):
         if params is None:
             self.set_status(f"Select a decal before pressing {mode.upper()}", error=True)
             return False
-        if mode not in ("move", "scale"):
+        if mode not in ("move", "scale", "rotate"):
             return False
+        if self._decal_transform_mode is not None:
+            if self._decal_transform_mode == mode:
+                return True
+            self.end_decal_transform(keep=False)
         self._decal_transform_mode = mode
         self._decal_transform_axis = None
         self._decal_transform_anchor = (
             params.center_u, params.center_v, params.surface_face, params.scale,
-            params.scale_x, params.scale_y,
+            params.scale_x, params.scale_y, params.rotation,
+            params.projector_center, params.projector_right, params.projector_up,
+            params.projector_forward, params.projector_size,
         )
         self._decal_transform_last_hit = None
         if params.projector_center is not None:
@@ -1468,7 +1474,7 @@ class MeshMapApp(mglw.WindowConfig):
         # Rebuild once without the decal being transformed. From here until
         # confirmation the shader projector is the only moving contribution.
         self.mark_normal_dirty()
-        verb = "Move" if mode == "move" else "Scale"
+        verb = {"move": "Move", "scale": "Scale", "rotate": "Rotate"}[mode]
         self.set_status(
             f"{verb} decal with one-finger pointer motion; X/Y constrains, "
             "click or Enter confirms, Esc cancels"
@@ -1476,7 +1482,7 @@ class MeshMapApp(mglw.WindowConfig):
         return True
 
     def constrain_decal_transform(self, axis: str) -> bool:
-        if self._decal_transform_mode is None or axis not in ("x", "y"):
+        if self._decal_transform_mode not in ("move", "scale") or axis not in ("x", "y"):
             return False
         self._decal_transform_axis = axis
         self.set_status(
@@ -1491,7 +1497,9 @@ class MeshMapApp(mglw.WindowConfig):
         params = self.selected_decal
         if not keep and params is not None and self._decal_transform_anchor is not None:
             (params.center_u, params.center_v, params.surface_face, params.scale,
-             params.scale_x, params.scale_y) = self._decal_transform_anchor
+             params.scale_x, params.scale_y, params.rotation,
+             params.projector_center, params.projector_right, params.projector_up,
+             params.projector_forward, params.projector_size) = self._decal_transform_anchor
             self.mark_normal_dirty()
         elif keep and params is not None and self._decal_transform_last_hit is not None:
             uv, face = self._decal_transform_last_hit
@@ -1555,7 +1563,7 @@ class MeshMapApp(mglw.WindowConfig):
                     image = self.decal_images.get(params.path)
                     if point is not None and image is not None:
                         self._set_live_decal_projector(image, point, params)
-        else:
+        elif mode == "scale":
             # Up/right grows, down/left shrinks. Prefer vertical travel because
             # that is the natural one-finger gesture, but a horizontal stroke
             # still works when it is clearly the larger movement.
@@ -1571,6 +1579,20 @@ class MeshMapApp(mglw.WindowConfig):
             image = self.decal_images.get(params.path)
             if projector is not None and image is not None:
                 self._set_live_decal_projector(image, projector["center"], params)
+        else:
+            # Horizontal motion turns naturally like a dial; vertical motion
+            # is accepted too for a comfortable one-finger trackpad gesture.
+            primary = dx if abs(dx) >= abs(dy) else -dy
+            degrees = -primary * 0.5
+            params.rotation = (float(params.rotation) + degrees) % 360.0
+            projector = self._live_decal_projector
+            if projector is not None:
+                angle = math.radians(degrees)
+                cosine, sine = math.cos(angle), math.sin(angle)
+                right = np.asarray(projector["right"], dtype=np.float64)
+                up = np.asarray(projector["up"], dtype=np.float64)
+                projector["right"] = tuple(right * cosine + up * sine)
+                projector["up"] = tuple(up * cosine - right * sine)
         return True
 
     # -- placing a decal by pointing at the mesh --------------------------
@@ -2688,6 +2710,8 @@ class MeshMapApp(mglw.WindowConfig):
                 self.begin_decal_transform("move")
             elif key == getattr(keys, "S", None):
                 self.begin_decal_transform("scale")
+            elif key == getattr(keys, "R", None):
+                self.begin_decal_transform("rotate")
             return
 
         # One number key per preview mode, and no more: a shortcut for a mode
@@ -2714,6 +2738,8 @@ class MeshMapApp(mglw.WindowConfig):
             self.begin_decal_transform("move")
         elif key == getattr(keys, "S", None):
             self.begin_decal_transform("scale")
+        elif key == getattr(keys, "R", None):
+            self.begin_decal_transform("rotate")
         elif key in (getattr(keys, "EQUAL", None), getattr(keys, "PLUS", None)):
             self.set_ui_scale(self.ui_scale + 0.1)
         elif key == getattr(keys, "MINUS", None):
