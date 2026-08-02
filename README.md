@@ -406,8 +406,12 @@ mesh. Unwrapping in Blender is almost always the better answer.
 | `1` / `2` | Preview: shaded (the mask tree) / normals (the decals) |
 | `B` / `E` / `F` | Bake / export maps (asks where) / frame the mesh (also resets the view) |
 | `W` / `L` | Wireframe / lighting |
+| `G` (decal selected) | Move the decal over the mesh with one-finger pointer motion |
+| `S` (decal selected) | Scale the decal with one-finger pointer motion |
+| `X` / `Y` during `G` or `S` | Constrain the transform to one decal axis |
+| Click / `Enter` during `G` or `S` | Confirm the decal transform |
 | `+` / `-` | Bigger / smaller UI |
-| `Esc` | Cancel a decal placement |
+| `Esc` | Cancel a decal placement or transform |
 
 ### Navigating
 

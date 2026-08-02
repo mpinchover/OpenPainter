@@ -36,25 +36,32 @@ def draw(camera, points, rect, buffer_height: int, scale: float) -> None:
     rather than joined across the screen, which is what a decal wrapping around
     the far side of the model would otherwise look like.
     """
-    if points is None or len(points) < 2:
+    if points is None or len(points) == 0 or (not isinstance(points, list) and len(points) < 2):
         return
 
     mvp = camera.projection_matrix * camera.matrix
-    screen = [
-        project(mvp, glm.vec3(float(p[0]), float(p[1]), float(p[2])), rect, buffer_height)
-        for p in points
-    ]
+    world_segments = (
+        [(segment[0], segment[1]) for segment in points]
+        if isinstance(points, list)
+        else list(zip(points, points[1:]))
+    )
+
+    def screen(point):
+        return project(
+            mvp, glm.vec3(float(point[0]), float(point[1]), float(point[2])),
+            rect, buffer_height,
+        )
 
     draw_list = imgui.get_background_draw_list()
     red, green, blue = COLOR
     shadow = imgui.get_color_u32(imgui.ImVec4(0.0, 0.0, 0.0, 0.55))
     line = imgui.get_color_u32(imgui.ImVec4(red, green, blue, 0.95))
 
-    segments = [
-        (first, second)
-        for first, second in zip(screen, screen[1:])
-        if first is not None and second is not None
-    ]
+    segments = []
+    for world_first, world_second in world_segments:
+        first, second = screen(world_first), screen(world_second)
+        if first is not None and second is not None:
+            segments.append((first, second))
     for width, color in ((SHADOW_WIDTH * scale, shadow), (WIDTH * scale, line)):
         for first, second in segments:
             draw_list.add_line(first, second, color, width)

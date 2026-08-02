@@ -19,6 +19,7 @@ Drop this module once moderngl-window ships 1.92 support upstream.
 from __future__ import annotations
 
 import ctypes
+import sys
 
 import moderngl
 from imgui_bundle import imgui
@@ -40,16 +41,50 @@ _CURSORS = {
     imgui.MouseCursor_.not_allowed: "no",
 }
 
+_FIRST_MOUSE_IMP = None
+
+
+def _enable_macos_first_click(window) -> None:
+    """Let an inactive app window activate and operate a control in one click."""
+    global _FIRST_MOUSE_IMP
+    if sys.platform != "darwin":
+        return
+    try:
+        from pyglet.libs.darwin.cocoapy import ObjCClass
+        from pyglet.libs.darwin.cocoapy.runtime import add_method, get_class
+
+        if _FIRST_MOUSE_IMP is None:
+            def accepts_first_mouse(objc_self, objc_cmd, event):
+                return True
+
+            _FIRST_MOUSE_IMP = add_method(
+                get_class("PygletView"), "acceptsFirstMouse:",
+                accepts_first_mouse, b"B@:@",
+            )
+
+        native = getattr(window, "_window", None)
+        nswindow = getattr(native, "_nswindow", None)
+        if nswindow is not None:
+            application = ObjCClass("NSApplication").sharedApplication()
+            application.activateIgnoringOtherApps_(True)
+            nswindow.makeKeyAndOrderFront_(None)
+    except Exception:
+        # Input still works normally on non-Cocoa/headless backends; first-click
+        # activation is an enhancement and must never prevent construction.
+        pass
+
 
 class ImGuiRenderer(ModernglWindowRenderer):
     """ModernglWindowRenderer with ImGui 1.92 backend-managed textures."""
 
     def __init__(self, window):
         super().__init__(window)
+        _enable_macos_first_click(window)
         self.io.backend_flags |= imgui.BackendFlags_.renderer_has_textures
         self.resize(*window.buffer_size)
         self._cursor: object = None
         self._cursor_cache: dict[str, object] = {}
+        self._mouse_buttons = [False, False, False]
 
     # -- cursors ----------------------------------------------------------
 
@@ -125,12 +160,14 @@ class ImGuiRenderer(ModernglWindowRenderer):
         self._queue_mouse_position(x, y)
         index = self._mouse_button_index(button)
         if index is not None:
+            self._mouse_buttons[index] = True
             self.io.add_mouse_button_event(index, True)
 
     def mouse_release_event(self, x: int, y: int, button: int) -> None:
         self._queue_mouse_position(x, y)
         index = self._mouse_button_index(button)
         if index is not None:
+            self._mouse_buttons[index] = False
             self.io.add_mouse_button_event(index, False)
 
     def mouse_scroll_event(self, x_offset: float, y_offset: float) -> None:
@@ -144,6 +181,15 @@ class ImGuiRenderer(ModernglWindowRenderer):
         if button == self.wnd.mouse.middle:
             return 2
         return None
+
+    def sync_mouse_buttons(self) -> None:
+        """Recover if focus changes caused Cocoa to swallow a release event."""
+        states = self.wnd.mouse_states
+        actual = (bool(states.left), bool(states.right), bool(states.middle))
+        for index, down in enumerate(actual):
+            if down != self._mouse_buttons[index]:
+                self._mouse_buttons[index] = down
+                self.io.add_mouse_button_event(index, down)
 
     # -- texture protocol -------------------------------------------------
 

@@ -303,6 +303,17 @@ def test_a_click_on_the_model_does_change_it(app, tmp_path):
     assert app.selected_decal is app.decals[0]
 
 
+def test_a_wrapped_decal_can_be_selected_on_its_neighboring_face(app, tmp_path):
+    app.add_decal(write_decal(tmp_path / "a.png"), center=(0.5, 0.5), face=2)
+    app.decals[0].scale = 0.3
+    app.select_decal(None)
+    app.surface_hit_at = lambda mouse: ((0.9, 0.9), 7)
+    app._surface_uv_on_wrap = lambda anchor, face, uv: (0.5, 0.5)
+
+    assert app.select_decal_at((100.0, 100.0)) == 0
+    assert app.selected_decal is app.decals[0]
+
+
 # --------------------------------------------------------------------------
 # dragging one off the shelf
 # --------------------------------------------------------------------------

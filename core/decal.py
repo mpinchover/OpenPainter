@@ -159,6 +159,11 @@ def decal_at_uv(decals, u: float, v: float) -> Optional[int]:
     return None
 
 
+def contains(params, u: float, v: float) -> bool:
+    """Whether one active decal covers a point in its placement coordinates."""
+    return bool(params.active() and _inside(params, u, v))
+
+
 def _inside(params, u: float, v: float) -> bool:
     """Whether a UV lands within a decal's own rectangle."""
     width, height = params.size()

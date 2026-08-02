@@ -218,9 +218,18 @@ class DecalParams:
     center_v: float = 0.5
     """Where the middle of the decal sits in UV space."""
 
+    surface_face: int = -1
+    """Triangle anchoring the continuous surface-wrap coordinate system."""
+
     scale: float = 0.25
     """Fraction of the atlas width the decal spans. Its height follows from the
     image's own aspect ratio, so a wide vent stays wide."""
+
+    scale_x: float = 1.0
+    """Additional width multiplier used by axis-constrained scaling."""
+
+    scale_y: float = 1.0
+    """Additional height multiplier used by axis-constrained scaling."""
 
     image_aspect: float = 1.0
     """The image's own width over its height, remembered when it is placed.
@@ -276,7 +285,10 @@ class DecalParams:
             self.path,
             round(self.center_u, 6),
             round(self.center_v, 6),
+            self.surface_face,
             round(self.scale, 6),
+            round(self.scale_x, 6),
+            round(self.scale_y, 6),
             round(self.image_aspect, 6),
             round(self.surface_aspect, 6),
             round(self.rotation, 4),
@@ -293,10 +305,11 @@ class DecalParams:
         The surface's decides what UV rectangle produces that shape, since a UV
         unit covers ``surface_aspect`` times as much world across as it does up.
         """
-        width = self.scale
+        width = self.scale * max(float(self.scale_x), 1e-6)
         shape = max(float(self.image_aspect), 1e-6)
         surface = max(float(self.surface_aspect), 1e-6)
-        return (width, width * surface / shape)
+        height = self.scale * surface / shape * max(float(self.scale_y), 1e-6)
+        return (width, height)
 
     def as_uniforms(self) -> dict[str, Any]:
         width, height = self.size()

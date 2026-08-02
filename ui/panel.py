@@ -1092,17 +1092,27 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
         "inside-out -- raised where it should be recessed -- this is why."
     )
 
-    imgui.separator_text("Placement  (UV space)")
+    imgui.separator_text("Surface placement")
     changed, decal.scale = imgui.slider_float(
         "Scale", decal.scale, 0.01, 1.0, "%.3f", imgui.SliderFlags_.logarithmic
     )
     dirty |= changed
     _tooltip(
-        "Fraction of the atlas the decal spans across. Its height follows from\n"
+        "Size on the anchor face. Its height follows from\n"
         "two things: the image's own aspect ratio, so a wide vent stays wide,\n"
         "and how stretched the mesh's UVs are where the decal sits, so a round\n"
-        "one comes out round."
+        "one comes out round. Across a UV seam it continues on the connected face."
     )
+
+    changed, decal.scale_x = imgui.slider_float(
+        "Width factor", decal.scale_x, 0.02, 4.0, "%.3f", imgui.SliderFlags_.logarithmic
+    )
+    dirty |= changed
+    changed, decal.scale_y = imgui.slider_float(
+        "Height factor", decal.scale_y, 0.02, 4.0, "%.3f", imgui.SliderFlags_.logarithmic
+    )
+    dirty |= changed
+    _tooltip("Independent factors changed by S then X or Y. 1.0 preserves the image shape.")
 
     stretch = float(decal.surface_aspect)
     if abs(stretch - 1.0) > 0.02:
@@ -1145,7 +1155,8 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
     if imgui.button("Reset placement"):
         blank = type(decal)()
         decal.center_u, decal.center_v = blank.center_u, blank.center_v
-        decal.scale, decal.rotation = blank.scale, blank.rotation
+        decal.scale, decal.scale_x, decal.scale_y = blank.scale, blank.scale_x, blank.scale_y
+        decal.rotation = blank.rotation
         dirty = True
 
     imgui.end_disabled()

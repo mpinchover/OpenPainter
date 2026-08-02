@@ -39,6 +39,16 @@ SLOTS = ("white", "black")
 #: LayerCompositor.read_material() hands back the real thing.
 MAX_EMISSION = 16.0
 
+#: The narrowest slice of a field the range handles may squeeze down to. Any
+#: narrower and the remap is a divide by nearly nothing, which turns a smooth
+#: field into a hard edge that the threshold can no longer move through.
+MIN_FIELD_RANGE = 1e-3
+
+#: The widest blur, as a fraction of the atlas. Enough to turn fine noise into
+#: broad patches; beyond it the radius starts to reach across whatever gutter
+#: the bake left between charts, and one island's mask bleeds into another's.
+MAX_MASK_BLUR = 0.03
+
 #: What a slot is, as ``value: label``. A colour is a leaf; the other two are
 #: masks, and choosing one grows the two slots underneath.
 COLOR_KIND = "color"
@@ -172,6 +182,34 @@ class MaskLayer:
     softness: float = 0.0
     """How wide the crossing is, in the same 0..1. Zero is a clean division --
     every texel belongs to one side or the other. Raise it to feather."""
+
+    blur: float = 0.0
+    """How far the field is smoothed across the surface before it is split.
+
+    The one control here that changes what a mask can *say* rather than where it
+    says it. Noise split as it comes is speckle at the size of a texel; smoothed
+    first and then split, the same noise is patches -- the difference between
+    dust and grime. It is also how a mask is grown or eaten back: blur it, then
+    move the threshold, and the white side spreads or retreats.
+
+    A fraction of the atlas, not a count of texels, so a mask keeps its look
+    when the bake resolution changes.
+    """
+
+    range_low: float = 0.0
+    range_high: float = 1.0
+    """The slice of the field stretched across the whole 0..1 before splitting.
+
+    Every mask makes a field, and few of them use all of it: noise clusters
+    around its middle, and a blur pulls everything further towards the mean. The
+    threshold then lives in a few pixels of slider travel, and nudging it jumps
+    from nothing to everything. Stretching the part in use across the full range
+    gives the slider back its resolution.
+
+    Monotonic, so with a hard threshold this moves the boundary rather than
+    reshaping it -- what it buys there is the ability to aim. With softness
+    above zero it also decides how the blend between the two sides eases.
+    """
     edge_wear: EdgeWearParams = field(default_factory=EdgeWearParams)
     noise: NoiseMaskParams = field(default_factory=NoiseMaskParams)
     white: "Slot" = field(default_factory=lambda: ColorSlot(_DEFAULT_WHITE))
@@ -192,7 +230,27 @@ class MaskLayer:
 
     def boundary_uniforms(self) -> dict[str, float]:
         """Where the two sides divide, for the shader. See :attr:`threshold`."""
-        return {"u_threshold": self.threshold, "u_softness": self.softness}
+        low, high = self.field_range()
+        return {
+            "u_threshold": self.threshold,
+            "u_softness": self.softness,
+            "u_rangeLow": low,
+            "u_rangeHigh": high,
+        }
+
+    def field_range(self) -> tuple[float, float]:
+        """The remap window, in the order the shader needs and never inverted.
+
+        Dragging the two handles past each other is an easy thing to do and a
+        divide by zero to act on, so they are sorted and held apart here rather
+        than guarded in three places downstream.
+        """
+        low, high = sorted((float(self.range_low), float(self.range_high)))
+        return low, max(high, low + MIN_FIELD_RANGE)
+
+    def blurred(self) -> bool:
+        """Whether this mask needs the extra passes a blur costs."""
+        return self.kind in MASK_KINDS and self.blur > 0.0
 
     def slot(self, name: str) -> "Slot":
         return getattr(self, _checked(name))
@@ -280,6 +338,9 @@ def texture_key(slot: Slot) -> tuple:
         slot.kind,
         round(slot.threshold, 6),
         round(slot.softness, 6),
+        round(slot.blur, 6),
+        round(slot.range_low, 6),
+        round(slot.range_high, 6),
         tuple(round(float(value), 6) for value in wear.as_uniforms().values()),
         tuple(round(float(value), 6) for value in noise.as_uniforms().values()),
         texture_key(slot.white),

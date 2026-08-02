@@ -20,6 +20,11 @@ class _Mouse:
 class _Window:
     mouse = _Mouse()
 
+    class mouse_states:
+        left = False
+        right = False
+        middle = False
+
 
 class _IO:
     def __init__(self):
@@ -44,10 +49,12 @@ class _Bridge:
     mouse_release_event = ImGuiRenderer.mouse_release_event
     mouse_drag_event = ImGuiRenderer.mouse_drag_event
     mouse_scroll_event = ImGuiRenderer.mouse_scroll_event
+    sync_mouse_buttons = ImGuiRenderer.sync_mouse_buttons
 
     def __init__(self):
         self.wnd = _Window()
         self.io = _IO()
+        self._mouse_buttons = [False, False, False]
 
     def _mouse_pos_viewport(self, x, y):
         return x * 2, y * 2
@@ -76,3 +83,13 @@ def test_drag_motion_does_not_invent_more_button_transitions():
     buttons = [event for event in bridge.io.events if event[0] == "button"]
     assert buttons == [("button", 0, True), ("button", 0, False)]
 
+
+def test_frame_sync_recovers_a_release_lost_while_focus_changed():
+    bridge = _Bridge()
+    bridge.mouse_press_event(10, 20, bridge.wnd.mouse.left)
+    # Cocoa never delivered release, but the window's authoritative state says
+    # the finger is up by the time the next frame begins.
+    bridge.sync_mouse_buttons()
+
+    buttons = [event for event in bridge.io.events if event[0] == "button"]
+    assert buttons == [("button", 0, True), ("button", 0, False)]

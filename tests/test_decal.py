@@ -899,6 +899,83 @@ def test_clearing_the_decal_ends_any_placement(placeable):
 
 
 # --------------------------------------------------------------------------
+# keyboard transforms
+# --------------------------------------------------------------------------
+
+def test_g_follows_surface_hits_from_one_finger_pointer_motion(placeable):
+    decal = placeable.selected_decal
+    origin = (decal.center_u, decal.center_v)
+    placeable.surface_hit_at = lambda mouse: ((0.22, 0.81), 0)
+
+    assert placeable.begin_decal_transform("move")
+    placeable.transform_decal_with_pointer(12.0, -8.0)
+
+    assert (decal.center_u, decal.center_v) == pytest.approx((0.22, 0.81))
+    placeable.end_decal_transform(keep=False)
+    assert (decal.center_u, decal.center_v) == pytest.approx(origin)
+
+
+def test_g_then_x_moves_only_across_u(placeable):
+    decal = placeable.selected_decal
+    origin = (decal.center_u, decal.center_v)
+
+    placeable.begin_decal_transform("move")
+    placeable.constrain_decal_transform("x")
+    placeable.transform_decal_with_pointer(30.0, -20.0)
+
+    assert decal.center_u > origin[0]
+    assert decal.center_v == pytest.approx(origin[1])
+
+
+def test_g_can_cross_to_a_different_mesh_face(placeable):
+    decal = placeable.selected_decal
+    decal.surface_face = 2
+    hits = iter([((0.15, 0.25), 2), ((0.78, 0.66), 9)])
+    converted = []
+    placeable.surface_hit_at = lambda mouse: next(hits)
+    placeable._surface_uv_on_wrap = lambda anchor, face, uv: (
+        converted.append((anchor, face)) or uv
+    )
+
+    placeable.begin_decal_transform("move")
+    placeable.transform_decal_with_pointer(8.0, 0.0)
+    placeable.transform_decal_with_pointer(8.0, 0.0)
+
+    assert (decal.center_u, decal.center_v) == pytest.approx((0.78, 0.66))
+    assert converted == [(2, 2), (2, 9)]
+    assert decal.surface_face == 2, "the chart stays stable while crossing the edge"
+
+
+def test_s_then_y_scales_only_the_decal_height(placeable):
+    decal = placeable.selected_decal
+    before = decal.size()
+
+    placeable.begin_decal_transform("scale")
+    placeable.constrain_decal_transform("y")
+    placeable.transform_decal_with_pointer(0.0, -30.0)
+    after = decal.size()
+
+    assert after[0] == pytest.approx(before[0])
+    assert after[1] > before[1]
+    placeable.end_decal_transform(keep=True)
+    assert placeable._decal_transform_mode is None
+
+
+def test_escape_restores_a_keyboard_transform(placeable):
+    decal = placeable.selected_decal
+    origin = (decal.center_u, decal.center_v)
+    keys = placeable.wnd.keys
+
+    placeable.on_key_event(keys.G, keys.ACTION_PRESS, placeable.wnd.modifiers)
+    x, y = viewport_point(placeable, 0.42, 0.6)
+    placeable.on_mouse_position_event(x, y, 10, 10)
+    assert (decal.center_u, decal.center_v) != pytest.approx(origin)
+
+    placeable.on_key_event(keys.ESCAPE, keys.ACTION_PRESS, placeable.wnd.modifiers)
+    assert (decal.center_u, decal.center_v) == pytest.approx(origin)
+
+
+# --------------------------------------------------------------------------
 # parameters
 # --------------------------------------------------------------------------
 
@@ -912,6 +989,8 @@ def test_every_field_changes_the_key():
         DecalParams(path="a.png", center_u=0.1),
         DecalParams(path="a.png", center_v=0.1),
         DecalParams(path="a.png", scale=0.9),
+        DecalParams(path="a.png", scale_x=1.2),
+        DecalParams(path="a.png", scale_y=1.2),
         DecalParams(path="a.png", rotation=12.0),
         DecalParams(path="a.png", intensity=2.0),
         DecalParams(path="a.png", flip_green=True),
@@ -932,6 +1011,11 @@ def test_size_follows_the_image_aspect():
         (0.6, 0.3)
     ), "twice as wide as tall"
     assert DecalParams(scale=0.6, image_aspect=0.5).size() == pytest.approx((0.6, 1.2))
+
+
+def test_axis_scale_factors_change_width_and_height_independently():
+    params = DecalParams(scale=0.4, scale_x=2.0, scale_y=0.5)
+    assert params.size() == pytest.approx((0.8, 0.2))
 
 
 def test_size_undoes_the_surfaces_own_stretch():
