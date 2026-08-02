@@ -9,6 +9,15 @@ out vec4 out_color;
 uniform sampler2D u_map;
 uniform sampler2D u_normalMap;
 uniform sampler2D u_material;   // metallic, roughness, alpha, emission
+uniform sampler2D u_liveDecal;
+uniform float u_useLiveDecal;
+uniform vec3 u_projectorCenter;
+uniform vec3 u_projectorRight;
+uniform vec3 u_projectorUp;
+uniform vec3 u_projectorForward;
+uniform vec2 u_projectorSize;
+uniform float u_projectorIntensity;
+uniform float u_projectorFlipGreen;
 
 // 0 = sample u_map as greyscale
 // 1 = UV checker
@@ -53,6 +62,40 @@ vec3 apply_normal_map(vec3 normal, vec2 uv) {
     mat3 tbn = mat3(tangent * invmax, bitangent * invmax, normal);
     vec3 tangent_normal = texture(u_normalMap, uv).rgb * 2.0 - 1.0;
     return normalize(tbn * tangent_normal);
+}
+
+vec3 apply_live_decal(vec3 normal) {
+    vec3 offset = v_world - u_projectorCenter;
+    vec2 decal_uv = vec2(
+        dot(offset, u_projectorRight) / u_projectorSize.x + 0.5,
+        dot(offset, u_projectorUp) / u_projectorSize.y + 0.5
+    );
+    float depth = abs(dot(offset, u_projectorForward));
+    float facing = dot(normal, u_projectorForward);
+    if (any(lessThan(decal_uv, vec2(0.0))) || any(greaterThan(decal_uv, vec2(1.0)))
+            || depth > max(u_projectorSize.x, u_projectorSize.y)
+            || abs(facing) < 0.08) {
+        return normal;
+    }
+    vec4 decal = texture(u_liveDecal, decal_uv);
+    if (decal.a <= 0.001) {
+        return normal;
+    }
+    vec3 encoded = decal.rgb * 2.0 - 1.0;
+    if (u_projectorFlipGreen > 0.5) {
+        encoded.y = -encoded.y;
+    }
+    vec2 slope = encoded.xy / max(encoded.z, 0.05) * u_projectorIntensity;
+    vec3 tangent = u_projectorRight - normal * dot(u_projectorRight, normal);
+    if (dot(tangent, tangent) < 1e-8) {
+        return normal;
+    }
+    tangent = normalize(tangent);
+    vec3 bitangent = normalize(cross(normal, tangent));
+    vec3 projected = normalize(normal + tangent * slope.x + bitangent * slope.y);
+    float edge = min(min(decal_uv.x, decal_uv.y), min(1.0 - decal_uv.x, 1.0 - decal_uv.y));
+    float weight = decal.a * smoothstep(0.0, 0.025, edge);
+    return normalize(mix(normal, projected, weight));
 }
 
 // -- Cook-Torrance, the same specular model Blender's Principled BSDF uses ---
@@ -121,6 +164,9 @@ void main() {
     }
     if (u_useNormalMap > 0.5) {
         normal = apply_normal_map(normal, v_uv);
+    }
+    if (u_useLiveDecal > 0.5) {
+        normal = apply_live_decal(normal);
     }
 
     float alpha = 1.0;

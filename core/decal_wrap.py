@@ -55,6 +55,25 @@ def wrapped_vertices(vertices, faces, uvs, anchor_face: int, *, return_layout=Fa
     laid: dict[int, dict[tuple, np.ndarray]] = {
         anchor_face: {corner_keys[anchor_face][i]: anchor_2d[i] for i in range(3)}
     }
+    # Testing every new triangle against the entire unfolded chart made this
+    # traversal quadratic.  A modest spatial hash limits exact overlap tests
+    # to triangles whose 2D bounding boxes actually share a region.
+    typical_edge = diagonal / max(np.sqrt(len(faces)), 1.0)
+    cell_size = max(typical_edge * 2.0, weld * 16.0)
+    spatial: dict[tuple[int, int], set[int]] = {}
+
+    def cells_for(triangle):
+        low = np.floor(np.min(triangle, axis=0) / cell_size).astype(np.int64)
+        high = np.floor(np.max(triangle, axis=0) / cell_size).astype(np.int64)
+        for cell_x in range(int(low[0]), int(high[0]) + 1):
+            for cell_y in range(int(low[1]), int(high[1]) + 1):
+                yield cell_x, cell_y
+
+    def index_face(face_index, triangle):
+        for cell in cells_for(triangle):
+            spatial.setdefault(cell, set()).add(int(face_index))
+
+    index_face(anchor_face, anchor_2d)
     queue = deque([anchor_face])
     while queue:
         current = queue.popleft()
@@ -87,7 +106,11 @@ def wrapped_vertices(vertices, faces, uvs, anchor_face: int, *, return_layout=Fa
                 # overlap an already laid triangle; otherwise one decal appears
                 # again on a distant face and its outline breaks into fragments.
                 overlaps = False
-                for existing_face, existing in laid.items():
+                nearby = set()
+                for cell in cells_for(candidate_triangle):
+                    nearby.update(spatial.get(cell, ()))
+                for existing_face in nearby:
+                    existing = laid[existing_face]
                     existing_triangle = np.asarray([
                         existing[key] for key in corner_keys[existing_face]
                     ])
@@ -97,6 +120,7 @@ def wrapped_vertices(vertices, faces, uvs, anchor_face: int, *, return_layout=Fa
                 if overlaps:
                     continue
                 laid[neighbor] = candidate
+                index_face(neighbor, candidate_triangle)
                 queue.append(neighbor)
 
     rows = []

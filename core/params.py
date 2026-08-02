@@ -200,12 +200,9 @@ class EdgeWearParams:
 class DecalParams:
     """A normal-map decal stamped into the mesh's UV layout.
 
-    Substance Painter projects a decal onto the surface through a 3D placement
-    gizmo. There is no painting viewport here to do that with, so the placement
-    is stated in UV space instead: the decal occupies a rectangle of the atlas,
-    which is a rectangle of the surface. For anything with a sane UV layout --
-    a panel, a hull plate, the side of a crate -- that is the same operation
-    expressed in the coordinates this app already works in.
+    Interactive placement uses a view-aligned GPU projector, as in a painting
+    viewport. Once committed, the placement is also stated in UV space so it
+    can be composited into the exported normal map.
 
     The image is never modified. Everything below is applied when the decal is
     composited into the normal map, so all of it stays live.
@@ -272,6 +269,12 @@ class DecalParams:
     """Flip the green channel, for a map baked in DirectX (-Y) convention.
     Everything here is OpenGL (+Y up), which is what Blender expects."""
 
+    projector_center: tuple[float, float, float] | None = None
+    projector_right: tuple[float, float, float] | None = None
+    projector_up: tuple[float, float, float] | None = None
+    projector_forward: tuple[float, float, float] | None = None
+    projector_size: tuple[float, float] | None = None
+
     def loaded(self) -> bool:
         return bool(self.path)
 
@@ -295,6 +298,11 @@ class DecalParams:
             round(self.falloff, 6),
             round(self.intensity, 6),
             self.flip_green,
+            self.projector_center,
+            self.projector_right,
+            self.projector_up,
+            self.projector_forward,
+            self.projector_size,
         )
 
     def size(self) -> tuple[float, float]:

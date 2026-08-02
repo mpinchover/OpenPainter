@@ -965,6 +965,7 @@ def _draw_decal_library(app: "MeshMapApp") -> None:
         return
 
     _muted_wrapped("Drag one onto the model to place it.")
+    app.pump_decal_library()
 
     thumbnail = DECAL_THUMBNAIL * scale
     across = max(1, int(imgui.get_content_region_avail().x // (thumbnail + 8 * scale)))
@@ -981,19 +982,14 @@ def _draw_decal_library(app: "MeshMapApp") -> None:
 
 
 def _draw_library_item(app: "MeshMapApp", path: Path, size: float) -> None:
-    """One picture on the shelf, loaded the first time it is looked at.
-
-    Reading every image in the folder at startup would stall the window on a
-    large library for pictures that may never be used, so each is read when it
-    first needs drawing and kept from then on.
-    """
-    image = app.load_decal_image(path)
-    texture = app.decal_textures.get(str(path)) if image else None
-    if texture is None:
+    """Draw one picture once the background library loader has prepared it."""
+    image_size = app.decal_thumbnail_sizes.get(str(path))
+    texture = app.decal_thumbnail_textures.get(str(path))
+    if texture is None or image_size is None:
         imgui.dummy(imgui.ImVec2(size, size))
         return
 
-    width, height = image.size
+    width, height = image_size
     imgui.image_button(
         "##thumb",
         imgui.ImTextureRef(texture.glo),

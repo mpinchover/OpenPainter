@@ -27,6 +27,8 @@ uniform sampler2D u_blackMaterial;
 uniform int u_kind;             // 0 = edge wear, 1 = noise, 2 = flat colour
 uniform float u_threshold;      // where the two sides divide, on the mask's 0..1
 uniform float u_softness;       // how wide the crossing is; 0 is a clean split
+uniform float u_rangeLow;       // the slice of the field stretched across 0..1
+uniform float u_rangeHigh;      // before the split -- see MaskLayer.range_low
 uniform int u_whiteIsMap;
 uniform int u_blackIsMap;
 uniform vec3 u_whiteColor;
@@ -82,6 +84,11 @@ void main() {
     // sides everywhere it sits mid-way -- the colours bleed into each other
     // instead of dividing. Cutting it at the threshold is what makes the
     // boundary a boundary; softness feathers it back if that is wanted.
+    // The part of the field actually in use, stretched across the whole range.
+    // Few masks use all of theirs -- noise clusters around its middle -- and
+    // the threshold then lives in a few pixels of slider travel.
+    mask = clamp((mask - u_rangeLow) / max(u_rangeHigh - u_rangeLow, 1e-3), 0.0, 1.0);
+
     mask = u_softness <= 0.0
         ? step(u_threshold, mask)
         : smoothstep(u_threshold - u_softness, u_threshold + u_softness, mask);

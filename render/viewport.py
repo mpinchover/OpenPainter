@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -30,6 +31,7 @@ from core.decal import (
     uv_aspect,
 )
 from core.decal_wrap import wrapped_vertices
+from core.decal_thumbnail import DecalThumbnail, load_thumbnail
 from core.export import (
     COLOR_NAME,
     MAP_NAMES,
@@ -87,6 +89,10 @@ PREVIEW_MODES = (
     PreviewMode("Shaded", 4, "composite"),
     PreviewMode("Normals", 4, "normal", needs_bake=False),
 )
+
+# Full export resolution is unnecessary while a decal follows the pointer.
+# Keeping the live target bounded prevents 4K/8K float-buffer work per frame.
+DECAL_INTERACTIVE_RESOLUTION = 2048
 
 #: Drawn in place of any mode whose map does not exist yet -- an unbaked mesh
 #: under the Shaded view, mostly. Plain grey, so the geometry still reads.
@@ -701,6 +707,7 @@ class MeshMapApp(mglw.WindowConfig):
         #: colour or a mask, either way.
         self.texture_path: tuple[str, ...] = ()
         self._texture_dirty = True
+        self._full_texture_render_requested = False
         #: Counts textures made this session, so each gets its own name.
         self._texture_serial = 0
         #: Which row the tree is renaming in place, if any, and whether its
@@ -726,6 +733,22 @@ class MeshMapApp(mglw.WindowConfig):
         self.decal_textures: dict = {}
         #: The shelf offered in the Decal tab, from metadata.json.
         self.decal_library: list[Path] = decal_library(METADATA.decals)
+        #: Library images are decoded away from the render thread.  Opening
+        #: the Decal tab must not synchronously decode every large PNG before
+        #: the window can draw its next frame.
+        self._decal_library_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="decal-library"
+        )
+        self._decal_library_future: Optional[tuple[Path, Future[DecalThumbnail]]] = None
+        self._decal_library_attempted: set[str] = set()
+        self.decal_thumbnail_sizes: dict[str, tuple[int, int]] = {}
+        self.decal_thumbnail_textures: dict = {}
+        self._decal_image_futures: dict[str, Future[DecalImage]] = {}
+        self._pending_decal_drop: Optional[
+            tuple[Path, tuple[float, float], int]
+        ] = None
+        self._live_decal_projector: Optional[dict] = None
+        self._full_decal_render_requested = False
         #: A decal being dragged out of the shelf, waiting to be dropped.
         self.dragging_decal: Optional[Path] = None
         #: Temporary placement rendered under the cursor during a shelf drag.
@@ -853,6 +876,10 @@ class MeshMapApp(mglw.WindowConfig):
             vertex_shader=load_shader("decal_wrap.vert"),
             fragment_shader=load_shader("decal_wrap.frag"),
         )
+        self.decal_project_program = self.ctx.program(
+            vertex_shader=load_shader("decal_project.vert"),
+            fragment_shader=load_shader("decal_project.frag"),
+        )
         self.encode_program = self.ctx.program(
             vertex_shader=load_shader("fullscreen.vert"),
             fragment_shader=load_shader("normal_encode.frag"),
@@ -873,9 +900,11 @@ class MeshMapApp(mglw.WindowConfig):
         self.preview_program["u_map"].value = 0
         self.preview_program["u_normalMap"].value = 1
         self.preview_program["u_material"].value = 2
+        self.preview_program["u_liveDecal"].value = 3
         self.preview_program["u_emissionScale"].value = MAX_EMISSION
         self.decal_program["u_decal"].value = 0
         self.decal_wrap_program["u_decal"].value = 0
+        self.decal_project_program["u_decal"].value = 0
         self.encode_program["u_slope"].value = 0
         for program in (self.preview_program, self.background_program,
                         self.bright_program, self.tonemap_program):
@@ -907,9 +936,11 @@ class MeshMapApp(mglw.WindowConfig):
         self._decal_wrap_cache: dict[
             int, tuple[Optional[moderngl.Buffer], Optional[moderngl.VertexArray], dict[int, np.ndarray]]
         ] = {}
+        self._decal_wrap_futures: dict[int, tuple[tuple, Future]] = {}
         self.encode_vao = self.ctx.vertex_array(self.encode_program, [])
 
         self.mesh_vao: Optional[moderngl.VertexArray] = None
+        self.decal_project_vao: Optional[moderngl.VertexArray] = None
         self._mesh_buffers: list = []
         self._vao_token: tuple = ()
         #: The geometry the VAO was built from, kept for cursor picking: the
@@ -1264,6 +1295,87 @@ class MeshMapApp(mglw.WindowConfig):
         self._upload_decal(image)
         return image
 
+    def pump_decal_library(self) -> None:
+        """Advance lazy library loading without blocking the UI thread.
+
+        PNG decoding and normal-map preparation happen on a worker.  The GL
+        upload stays on the render thread, one completed image per frame.
+        """
+        pending = self._decal_library_future
+        if pending is not None:
+            path, future = pending
+            if not future.done():
+                return
+            self._decal_library_future = None
+            try:
+                image = future.result()
+            except Exception as error:  # keep one bad library item non-fatal
+                self.set_status(f"Could not load {path.name}: {error}", error=True)
+            else:
+                self._upload_decal_thumbnail(image)
+
+        if self._decal_library_future is None:
+            for path in self.decal_library:
+                key = str(path)
+                if key in self.decal_thumbnail_textures or key in self._decal_library_attempted:
+                    continue
+                self._decal_library_attempted.add(key)
+                cache = _settings_dir() / "cache" / "decal-thumbnails"
+                future = self._decal_library_executor.submit(load_thumbnail, path, cache)
+                self._decal_library_future = (path, future)
+                break
+
+    def request_decal_image(self, path: str | Path) -> None:
+        """Begin preparing a full-resolution decal without stalling a drag."""
+        key = str(Path(path).expanduser())
+        if key not in self.decal_images and key not in self._decal_image_futures:
+            self._decal_image_futures[key] = self._decal_library_executor.submit(
+                load_decal, Path(key)
+            )
+
+    def _pump_decal_images(self) -> None:
+        """Move completed full decals onto GL, which must stay on this thread."""
+        for key, future in tuple(self._decal_image_futures.items()):
+            if not future.done():
+                continue
+            del self._decal_image_futures[key]
+            try:
+                image = future.result()
+            except DecalLoadError as error:
+                self.set_status(str(error), error=True)
+                if self._pending_decal_drop and str(self._pending_decal_drop[0]) == key:
+                    self._pending_decal_drop = None
+            except Exception as error:
+                self.set_status(f"Could not load {Path(key).name}: {error}", error=True)
+                if self._pending_decal_drop and str(self._pending_decal_drop[0]) == key:
+                    self._pending_decal_drop = None
+            else:
+                if image.path not in self.decal_images:
+                    self.decal_images[image.path] = image
+                    self._upload_decal(image)
+                if self.dragging_decal is not None and str(self.dragging_decal) == key:
+                    self._update_dragged_decal_preview()
+                pending = self._pending_decal_drop
+                if pending is not None and str(pending[0]) == key:
+                    self._pending_decal_drop = None
+                    self.add_decal(pending[0], center=pending[1], face=pending[2])
+
+    def _pump_decal_wraps(self) -> None:
+        """Upload completed surface charts without unfolding during a frame."""
+        for face, (token, future) in tuple(self._decal_wrap_futures.items()):
+            if not future.done():
+                continue
+            del self._decal_wrap_futures[face]
+            if token != self._vao_token:
+                continue
+            try:
+                data, layout = future.result()
+            except Exception as error:
+                self.set_status(f"Could not project decal: {error}", error=True)
+                continue
+            self._store_wrapped_decal(face, data, layout)
+            self.mark_normal_dirty()
+
     def remove_decal(self, index: Optional[int] = None) -> None:
         """Take one decal off the mesh. The neighbour takes the selection."""
         if self._decal_transform_mode is not None:
@@ -1326,6 +1438,31 @@ class MeshMapApp(mglw.WindowConfig):
             params.scale_x, params.scale_y,
         )
         self._decal_transform_last_hit = None
+        if params.projector_center is not None:
+            self._live_decal_projector = {
+                "path": params.path,
+                "center": params.projector_center,
+                "right": params.projector_right,
+                "up": params.projector_up,
+                "forward": params.projector_forward,
+                "size": params.projector_size,
+                "intensity": float(params.intensity),
+                "flip_green": 1.0 if params.flip_green else 0.0,
+            }
+        elif self._pick_geometry is not None:
+            vertices, faces, uvs = self._pick_geometry
+            point = surface_at_uv(
+                vertices, faces, uvs, params.center_u, params.center_v
+            )
+            image = self.decal_images.get(params.path)
+            if point is not None and image is not None:
+                self._set_live_decal_projector(
+                    image, point, params,
+                    params.surface_face if params.surface_face >= 0 else None,
+                )
+        # Rebuild once without the decal being transformed. From here until
+        # confirmation the shader projector is the only moving contribution.
+        self.mark_normal_dirty()
         verb = "Move" if mode == "move" else "Scale"
         self.set_status(
             f"{verb} decal with one-finger pointer motion; X/Y constrains, "
@@ -1357,11 +1494,15 @@ class MeshMapApp(mglw.WindowConfig):
             params.surface_face = int(face)
             params.surface_aspect = self.measure_uv_aspect(face)
             self.mark_normal_dirty()
+        if keep and params is not None and self._live_decal_projector is not None:
+            self._commit_live_projector(params, self._live_decal_projector)
         self.set_status("Decal transform applied" if keep else "Decal transform cancelled")
         self._decal_transform_mode = None
         self._decal_transform_axis = None
         self._decal_transform_anchor = None
         self._decal_transform_last_hit = None
+        self._live_decal_projector = None
+        self.mark_normal_dirty()
 
     def transform_decal_with_pointer(self, dx: float, dy: float) -> bool:
         """Apply ordinary cursor motion to the active decal transform.
@@ -1381,18 +1522,14 @@ class MeshMapApp(mglw.WindowConfig):
         if mode == "move":
             if axis is None:
                 hit = self.surface_hit_at(self._mouse)
-                if hit is None:
+                world_hit = self.world_surface_hit_at(self._mouse)
+                if hit is None or world_hit is None:
                     return False
                 uv, face = hit
                 self._decal_transform_last_hit = (uv, int(face))
-                if params.surface_face < 0:
-                    params.surface_face = int(face)
-                    params.center_u, params.center_v = uv
-                else:
-                    surface = self._surface_uv_on_wrap(params.surface_face, int(face), uv)
-                    if surface is None:
-                        return False
-                    params.center_u, params.center_v = surface
+                image = self.decal_images.get(params.path)
+                if image is not None:
+                    self._set_live_decal_projector(image, world_hit[0], params, int(face))
             else:
                 _, _, width, height = self.viewport_rect
                 if axis == "x":
@@ -1405,6 +1542,14 @@ class MeshMapApp(mglw.WindowConfig):
                         params.center_v - dy * float(self.wnd.pixel_ratio) / max(height, 1),
                         0.0, 1.0,
                     ))
+                if self._pick_geometry is not None:
+                    vertices, faces, uvs = self._pick_geometry
+                    point = surface_at_uv(
+                        vertices, faces, uvs, params.center_u, params.center_v
+                    )
+                    image = self.decal_images.get(params.path)
+                    if point is not None and image is not None:
+                        self._set_live_decal_projector(image, point, params)
         else:
             # Up/right grows, down/left shrinks. Prefer vertical travel because
             # that is the natural one-finger gesture, but a horizontal stroke
@@ -1417,7 +1562,10 @@ class MeshMapApp(mglw.WindowConfig):
                 params.scale_y = float(np.clip(params.scale_y * factor, 0.02, 50.0))
             else:
                 params.scale = float(np.clip(params.scale * factor, 0.002, 4.0))
-        self.mark_normal_dirty()
+            projector = self._live_decal_projector
+            image = self.decal_images.get(params.path)
+            if projector is not None and image is not None:
+                self._set_live_decal_projector(image, projector["center"], params)
         return True
 
     # -- placing a decal by pointing at the mesh --------------------------
@@ -1503,6 +1651,21 @@ class MeshMapApp(mglw.WindowConfig):
         texel = corners[0] * (1.0 - u - v) + corners[1] * u + corners[2] * v
         return (float(texel[0]), float(texel[1])), int(face)
 
+    def world_surface_hit_at(
+        self, mouse: tuple[float, float]
+    ) -> Optional[tuple[np.ndarray, int]]:
+        """World-space cursor hit used by the live GPU decal projector."""
+        ray = self._cursor_ray(mouse)
+        if ray is None or self._pick_geometry is None:
+            return None
+        vertices, faces, _ = self._pick_geometry
+        hit = ray_mesh_hit(*ray, vertices, faces)
+        if hit is None:
+            return None
+        face, _, _, distance = hit
+        point = np.asarray(ray[0]) + np.asarray(ray[1]) * float(distance)
+        return point, int(face)
+
     def _cursor_ray(self, mouse: tuple[float, float]):
         """The ray a cursor position casts into the scene, in world space."""
         if self._pick_geometry is None:
@@ -1564,13 +1727,31 @@ class MeshMapApp(mglw.WindowConfig):
         self._aspect_token = self._vao_token
 
     def _release_decal_textures(self) -> None:
-        for texture in self.decal_textures.values():
+        for texture in (*self.decal_textures.values(), *self.decal_thumbnail_textures.values()):
             try:
                 self.gui.remove_texture(texture)
             except KeyError:
                 pass
             texture.release()
         self.decal_textures.clear()
+        self.decal_thumbnail_textures.clear()
+
+    def _upload_decal_thumbnail(self, thumbnail: DecalThumbnail) -> None:
+        """Upload only the small browser preview, never the source texture."""
+        if thumbnail.path in self.decal_thumbnail_textures:
+            return
+        width, height = thumbnail.size
+        # Match the row-0-at-bottom convention used by full decal textures.
+        pixels = np.frombuffer(thumbnail.rgba, dtype=np.uint8).reshape(height, width, 4)
+        texture = self.ctx.texture(
+            thumbnail.size, 4, data=np.ascontiguousarray(np.flipud(pixels)).tobytes()
+        )
+        texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        texture.repeat_x = False
+        texture.repeat_y = False
+        self.gui.register_texture(texture)
+        self.decal_thumbnail_sizes[thumbnail.path] = thumbnail.size
+        self.decal_thumbnail_textures[thumbnail.path] = texture
 
     def _upload_decal(self, image: DecalImage) -> None:
         """Put one decal image on the GPU, once, and keep it there.
@@ -1582,9 +1763,13 @@ class MeshMapApp(mglw.WindowConfig):
         if image.path in self.decal_textures:
             return
 
+        # Source images have already gone through Pillow's 8-bit RGBA decode,
+        # so a 32-bit float GPU texture adds no source detail. Normalized u8
+        # samples identically in the shader while using one quarter of the
+        # upload bandwidth and memory (including its mip chain).
+        pixels = np.clip(image.rgba() * 255.0 + 0.5, 0.0, 255.0).astype("u1")
         texture = self.ctx.texture(
-            image.size, 4, data=np.ascontiguousarray(image.rgba(), dtype="f4").tobytes(),
-            dtype="f4",
+            image.size, 4, data=np.ascontiguousarray(pixels).tobytes(), dtype="f1"
         )
         # Mipmaps because the decal is usually larger than the patch of atlas it
         # lands in, so minification without them aliases the fine detail a vent
@@ -1607,10 +1792,17 @@ class MeshMapApp(mglw.WindowConfig):
         self.refresh_decal_aspect()
         if self.tex_normal is None and not self.any_visible_decal_active():
             return
-        if self._normal_resolution != int(self.controller.bake_params.resolution):
+        if self._normal_resolution != self._decal_render_resolution():
             self._normal_dirty = True
         if self._normal_dirty:
             self._run_decal()
+
+    def _decal_render_resolution(self) -> int:
+        """Keep viewport compositing cheap; full size is reserved for output."""
+        requested = int(self.controller.bake_params.resolution)
+        if self._full_decal_render_requested:
+            return requested
+        return min(requested, DECAL_INTERACTIVE_RESOLUTION)
 
     def _run_decal(self) -> None:
         """Re-composite the normal map: one full-screen pass per decal.
@@ -1622,7 +1814,7 @@ class MeshMapApp(mglw.WindowConfig):
         the encoded normals would average them towards flat and let the second
         decal rub out the first.
         """
-        resolution = int(self.controller.bake_params.resolution)
+        resolution = self._decal_render_resolution()
         self._ensure_normal_texture(resolution)
         assert self.normal_fbo is not None and self._slope_fbo is not None
 
@@ -1635,6 +1827,8 @@ class MeshMapApp(mglw.WindowConfig):
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.ONE, moderngl.ONE
         placements = list(self.decals)
+        if self._decal_transform_mode is not None and 0 <= self.decal_index < len(placements):
+            del placements[self.decal_index]
         if self.dragging_decal_preview is not None:
             placements.append(self.dragging_decal_preview)
         for params in placements:
@@ -1642,6 +1836,24 @@ class MeshMapApp(mglw.WindowConfig):
             if not params.active() or texture is None:
                 continue
             texture.use(0)
+            if params.projector_center is not None:
+                # Never send a world-projector placement through the legacy UV
+                # rectangle path. During the first mesh/atlas handoff its VAO
+                # can be absent for a frame; drawing nothing for that frame is
+                # preferable to stamping a differently oriented decal that can
+                # remain in the accumulated normal target.
+                if self.decal_project_vao is not None:
+                    program = self.decal_project_program
+                    program["u_projectorCenter"].value = params.projector_center
+                    program["u_projectorRight"].value = params.projector_right
+                    program["u_projectorUp"].value = params.projector_up
+                    program["u_projectorForward"].value = params.projector_forward
+                    program["u_projectorSize"].value = params.projector_size
+                    program["u_intensity"].value = float(params.intensity)
+                    program["u_flipGreen"].value = 1.0 if params.flip_green else 0.0
+                    program["u_falloff"].value = float(params.falloff)
+                    self.decal_project_vao.render(moderngl.TRIANGLES)
+                continue
             wrapped = self._wrapped_decal_vao(params.surface_face)
             for name, value in params.as_uniforms().items():
                 self.decal_program[name].value = value
@@ -1668,25 +1880,32 @@ class MeshMapApp(mglw.WindowConfig):
         cached = self._decal_wrap_cache.get(int(face))
         if cached is not None:
             return cached[1]
-        vertices, faces, uvs = self._pick_geometry
-        data, layout = wrapped_vertices(
-            vertices, faces, uvs, int(face), return_layout=True
-        )
-        if len(data) == 0:
+        if int(face) in self._decal_wrap_futures:
             return None
+        vertices, faces, uvs = self._pick_geometry
+        future = self._decal_library_executor.submit(
+            wrapped_vertices, vertices, faces, uvs, int(face), return_layout=True
+        )
+        self._decal_wrap_futures[int(face)] = (self._vao_token, future)
+        return None
+
+    def _store_wrapped_decal(self, face: int, data, layout) -> None:
+        """Create render-thread GL resources from a prepared surface chart."""
+        if len(data) == 0:
+            self._decal_wrap_cache[int(face)] = (None, None, layout)
+            return
         blocks = data.reshape(-1, 3, data.shape[1])
         seam_faces = np.max(np.abs(blocks[:, :, :2] - blocks[:, :, 2:4]), axis=(1, 2)) > 1e-5
         data = np.ascontiguousarray(blocks[seam_faces].reshape(-1, data.shape[1]))
         if len(data) == 0:
             self._decal_wrap_cache[int(face)] = (None, None, layout)
-            return None
+            return
         vbo = self.ctx.buffer(data.tobytes())
         vao = self.ctx.vertex_array(
             self.decal_wrap_program,
             [(vbo, "2f 2f 4f", "in_atlas_uv", "in_surface_uv", "in_slope_transform")],
         )
         self._decal_wrap_cache[int(face)] = (vbo, vao, layout)
-        return vao
 
     def _surface_uv_on_wrap(
         self, anchor_face: int, target_face: int, uv: tuple[float, float]
@@ -1716,8 +1935,14 @@ class MeshMapApp(mglw.WindowConfig):
         Read back off the GPU rather than recomputed, so the PNG is exactly the
         pixels the viewport is showing.
         """
-        self._sync_texture()
-        return self.compositor.read()
+        self._full_texture_render_requested = True
+        try:
+            self._texture_dirty = True
+            self._sync_texture()
+            return self.compositor.read()
+        finally:
+            self._full_texture_render_requested = False
+            self._texture_dirty = True
 
     def read_normal_map(self) -> Optional[np.ndarray]:
         """The composited normal map as an (n, n, 3) array, or None if flat.
@@ -1727,12 +1952,18 @@ class MeshMapApp(mglw.WindowConfig):
         """
         if not self.any_decal_active() or self.normal_fbo is None:
             return None
-        if self._normal_dirty:
-            self._run_decal()
-        resolution = self._normal_resolution
-        return np.frombuffer(
-            self.normal_fbo.read(components=3, dtype="f4"), dtype="f4"
-        ).reshape(resolution, resolution, 3)
+        self._full_decal_render_requested = True
+        try:
+            if self._normal_resolution != self._decal_render_resolution():
+                self._normal_dirty = True
+            if self._normal_dirty:
+                self._run_decal()
+            resolution = self._normal_resolution
+            return np.frombuffer(
+                self.normal_fbo.read(components=3, dtype="f4"), dtype="f4"
+            ).reshape(resolution, resolution, 3)
+        finally:
+            self._full_decal_render_requested = False
 
     # -- GL resources -----------------------------------------------------
 
@@ -1756,11 +1987,20 @@ class MeshMapApp(mglw.WindowConfig):
             index_buffer=ibo,
             index_element_size=4,
         )
+        self.decal_project_vao = self.ctx.vertex_array(
+            self.decal_project_program,
+            [(vbo, "3f 3f 2f", "in_position", "in_normal", "in_uv")],
+            index_buffer=ibo,
+            index_element_size=4,
+        )
 
     def _release_mesh_vao(self) -> None:
         if self.mesh_vao is not None:
             self.mesh_vao.release()
             self.mesh_vao = None
+        if self.decal_project_vao is not None:
+            self.decal_project_vao.release()
+            self.decal_project_vao = None
         for buffer in self._mesh_buffers:
             buffer.release()
         self._mesh_buffers = []
@@ -1770,6 +2010,9 @@ class MeshMapApp(mglw.WindowConfig):
             if buffer is not None:
                 buffer.release()
         self._decal_wrap_cache.clear()
+        for _, future in self._decal_wrap_futures.values():
+            future.cancel()
+        self._decal_wrap_futures.clear()
 
     def _ensure_textures(self, resolution: int) -> None:
         if self._texture_resolution == resolution:
@@ -1884,8 +2127,22 @@ class MeshMapApp(mglw.WindowConfig):
         something already glued to the pointer says nothing anyway.
         """
         params = self.selected_decal
-        if params is None or self._pick_geometry is None or self.decal_placing:
+        if (params is None or self._pick_geometry is None or self.decal_placing
+                or self._decal_transform_mode is not None):
             return None
+
+        if params.projector_center is not None:
+            center = np.asarray(params.projector_center, dtype=np.float64)
+            right = np.asarray(params.projector_right, dtype=np.float64)
+            up = np.asarray(params.projector_up, dtype=np.float64)
+            width, height = params.projector_size
+            corners = [
+                center - right * width * 0.5 - up * height * 0.5,
+                center + right * width * 0.5 - up * height * 0.5,
+                center + right * width * 0.5 + up * height * 0.5,
+                center - right * width * 0.5 + up * height * 0.5,
+            ]
+            return np.asarray(corners + [corners[0]])
 
         key = (params.key(), self._vao_token)
         if key != self._outline_key:
@@ -2024,16 +2281,19 @@ class MeshMapApp(mglw.WindowConfig):
         if self.tex_curvature is None or self.tex_position is None:
             return  # the masks read the bake; nothing to stand on yet
 
+        render_resolution = int(self._texture_resolution)
+        if not self._full_texture_render_requested:
+            render_resolution = min(render_resolution, DECAL_INTERACTIVE_RESOLUTION)
         key = (
             texture_key(self.texture),
-            self._texture_resolution,
+            render_resolution,
             self._uploaded_maps_version,
         )
         if not self._texture_dirty and key == self._composited_key:
             return
 
         self.compositor.render(
-            self.texture, self._texture_resolution,
+            self.texture, render_resolution,
             self.tex_curvature, self.tex_position,
         )
         self._composited_key = key
@@ -2244,6 +2504,20 @@ class MeshMapApp(mglw.WindowConfig):
         self.preview_program["u_eye"].value = (eye.x, eye.y, eye.z)
         self.preview_program["u_checkerScale"].value = self.checker_scale
 
+        projector = self._live_decal_projector
+        live_texture = None if projector is None else self.decal_textures.get(projector["path"])
+        live = projector is not None and live_texture is not None
+        self.preview_program["u_useLiveDecal"].value = 1.0 if live else 0.0
+        if live:
+            live_texture.use(3)
+            self.preview_program["u_projectorCenter"].value = projector["center"]
+            self.preview_program["u_projectorRight"].value = projector["right"]
+            self.preview_program["u_projectorUp"].value = projector["up"]
+            self.preview_program["u_projectorForward"].value = projector["forward"]
+            self.preview_program["u_projectorSize"].value = projector["size"]
+            self.preview_program["u_projectorIntensity"].value = projector["intensity"]
+            self.preview_program["u_projectorFlipGreen"].value = projector["flip_green"]
+
         # Anchored to the model, not to the camera: orbiting moves your view of
         # the lighting rather than the lighting itself, which is the only way
         # "put the light over there" can mean anything.
@@ -2261,6 +2535,8 @@ class MeshMapApp(mglw.WindowConfig):
         self._drain_scroll()
         self.controller.pump()
         self._sync_bake_outputs()
+        self._pump_decal_images()
+        self._pump_decal_wraps()
 
         self._sync_texture()
         self._sync_decal()
@@ -2500,8 +2776,18 @@ class MeshMapApp(mglw.WindowConfig):
         index = None
         if hit is not None:
             uv, face = hit
+            world_hit = self.world_surface_hit_at(mouse)
             for candidate in range(len(self.decals) - 1, -1, -1):
                 params = self.decals[candidate]
+                if params.projector_center is not None and world_hit is not None:
+                    offset = world_hit[0] - np.asarray(params.projector_center)
+                    local_x = float(np.dot(offset, params.projector_right))
+                    local_y = float(np.dot(offset, params.projector_up))
+                    width, height = params.projector_size
+                    if abs(local_x) <= width * 0.5 and abs(local_y) <= height * 0.5:
+                        index = candidate
+                        break
+                    continue
                 point = uv
                 if params.surface_face >= 0:
                     point = self._surface_uv_on_wrap(params.surface_face, face, uv)
@@ -2523,33 +2809,108 @@ class MeshMapApp(mglw.WindowConfig):
         if self.dragging_decal == path:
             return
         self.dragging_decal = path
+        self.request_decal_image(path)
         self._clear_dragged_decal_preview()
 
+    def _set_live_decal_projector(
+        self, image: DecalImage, point, params: DecalParams,
+        face: Optional[int] = None,
+    ) -> None:
+        """Describe a projector tangent to the surface under its centre."""
+        existing = self._live_decal_projector
+        preserve_axes = (
+            face is None
+            and
+            self._decal_transform_mode is not None
+            and existing is not None
+            and existing["path"] == image.path
+        )
+        if face is not None and self._pick_geometry is not None:
+            vertices, faces, _ = self._pick_geometry
+            triangle = vertices[faces[int(face)]]
+            normal = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
+            normal /= max(float(np.linalg.norm(normal)), 1e-12)
+            camera_right, camera_up, _ = self.camera._axes()
+            right_hint = np.asarray(
+                (float(camera_right.x), float(camera_right.y), float(camera_right.z))
+            )
+            tangent = right_hint - normal * float(np.dot(right_hint, normal))
+            if np.linalg.norm(tangent) < 1e-8:
+                up_hint = np.asarray(
+                    (float(camera_up.x), float(camera_up.y), float(camera_up.z))
+                )
+                tangent = up_hint - normal * float(np.dot(up_hint, normal))
+            tangent /= max(float(np.linalg.norm(tangent)), 1e-12)
+            bitangent = np.cross(normal, tangent)
+            angle = math.radians(float(params.rotation))
+            cosine, sine = math.cos(angle), math.sin(angle)
+            rotated_right = tangent * cosine + bitangent * sine
+            rotated_up = bitangent * cosine - tangent * sine
+            projected_right = tuple(float(value) for value in rotated_right)
+            projected_up = tuple(float(value) for value in rotated_up)
+            projected_forward = tuple(float(value) for value in normal)
+        elif preserve_axes:
+            projected_right = tuple(existing["right"])
+            projected_up = tuple(existing["up"])
+            projected_forward = tuple(existing["forward"])
+        else:
+            right, up, forward = self.camera._axes()
+            angle = math.radians(float(params.rotation))
+            cosine, sine = math.cos(angle), math.sin(angle)
+            rotated_right = right * cosine + up * sine
+            rotated_up = up * cosine - right * sine
+            projected_right = (
+                float(rotated_right.x), float(rotated_right.y), float(rotated_right.z)
+            )
+            projected_up = (
+                float(rotated_up.x), float(rotated_up.y), float(rotated_up.z)
+            )
+            projected_forward = (float(forward.x), float(forward.y), float(forward.z))
+        base = max((self.mesh_info.scale if self.mesh_info else 1.0) * params.scale, 1e-6)
+        self._live_decal_projector = {
+            "path": image.path,
+            "center": tuple(float(value) for value in point),
+            "right": projected_right,
+            "up": projected_up,
+            "forward": projected_forward,
+            "size": (
+                base * max(params.scale_x, 1e-6),
+                base * max(params.scale_y, 1e-6) / max(image.aspect, 1e-6),
+            ),
+            "intensity": float(params.intensity),
+            "flip_green": 1.0 if params.flip_green else 0.0,
+        }
+
+    @staticmethod
+    def _commit_live_projector(params: DecalParams, projector: dict) -> None:
+        """Persist exactly the transform that the interactive shader displayed."""
+        params.projector_center = tuple(projector["center"])
+        params.projector_right = tuple(projector["right"])
+        params.projector_up = tuple(projector["up"])
+        params.projector_forward = tuple(projector["forward"])
+        params.projector_size = tuple(projector["size"])
+
     def _update_dragged_decal_preview(self) -> bool:
-        """Render the shelf decal at the surface currently under the cursor."""
+        """Move the view-aligned GPU projector to the cursor's surface hit."""
         if self.dragging_decal is None:
             return False
-        hit = self.surface_hit_at(self._mouse)
+        hit = self.world_surface_hit_at(self._mouse)
         if hit is None:
             self._clear_dragged_decal_preview()
             return False
 
-        uv, face = hit
-        image = self.load_decal_image(self.dragging_decal)
+        image = self.decal_images.get(str(self.dragging_decal))
         if image is None:
             self._clear_dragged_decal_preview()
             return False
-        preview = self.dragging_decal_preview
-        if preview is None or preview.path != image.path:
-            preview = DecalParams(path=image.path, image_aspect=image.aspect)
-            self.dragging_decal_preview = preview
-        preview.center_u, preview.center_v = uv
-        preview.surface_face = int(face)
-        preview.surface_aspect = self.measure_uv_aspect(face)
-        self.mark_normal_dirty()
+        point, face = hit
+        self._set_live_decal_projector(
+            image, point, DecalParams(path=image.path, image_aspect=image.aspect), face
+        )
         return True
 
     def _clear_dragged_decal_preview(self) -> None:
+        self._live_decal_projector = None
         if self.dragging_decal_preview is not None:
             self.dragging_decal_preview = None
             self.mark_normal_dirty()
@@ -2561,7 +2922,7 @@ class MeshMapApp(mglw.WindowConfig):
         the mesh the projected normal-map preview is more useful; over the
         sidebar the library thumbnail already shows what the hand is holding.
         """
-        if self.dragging_decal is None or self.dragging_decal_preview is not None:
+        if self.dragging_decal is None or self._live_decal_projector is not None:
             return None
 
         ratio = float(self.wnd.pixel_ratio)
@@ -2575,10 +2936,10 @@ class MeshMapApp(mglw.WindowConfig):
         if not (left <= mouse_x <= right and top <= mouse_y <= bottom):
             return None
 
-        image = self.load_decal_image(self.dragging_decal)
-        if image is None:
+        size = self.decal_thumbnail_sizes.get(str(self.dragging_decal))
+        if size is None:
             return None
-        width, height = image.size
+        width, height = size
         longest = 72.0 * self.ui_pixel_scale / ratio
         if width >= height:
             thumb_width = longest
@@ -2597,8 +2958,7 @@ class MeshMapApp(mglw.WindowConfig):
         rect = self.dragged_decal_cursor_rect()
         if rect is None or self.dragging_decal is None:
             return
-        image = self.load_decal_image(self.dragging_decal)
-        texture = None if image is None else self.decal_textures.get(image.path)
+        texture = self.decal_thumbnail_textures.get(str(self.dragging_decal))
         if texture is None:
             return
 
@@ -2634,12 +2994,21 @@ class MeshMapApp(mglw.WindowConfig):
             return False
 
         hit = self.surface_hit_at(self._mouse)
+        projector = self._live_decal_projector
         self._clear_dragged_decal_preview()
         if hit is None:
             self.set_status("Dropped nowhere - drag a decal onto the model")
             return False
         uv, face = hit
-        self.add_decal(path, center=uv, face=face)
+        if str(path) not in self.decal_images:
+            self.request_decal_image(path)
+            self._pending_decal_drop = (path, uv, face)
+            self.set_status(f"Loading {path.name}...")
+        else:
+            index = self.add_decal(path, center=uv, face=face)
+            if index is not None and projector is not None:
+                self._commit_live_projector(self.decals[index], projector)
+                self.mark_normal_dirty()
         return True
 
     def on_mouse_drag_event(self, x: int, y: int, dx: int, dy: int) -> None:
@@ -2874,6 +3243,7 @@ class MeshMapApp(mglw.WindowConfig):
         return float(rect_x + rect_width) - reach - margin, top + margin + reach
 
     def on_close(self) -> None:
+        self._decal_library_executor.shutdown(wait=False, cancel_futures=True)
         self.controller.release()
 
     # -- actions used by the panel ----------------------------------------

@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.decal import decal_at_uv, library, outline_uvs  # noqa: E402
+from core.decal_thumbnail import load_thumbnail, thumbnail_cache_key  # noqa: E402
 from core.params import DecalParams  # noqa: E402
 
 FLAT = np.array([0.5, 0.5, 1.0], dtype=np.float32)
@@ -103,6 +104,25 @@ def test_the_app_offers_that_shelf(app):
     assert [path.name for path in app.decal_library] == [
         path.name for path in library(METADATA.decals)
     ]
+
+
+def test_library_thumbnails_are_small_and_persisted(tmp_path):
+    source = write_decal(tmp_path / "large.png", size=(600, 300))
+    cache = tmp_path / "cache"
+
+    thumbnail = load_thumbnail(source, cache)
+
+    assert thumbnail.size == (256, 128)
+    assert len(list(cache.glob("*.png"))) == 1
+
+
+def test_thumbnail_cache_key_changes_with_the_source(tmp_path):
+    source = write_decal(tmp_path / "changing.png")
+    before = thumbnail_cache_key(source)
+
+    write_decal(source, size=(48, 32))
+
+    assert thumbnail_cache_key(source) != before
 
 
 # --------------------------------------------------------------------------
