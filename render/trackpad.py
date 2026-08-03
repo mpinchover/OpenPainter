@@ -23,6 +23,7 @@ AppKit calling freed memory the next time a finger touched the trackpad.
 from __future__ import annotations
 
 import sys
+import time
 import traceback
 from typing import Callable, Optional
 
@@ -33,7 +34,10 @@ from core.action_log import log_action
 #: ObjCInstance wrappers while the actual AppKit view remains the same.
 _handlers: dict[int, Callable[[float], None]] = {}
 _recognizers: dict[int, object] = {}
+_last_dispatch: dict[int, tuple[float, float]] = {}
 _installed = False
+_DUPLICATE_WINDOW_SECONDS = 0.006
+_DUPLICATE_MAGNIFICATION_EPS = 1e-5
 
 
 def _pointer_key(value: object) -> int:
@@ -43,19 +47,35 @@ def _pointer_key(value: object) -> int:
     return int(raw)
 
 
-def _dispatch_pinch(view: object, magnification: float) -> bool:
+def _dispatch_pinch(
+    view: object, magnification: float, *, source: str = "unknown"
+) -> bool:
     """Deliver one native event without depending on pyglet wrapper identity."""
     key = _pointer_key(view)
     handler = _handlers.get(key)
+    magnification = float(magnification)
+    now = time.monotonic()
+    last = _last_dispatch.get(key)
+    duplicate = bool(
+        handler is not None
+        and last is not None
+        and now - last[0] <= _DUPLICATE_WINDOW_SECONDS
+        and abs(magnification - last[1]) <= _DUPLICATE_MAGNIFICATION_EPS
+    )
     log_action(
         "native_magnify",
         view_pointer=key,
         handler_found=handler is not None,
-        magnification=float(magnification),
+        magnification=magnification,
+        source=source,
+        duplicate=duplicate,
     )
     if handler is None:
         return False
-    handler(float(magnification))
+    if duplicate:
+        return True
+    _last_dispatch[key] = (now, magnification)
+    handler(magnification)
     return True
 
 
@@ -127,13 +147,12 @@ def _install_selectors() -> bool:
     def magnify(objc_self, objc_cmd, nsevent) -> None:
         """``- (void)magnifyWithEvent:(NSEvent *)event``, encoded ``v@:@``."""
         try:
-            # An attached recognizer receives this same native gesture and is
-            # the authoritative path. Avoid applying one pinch twice if AppKit
-            # also forwards the underlying event to the responder method.
-            if _pointer_key(objc_self) in _recognizers:
-                return
+            # The explicit recognizer is normally the path that fires, but macOS
+            # can detach or silence recognizers across focus/view lifecycle
+            # transitions. Let the view's native event path remain a fallback;
+            # _dispatch_pinch collapses the duplicate if both paths fire.
             magnitude = float(cocoapy.ObjCInstance(nsevent).magnification())
-            _dispatch_pinch(objc_self, magnitude)
+            _dispatch_pinch(objc_self, magnitude, source="event")
         except Exception:
             # An exception must never unwind into Objective-C: there is no
             # Python frame to catch it and the process dies mid-gesture.
@@ -148,7 +167,7 @@ def _install_selectors() -> bool:
             # gesture began. Reset it after every action so the application
             # receives the incremental values its zoom queue expects.
             recognizer.setMagnification_(0.0)
-            _dispatch_pinch(objc_self, magnitude)
+            _dispatch_pinch(objc_self, magnitude, source="recognizer")
         except Exception:
             traceback.print_exc()
 
@@ -170,7 +189,17 @@ def _install_recognizer(view: object) -> bool:
     """Attach a native pinch recognizer to one concrete Pyglet NSView."""
     key = _pointer_key(view)
     if key in _recognizers:
-        return True
+        recognizer = _recognizers[key]
+        _enable_recognizer(recognizer)
+        if _recognizer_attached(view, recognizer):
+            return True
+        try:
+            view.addGestureRecognizer_(recognizer)
+            log_action("pinch_recognizer_reattached", view_pointer=key)
+            return True
+        except Exception:
+            _recognizers.pop(key, None)
+            log_action("pinch_recognizer_reattach_failed", view_pointer=key)
     try:
         from pyglet.libs.darwin import cocoapy
 
@@ -181,6 +210,7 @@ def _install_recognizer(view: object) -> bool:
                 view, cocoapy.get_selector("meshMapMagnify:")
             )
         )
+        _enable_recognizer(recognizer)
         view.addGestureRecognizer_(recognizer)
         # NSView retains it; keeping the wrapper as well prevents cocoapy from
         # losing the Python-side object while the native recognizer is active.
@@ -189,3 +219,26 @@ def _install_recognizer(view: object) -> bool:
     except Exception:
         traceback.print_exc()
         return False
+
+
+def _enable_recognizer(recognizer: object) -> None:
+    try:
+        recognizer.setEnabled_(True)
+    except Exception:
+        pass
+
+
+def _recognizer_attached(view: object, recognizer: object) -> bool:
+    try:
+        recognizers = view.gestureRecognizers()
+        if recognizers is None:
+            return False
+        recognizer_key = _pointer_key(recognizer)
+        for index in range(int(recognizers.count())):
+            if _pointer_key(recognizers.objectAtIndex_(index)) == recognizer_key:
+                return True
+        return False
+    except Exception:
+        # Older pyglet/cocoapy combinations can fail to expose the array cleanly.
+        # In that case, do not risk adding duplicate native recognizers.
+        return True

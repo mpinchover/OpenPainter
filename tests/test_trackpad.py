@@ -184,6 +184,54 @@ def test_native_view_pointer_survives_wrapper_replacement():
     assert delivered == [0.25]
 
 
+def test_duplicate_native_paths_are_collapsed(monkeypatch):
+    """A direct event and a recognizer callback for the same native event count once."""
+
+    class Pointer:
+        value = 654321
+
+    class Wrapper:
+        ptr = Pointer()
+
+    delivered: list[float] = []
+    times = iter((100.0, 100.001, 100.02))
+    monkeypatch.setattr(trackpad.time, "monotonic", lambda: next(times))
+    trackpad._handlers[654321] = delivered.append
+    try:
+        assert trackpad._dispatch_pinch(Wrapper(), 0.25, source="event")
+        assert trackpad._dispatch_pinch(Wrapper(), 0.25, source="recognizer")
+        assert trackpad._dispatch_pinch(Wrapper(), 0.25, source="recognizer")
+    finally:
+        trackpad._handlers.pop(654321, None)
+        trackpad._last_dispatch.pop(654321, None)
+
+    assert delivered == [0.25, 0.25]
+
+
+def test_window_activation_rearms_pinch_bridge(monkeypatch):
+    """Focus changes can detach native gesture plumbing, so activation re-installs it."""
+
+    app = type("FakeApp", (), {})()
+    app._window_active = False
+    app._window_activated_at = float("-inf")
+    app.wnd = object()
+    app.pinch_zoom = False
+    app.on_pinch_zoom = lambda magnitude: None
+    app._trace_action = lambda *args, **kwargs: None
+    calls = []
+
+    def install(window, handler):
+        calls.append((window, handler))
+        return True
+
+    monkeypatch.setattr("render.viewport.install_pinch_zoom", install)
+
+    MeshMapApp._on_window_activate(app)
+
+    assert calls == [(app.wnd, app.on_pinch_zoom)]
+    assert app.pinch_zoom is True
+
+
 @macos_only
 def test_pyglet_view_gains_the_gesture_selector(pyglet_view):
     from pyglet.libs.darwin import cocoapy
@@ -231,6 +279,39 @@ def test_a_gesture_event_reaches_the_registered_handler(pyglet_view):
         view.magnifyWithEvent_(event)
     finally:
         del trackpad._handlers[view_key]
+
+    assert delivered == [0.25]
+
+
+@macos_only
+def test_direct_gesture_event_survives_stale_recognizer_cache(pyglet_view):
+    """A cached recognizer must not suppress the direct AppKit magnify fallback."""
+    from pyglet.libs.darwin import cocoapy
+
+    assert trackpad._install_selectors()
+
+    fake_event_class = cocoapy.ObjCSubclass(
+        "NSObject", "MeshMapTestStaleRecognizerMagnifyEvent"
+    )
+
+    @fake_event_class.method(b"d")
+    def magnification(self) -> float:
+        return 0.25
+
+    event = cocoapy.ObjCClass("MeshMapTestStaleRecognizerMagnifyEvent").alloc().init()
+    view = cocoapy.ObjCClass("PygletView").alloc().init()
+    view.retain()
+
+    delivered: list[float] = []
+    view_key = trackpad._pointer_key(view)
+    trackpad._handlers[view_key] = delivered.append
+    trackpad._recognizers[view_key] = object()
+    try:
+        view.magnifyWithEvent_(event)
+    finally:
+        trackpad._handlers.pop(view_key, None)
+        trackpad._recognizers.pop(view_key, None)
+        trackpad._last_dispatch.pop(view_key, None)
 
     assert delivered == [0.25]
 

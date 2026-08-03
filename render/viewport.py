@@ -716,6 +716,7 @@ class MeshMapApp(mglw.WindowConfig):
 
         imgui.create_context()
         imgui.get_io().set_ini_filename(str(_settings_dir() / "layout.ini"))
+        panel.apply_theme()
         self.gui = ImGuiRenderer(self.wnd)
 
         self.controller = BakeController(self.ctx)
@@ -3654,6 +3655,8 @@ class MeshMapApp(mglw.WindowConfig):
         if not self._window_active:
             self._window_activated_at = time.monotonic()
         self._window_active = True
+        if install_pinch_zoom(self.wnd, self.on_pinch_zoom):
+            self.pinch_zoom = True
         self._trace_action("window_activate")
 
     def _on_window_deactivate(self) -> None:

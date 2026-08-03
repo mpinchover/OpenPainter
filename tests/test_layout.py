@@ -479,3 +479,59 @@ def test_the_shaded_and_normals_modes_are_the_whole_list():
     from render.viewport import PREVIEW_MODES
 
     assert [mode.label for mode in PREVIEW_MODES] == ["Shaded", "Normals"]
+
+
+def test_color_input_tooltip_waits_for_a_quiet_second(monkeypatch):
+    from ui import panel
+
+    clock = [10.0]
+    shown: list[str] = []
+    monkeypatch.setattr(panel.imgui, "get_item_id", lambda: 71)
+    monkeypatch.setattr(panel.imgui, "get_time", lambda: clock[0])
+    monkeypatch.setattr(panel.imgui, "is_item_hovered", lambda _flags: True)
+    monkeypatch.setattr(panel.imgui, "is_item_active", lambda: False)
+    monkeypatch.setattr(panel.imgui, "is_mouse_dragging", lambda _button: False)
+    monkeypatch.setattr(panel.imgui, "set_item_tooltip", shown.append)
+    panel._input_tooltip_item = None
+
+    panel._delayed_input_tooltip("help")
+    clock[0] = 10.99
+    panel._delayed_input_tooltip("help")
+    assert shown == []
+
+    clock[0] = 11.0
+    panel._delayed_input_tooltip("help")
+    assert shown == ["help"]
+
+    # Updating the field cancels the visible tooltip and restarts its delay.
+    clock[0] = 11.1
+    panel._delayed_input_tooltip("help", changed=True)
+    clock[0] = 12.0
+    panel._delayed_input_tooltip("help")
+    assert shown == ["help"]
+
+
+def test_inline_color_value_editor_survives_its_activation_frame(monkeypatch):
+    """The preceding slider deactivates as it becomes an input with the same ID."""
+    from ui import panel
+
+    focused: list[bool] = []
+    monkeypatch.setattr(panel.imgui, "get_id", lambda _label: 91)
+    monkeypatch.setattr(panel.imgui, "set_keyboard_focus_here", lambda: focused.append(True))
+    monkeypatch.setattr(
+        panel.imgui, "input_float",
+        lambda *_args, **_kwargs: (False, 0.5),
+    )
+    monkeypatch.setattr(panel.imgui, "is_item_deactivated", lambda: True)
+    panel._filled_slider_edit_item = 91
+    panel._filled_slider_edit_opened = True
+
+    panel._filled_slider_float("Metallic", 0.5, 0.0, 1.0)
+
+    assert focused == [True]
+    assert panel._filled_slider_edit_item == 91, "typing must be possible next frame"
+    assert not panel._filled_slider_edit_opened
+
+    # A later deactivation really is clicking away and should end the editor.
+    panel._filled_slider_float("Metallic", 0.5, 0.0, 1.0)
+    assert panel._filled_slider_edit_item is None
