@@ -33,7 +33,7 @@ from core.layers import (
     set_slot,
     walk,
 )
-from core.params import BAKE_AXES, RESOLUTIONS
+from core.params import BAKE_AXES, RESOLUTIONS, DecalArrayModifier
 
 if TYPE_CHECKING:  # pragma: no cover
     from render.viewport import MeshMapApp
@@ -284,7 +284,22 @@ def _draw_sidebar_icon(kind: int, selected: bool, size: float) -> bool:
         draw.add_line(bottom, left, color, thickness)
         draw.add_line(left, top, color, thickness)
         draw.add_circle_filled(imgui.ImVec2(cx, cy), radius * 0.18, color, 10)
-    elif kind == 3:  # Library: a shelf of four assets.
+    elif kind == 3:  # Mesh: a small wireframe cube.
+        inset = radius * 0.34
+        front_min = imgui.ImVec2(cx - radius, cy - radius * 0.58)
+        front_max = imgui.ImVec2(cx + radius * 0.48, cy + radius)
+        back_min = imgui.ImVec2(front_min.x + inset, front_min.y - inset)
+        back_max = imgui.ImVec2(front_max.x + inset, front_max.y - inset)
+        draw.add_rect(front_min, front_max, color, 1.0, thickness=thickness)
+        draw.add_rect(back_min, back_max, color, 1.0, thickness=thickness)
+        for first, second in (
+            (front_min, back_min),
+            (imgui.ImVec2(front_max.x, front_min.y),
+             imgui.ImVec2(back_max.x, back_min.y)),
+            (front_max, back_max),
+        ):
+            draw.add_line(first, second, color, thickness)
+    elif kind == 4:  # Library: a shelf of four assets.
         cell = radius * 0.72
         gap = radius * 0.20
         for row in (-1, 1):
@@ -296,6 +311,24 @@ def _draw_sidebar_icon(kind: int, selected: bool, size: float) -> bool:
                     imgui.ImVec2(cell_cx + cell * 0.5, cell_cy + cell * 0.5),
                     color, 1.5, thickness=thickness,
                 )
+    elif kind == 5:  # Console: a small command prompt.
+        draw.add_rect(
+            imgui.ImVec2(cx - radius, cy - radius * 0.78),
+            imgui.ImVec2(cx + radius, cy + radius * 0.78),
+            color, 2.0, thickness=thickness,
+        )
+        draw.add_line(
+            imgui.ImVec2(cx - radius * 0.58, cy - radius * 0.30),
+            imgui.ImVec2(cx - radius * 0.12, cy), color, thickness,
+        )
+        draw.add_line(
+            imgui.ImVec2(cx - radius * 0.12, cy),
+            imgui.ImVec2(cx - radius * 0.58, cy + radius * 0.30), color, thickness,
+        )
+        draw.add_line(
+            imgui.ImVec2(cx + radius * 0.02, cy + radius * 0.32),
+            imgui.ImVec2(cx + radius * 0.58, cy + radius * 0.32), color, thickness,
+        )
     else:  # Settings: sliders.
         for offset, knob in ((-0.55, -0.35), (0.0, 0.42), (0.55, -0.05)):
             y = cy + radius * offset
@@ -328,12 +361,14 @@ def _draw_parameters(app: "MeshMapApp") -> None:
 
     rail_width = SIDEBAR_ICON_RAIL * scale
     button_size = 34 * scale
-    labels = ("Bake", "Material", "Decal", "Library", "Settings")
+    labels = ("Bake", "Material", "Decal", "Mesh", "Library", "Console", "Settings")
     drawers = (
         _draw_bake_tab,
         _draw_texture_tab,
         _draw_decal_tab,
+        _draw_mesh_tab,
         _draw_decal_library_tab,
+        _draw_console_tab,
         _draw_settings_tab,
     )
     app.sidebar_view = max(0, min(int(getattr(app, "sidebar_view", 0)), len(labels) - 1))
@@ -383,8 +418,8 @@ def _draw_bake_tab(app: "MeshMapApp") -> None:
             f"  (diagonal {info.scale:.3g})\n"
             f"UV map: {'yes' if info.has_uvs else 'none'}",
         )
-        for note in info.notes:
-            imgui.text_colored(WARN_COLOR, f"! {note}")
+        for index, note in enumerate(info.notes):
+            app.console_log("WARNING", note, key=f"mesh_note_{index}")
     else:
         imgui.text_colored(MUTED_COLOR, "No mesh loaded.")
 
@@ -464,18 +499,17 @@ def _draw_bake_tab(app: "MeshMapApp") -> None:
         "a flat surface are left alone. 30 degrees is Blender's usual choice."
     )
 
-    # A bevel narrower than a texel falls between samples and bakes nothing, so
-    # say how wide this one lands rather than let it silently do nothing.
+    # A sub-texel bevel is useful diagnostic information, but it should not
+    # interrupt the normal inspector. Send it to Console instead.
     if info is not None and info.uv_density > 0.0:
         texels = bevel.amount * info.uv_density * bake.resolution
         if texels < 2.0:
-            imgui.text_colored(
-                WARN_COLOR,
-                f"! {texels:.1f} texels wide - too thin to bake, raise Amount "
-                f"or the resolution",
+            app.console_log(
+                "WARNING",
+                f"Bevel is {texels:.1f} texels wide - too thin to bake; "
+                "raise Amount or the resolution.",
+                key="bevel_too_thin",
             )
-        else:
-            imgui.text_colored(MUTED_COLOR, f"{texels:.1f} texels wide in the atlas")
     imgui.end_disabled()
 
     if imgui.collapsing_header("Advanced bake settings"):
@@ -586,7 +620,7 @@ def _draw_splitter(
     is discoverable without a tooltip nobody reads mid-drag.
     """
     setter = setter or app.set_texture_split
-    share = app.texture_split if name == "texture" else app.decal_split
+    share = getattr(app, f"{name}_split")
     imgui.invisible_button(f"##{name}_split", imgui.ImVec2(-1, height))
 
     hovered = imgui.is_item_hovered()
@@ -627,19 +661,14 @@ def filter_textures(textures, needle: str) -> list[tuple[int, str]]:
 
 
 def _draw_texture_warnings(app: "MeshMapApp") -> None:
-    """Why the model might not look like the texture says it should.
-
-    Above the tree rather than below it: a texture that renders black because
-    its mask found nothing is exactly when the panel needs to be read, and the
-    tree scrolls.
-    """
+    """Send material diagnostics to Console without cluttering the inspector."""
     if depth(app.texture) >= MAX_DEPTH:
-        imgui.text_colored(WARN_COLOR, f"! Nesting stops at {MAX_DEPTH} levels.")
+        message = f"Nesting stops at {MAX_DEPTH} levels."
+        app.console_log("WARNING", message, key="material_max_depth")
 
     if app.controller.curvature_map is None:
-        imgui.text_colored(
-            WARN_COLOR, "! Bake first - the masks read the curvature and positions."
-        )
+        message = "Bake first - material masks read curvature and position maps."
+        app.console_log("WARNING", message, key="material_needs_bake")
     elif app.texture_is_flat and mask_count(app.texture) > 0:
         # Every texel landing on the same side of the mask paints the whole
         # model in one colour, which reads as broken rather than as empty.
@@ -652,11 +681,8 @@ def _draw_texture_warnings(app: "MeshMapApp") -> None:
             "  wear needs a rounded edge to grip." if wears else
             "  Lower its Threshold, or raise Contrast."
         )
-        imgui.text_colored(
-            WARN_COLOR,
-            "! One flat colour: every texel lands on\n"
-            "  the same side of its mask.\n" + remedy,
-        )
+        message = "One flat colour: every texel lands on the same side of its mask."
+        app.console_log("WARNING", message + remedy.replace("\n", " "), key="material_flat")
 
 
 def _draw_texture_picker(app: "MeshMapApp") -> None:
@@ -752,7 +778,7 @@ def _draw_slot_params(app: "MeshMapApp") -> None:
         if changed:
             slot.color = (float(color[0]), float(color[1]), float(color[2]))
         imgui.same_line()
-        imgui.text(f"Colour  {slot.auto_label}")
+        imgui.text(f"Base color  {slot.auto_label}")
         _tooltip(
             "Click the swatch to open the picker.\n"
             "Click away or press Escape to close it again."
@@ -782,11 +808,17 @@ def _draw_surface_params(app: "MeshMapApp", slot) -> None:
     )
     _, slot.roughness = imgui.slider_float("Roughness", slot.roughness, 0.0, 1.0)
     _tooltip("How wide the highlight spreads: 0 is a mirror, 1 is chalk.")
-    _, slot.alpha = imgui.slider_float("Alpha", slot.alpha, 0.0, 1.0)
+    _, slot.alpha = imgui.slider_float("Opacity", slot.alpha, 0.0, 1.0)
     _tooltip(
-        "Opacity. Below 1 the surface lets what is behind it through.\n"
-        "Shading only -- the export is a PBR set of five, and this is not\n"
-        "one of them."
+        "1 is solid. Below 1 the surface lets what is behind it through.\n"
+        "This replaces the old separate transparency control."
+    )
+    _, slot.ambient_occlusion = imgui.slider_float(
+        "Ambient occlusion", slot.ambient_occlusion, 0.0, 1.0
+    )
+    _tooltip(
+        "Material-authored occlusion. 1 leaves ambient light alone; lower\n"
+        "values darken it. It is multiplied by the baked mesh AO on export."
     )
     _, slot.emission = imgui.slider_float(
         "Emission", slot.emission, 0.0, MAX_EMISSION, "%.2f",
@@ -796,9 +828,121 @@ def _draw_surface_params(app: "MeshMapApp", slot) -> None:
         "Light the surface gives off, in multiples of its own colour. Past 1\n"
         "the surface is brighter than white can show, and the extra turns into\n"
         "the glow spilling past its edge -- which is what carries the difference\n"
-        "between a lit surface and a light. Shading only, like Alpha: the\n"
-        "export is a PBR set of five, and this is not one of them."
+        "between a lit surface and a light."
     )
+
+
+def _generator_slider(
+    params,
+    attribute: str,
+    label: str,
+    minimum: float,
+    maximum: float,
+    fmt: str = "%.3f",
+    flags=0,
+) -> bool:
+    """Generator slider with precise entry and a discoverable default reset."""
+    value = float(getattr(params, attribute))
+    changed, value = imgui.slider_float(label, value, minimum, maximum, fmt, flags)
+    hovered = imgui.is_item_hovered()
+    io = imgui.get_io()
+    reset = hovered and io.key_super and imgui.is_mouse_clicked(0)
+    popup = f"Edit {label}##generator_value"
+
+    if reset:
+        value = float(getattr(type(params)(), attribute))
+        changed = True
+    elif hovered and imgui.is_mouse_double_clicked(0):
+        imgui.open_popup(popup)
+
+    _tooltip(
+        "Double-click to type an exact value.\n"
+        "Cmd-click to restore the default."
+    )
+    if imgui.begin_popup(popup):
+        if imgui.is_window_appearing():
+            imgui.set_keyboard_focus_here()
+        edited, typed = imgui.input_float(
+            "##value", value, 0.0, 0.0, "%.6g",
+            imgui.InputTextFlags_.auto_select_all,
+        )
+        if edited:
+            value = float(min(max(typed, minimum), maximum))
+            changed = True
+        if imgui.is_key_pressed(imgui.Key.enter, False) or imgui.is_key_pressed(
+            imgui.Key.keypad_enter, False
+        ):
+            imgui.close_current_popup()
+        imgui.end_popup()
+
+    if changed:
+        setattr(params, attribute, value)
+    return changed
+
+
+def _draw_generator_params(node) -> bool:
+    """Only the controls that the selected procedural generator consumes."""
+    params = node.noise
+    kind = node.kind
+    dirty = False
+
+    dirty |= _generator_slider(
+        params, "scale", "Scale", 0.5, 80.0, "%.1f",
+        imgui.SliderFlags_.logarithmic,
+    )
+
+    if kind == "scratches":
+        dirty |= _generator_slider(params, "scratch_width", "Scratch width", 0.002, 0.2)
+        dirty |= _generator_slider(params, "scratch_length", "Scratch length", 0.02, 1.0)
+        dirty |= _generator_slider(
+            params, "scratch_irregularity", "Irregularity", 0.0, 1.0
+        )
+    elif kind == "brushed_metal":
+        dirty |= _generator_slider(params, "brush_density", "Line density", 2.0, 120.0, "%.1f")
+        dirty |= _generator_slider(params, "brush_waviness", "Waviness", 0.0, 1.0)
+        dirty |= _generator_slider(params, "brush_variation", "Variation", 0.0, 1.0)
+    elif kind == "cells":
+        dirty |= _generator_slider(params, "cell_jitter", "Cell jitter", 0.0, 1.0)
+        dirty |= _generator_slider(params, "cell_edge", "Cell edge", 0.0, 0.8)
+    elif kind == "directional_streaks":
+        dirty |= _generator_slider(params, "streak_length", "Streak length", 0.1, 30.0, "%.2f")
+        dirty |= _generator_slider(params, "streak_width", "Streak width", 0.01, 1.0)
+        for attribute, label, low, high in (
+            ("detail", "Detail", 0.0, 8.0),
+            ("roughness", "Roughness", 0.0, 1.0),
+            ("lacunarity", "Lacunarity", 1.0, 8.0),
+            ("distortion", "Distortion", 0.0, 2.0),
+        ):
+            dirty |= _generator_slider(params, attribute, label, low, high)
+    elif kind == "brick":
+        dirty |= _generator_slider(params, "brick_aspect", "Brick aspect", 0.25, 6.0)
+        dirty |= _generator_slider(
+            params, "mortar_thickness", "Mortar thickness", 0.001, 0.45
+        )
+    elif kind in ("wood_grain", "marble"):
+        label = "Ring thickness" if kind == "wood_grain" else "Vein thickness"
+        dirty |= _generator_slider(params, "vein_width", label, 0.02, 1.0)
+        dirty |= _generator_slider(params, "detail", "Turbulence detail", 0.0, 8.0)
+        dirty |= _generator_slider(params, "distortion", "Distortion", 0.0, 2.0)
+    elif kind == "gradient":
+        pass
+    else:
+        # Noise, grunge and clouds are all fBM-based, so these controls are
+        # genuinely shared by those three and affect every visible octave.
+        dirty |= _generator_slider(params, "detail", "Detail", 0.0, 8.0)
+        dirty |= _generator_slider(params, "roughness", "Roughness", 0.0, 1.0)
+        dirty |= _generator_slider(params, "lacunarity", "Lacunarity", 1.0, 8.0)
+        dirty |= _generator_slider(params, "distortion", "Distortion", 0.0, 2.0)
+
+    if kind not in ("noise", "grunge", "clouds", "cells", "marble"):
+        dirty |= _generator_slider(params, "rotation", "Rotation", -180.0, 180.0, "%.1f deg")
+    if kind != "gradient":
+        dirty |= _generator_slider(params, "seed", "Seed", 0.0, 100.0, "%.1f")
+
+    imgui.separator_text("Output")
+    dirty |= _generator_slider(params, "bias", "Bias", 0.0, 1.0)
+    dirty |= _generator_slider(params, "contrast", "Contrast", 0.0, 20.0)
+    return dirty
 
 
 def _draw_mask_params(app: "MeshMapApp", node) -> bool:
@@ -811,50 +955,22 @@ def _draw_mask_params(app: "MeshMapApp", node) -> bool:
     dirty = False
 
     imgui.separator_text("Boundary")
-    changed, node.threshold = imgui.slider_float("Threshold", node.threshold, 0.0, 1.0)
-    dirty |= changed
+    dirty |= _generator_slider(node, "threshold", "Threshold", 0.0, 1.0)
     _tooltip(
         "Where the mask divides its two sides. A mask is a continuous field --\n"
         "edge wear ramps up as the surface curves, noise wanders through every\n"
         "value -- and this is the level that decides which side a texel is on.\n"
         "Lower gives white's side more of the surface."
     )
-    changed, node.softness = imgui.slider_float("Softness", node.softness, 0.0, 0.5)
-    dirty |= changed
+    dirty |= _generator_slider(node, "softness", "Softness", 0.0, 0.5)
     _tooltip(
         "How wide the crossing is. 0 is a clean division: every texel belongs\n"
         "to one side or the other. Raise it to blend them across a band."
     )
 
     imgui.separator_text(SLOT_KINDS[node.kind])
-    if node.kind == "noise":
-        noise = node.noise
-        changed, noise.scale = imgui.slider_float(
-            "Scale", noise.scale, 0.5, 80.0, "%.1f", imgui.SliderFlags_.logarithmic
-        )
-        dirty |= changed
-        _tooltip("Cycles across the model's bounding box. Higher is finer.")
-        changed, noise.bias = imgui.slider_float("Bias", noise.bias, 0.0, 1.0)
-        dirty |= changed
-        _tooltip("The noise level that lands on the midpoint. Lower gives more white.")
-        changed, noise.contrast = imgui.slider_float("Contrast", noise.contrast, 0.0, 20.0)
-        dirty |= changed
-        _tooltip("How hard the crossing is. 0 is flat grey, high is a clean edge.")
-
-        imgui.separator_text("Noise detail")
-        changed, noise.detail = imgui.slider_float("Detail", noise.detail, 0.0, 8.0)
-        dirty |= changed
-        _tooltip("fBM octaves.")
-        changed, noise.roughness = imgui.slider_float("Roughness", noise.roughness, 0.0, 1.0)
-        dirty |= changed
-        _tooltip("Amplitude falloff per octave.")
-        changed, noise.lacunarity = imgui.slider_float("Lacunarity", noise.lacunarity, 0.0, 8.0)
-        dirty |= changed
-        _tooltip("Frequency step per octave.")
-        changed, noise.distortion = imgui.slider_float("Distortion", noise.distortion, 0.0, 2.0)
-        dirty |= changed
-        _tooltip("Warps the sample position by the noise itself before evaluating.")
-        return dirty
+    if node.kind != "edge_wear":
+        return dirty | _draw_generator_params(node)
 
     _muted_wrapped(
         "The EdgeWear001 node group, on this layer. What it produces reaches "
@@ -898,42 +1014,42 @@ def _draw_mask_params(app: "MeshMapApp", node) -> bool:
 
 
 def _draw_texture_tree(app: "MeshMapApp") -> None:
-    """The whole texture, one selectable line per slot.
+    """Every project material, followed by all of its child slots.
 
     Selection and naming -- the controls live above -- so it can afford to
     indent: a line per node stays legible far deeper than a stack of sliders
     would. Double-clicking a row renames it in place.
     """
     scale = app.ui_pixel_scale
-    for path, slot in walk(app.texture):
-        imgui.push_id(f"tree{'/'.join(path)}")
-        indent = len(path) * 12 * scale
-        if indent:
-            imgui.indent(indent)
+    for material_index, material in enumerate(app.textures):
+        for path, slot in walk(material):
+            imgui.push_id(f"material{material_index}/{'/'.join(path)}")
+            indent = len(path) * 12 * scale
+            if indent:
+                imgui.indent(indent)
 
-        if app.renaming_path == path:
-            # No swatch, no thumbnail: while a row is being renamed it is the
-            # name and nothing else, so what is typed is what is read back.
-            _draw_rename_field(app, slot)
-        else:
-            if isinstance(slot, ColorSlot):
-                imgui.color_button("##swatch", imgui.ImVec4(*slot.color, 1.0))
+            active = material_index == app.texture_index
+            if active and app.renaming_path == path:
+                _draw_rename_field(app, slot)
             else:
-                thumbnail = app.compositor.thumbnail(path)
-                size = imgui.get_frame_height()
-                if thumbnail is not None:
-                    imgui.image(imgui.ImTextureRef(thumbnail.glo), imgui.ImVec2(size, size))
+                if isinstance(slot, ColorSlot):
+                    imgui.color_button("##swatch", imgui.ImVec4(*slot.color, 1.0))
                 else:
-                    imgui.dummy(imgui.ImVec2(size, size))
-            imgui.same_line()
-            _draw_tree_row(app, path, slot)
+                    thumbnail = app.compositor.thumbnail(path) if active else None
+                    size = imgui.get_frame_height()
+                    if thumbnail is not None:
+                        imgui.image(imgui.ImTextureRef(thumbnail.glo), imgui.ImVec2(size, size))
+                    else:
+                        imgui.dummy(imgui.ImVec2(size, size))
+                imgui.same_line()
+                _draw_tree_row(app, material_index, path, slot)
 
-        if indent:
-            imgui.unindent(indent)
-        imgui.pop_id()
+            if indent:
+                imgui.unindent(indent)
+            imgui.pop_id()
 
 
-def _draw_tree_row(app: "MeshMapApp", path, slot) -> None:
+def _draw_tree_row(app: "MeshMapApp", material_index, path, slot) -> None:
     """One row: which side of its mask it is, and what it is called.
 
     What it is called and nothing else -- a named slot shows its name, not the
@@ -944,61 +1060,13 @@ def _draw_tree_row(app: "MeshMapApp", path, slot) -> None:
     side = f"{path[-1][0].upper()}  " if path else ""
 
     clicked, _ = imgui.selectable(
-        f"{side}{describe(slot)}##row", path == app.texture_path,
+        f"{side}{describe(slot)}##row",
+        material_index == app.texture_index and path == app.texture_path,
         imgui.SelectableFlags_.allow_double_click,
     )
     if clicked:
-        app.select_slot(path)
-        if imgui.is_mouse_double_clicked(0):
-            app.begin_rename(path)
-    _tooltip("Double-click to rename.")
-
-
-def _draw_rename_field(app: "MeshMapApp", slot) -> None:
-    """The row being renamed, as a text field.
-
-    Seeded with the name rather than the automatic label, so a slot that has
-    never been named starts empty and typing replaces nothing. Clearing it puts
-    the automatic label back.
-
-    Focus is taken once, on the frame the field appears. Asking for it every
-    frame is what makes a rename impossible to leave: if anything else held
-    focus when the field opened it would never activate, never report being
-    deactivated, and sit there grabbing at the keyboard for the rest of the
-    session. Taking it once and closing the moment it is lost cannot stick.
-    """
-    just_opened = app.renaming_opened
-    if just_opened:
-        imgui.set_keyboard_focus_here()
-        app.renaming_opened = False
-
-    imgui.set_next_item_width(-1)
-    entered, text = imgui.input_text(
-        "##rename", slot.name,
-        imgui.InputTextFlags_.enter_returns_true | imgui.InputTextFlags_.auto_select_all,
-    )
-    if entered or imgui.is_item_deactivated_after_edit():
-        slot.name = text.strip()
-        app.end_rename()
-    elif not just_opened and not imgui.is_item_active():
-        app.end_rename()  # focus went somewhere else
-
-
-def _draw_tree_row(app: "MeshMapApp", path, slot) -> None:
-    """One row: which side of its mask it is, and what it is called.
-
-    What it is called and nothing else -- a named slot shows its name, not the
-    hex code or the kind it happens to be. That is what the Type dropdown above
-    is for, and a row that argues with the name given to it reads as the rename
-    not having taken.
-    """
-    side = f"{path[-1][0].upper()}  " if path else ""
-
-    clicked, _ = imgui.selectable(
-        f"{side}{describe(slot)}##row", path == app.texture_path,
-        imgui.SelectableFlags_.allow_double_click,
-    )
-    if clicked:
+        if material_index != app.texture_index:
+            app.select_texture(material_index)
         app.select_slot(path)
         if imgui.is_mouse_double_clicked(0):
             app.begin_rename(path)
@@ -1061,6 +1129,102 @@ def _draw_decal_tab(app: "MeshMapApp") -> None:
     imgui.end_child()
 
 
+def _draw_mesh_tab(app: "MeshMapApp") -> None:
+    """Selected mesh inspector above a persistent scene tree."""
+    scale = app.ui_pixel_scale
+    splitter = 8.0 * scale
+    header = imgui.get_frame_height_with_spacing()
+    usable = max(imgui.get_content_region_avail().y - 2 * header - splitter,
+                 4 * header)
+    inspector_height = usable * app.mesh_split
+
+    imgui.separator_text("Inspector")
+    imgui.begin_child("mesh_inspector", imgui.ImVec2(0, inspector_height))
+    _draw_mesh_inspector(app)
+    imgui.end_child()
+
+    _draw_splitter(app, splitter, usable, "mesh", app.set_mesh_split)
+
+    imgui.separator_text("Mesh tree")
+    imgui.begin_child("mesh_tree", imgui.ImVec2(0, 0))
+    _draw_mesh_tree(app)
+    imgui.end_child()
+
+
+def _draw_mesh_inspector(app: "MeshMapApp") -> None:
+    """Properties and material assignment for the selected scene mesh."""
+    if app.mesh is None or app.mesh_info is None:
+        _muted_wrapped("There are no meshes in the scene. Open or drop a mesh to add one.")
+        return
+
+    info = app.mesh_info
+    name = app.mesh_name
+    if app.mesh_selected_index != 0:
+        _muted_wrapped("Select a mesh in the tree below to inspect it and assign its material.")
+        return
+
+    imgui.text(name)
+    imgui.text_colored(MUTED_COLOR, f"{info.vertices:,} vertices  ·  {info.faces:,} faces")
+    imgui.text_colored(
+        MUTED_COLOR,
+        "Size  " + " × ".join(f"{extent:.3g}" for extent in info.extents),
+    )
+
+    imgui.separator_text("Appearance")
+    if app.textures:
+        labels = [describe(material) for material in app.textures]
+        current = (
+            app.mesh_material_index
+            if 0 <= app.mesh_material_index < len(labels)
+            else min(max(app.texture_index, 0), len(labels) - 1)
+        )
+        changed, current = imgui.combo("Material", current, labels)
+        if changed:
+            app.assign_mesh_material(current)
+        _tooltip("Assign a material from the Material view to this mesh.")
+    else:
+        imgui.text_colored(MUTED_COLOR, "Material: none")
+        _muted_wrapped("Create a material in the Material view before assigning one.")
+
+    if imgui.button("Frame selected"):
+        app.camera.frame(app.mesh.bounds.mean(axis=0), info.scale)
+
+
+def _draw_mesh_tree(app: "MeshMapApp") -> None:
+    """All scene meshes, sharing selection with the viewport and inspector."""
+    if app.mesh is None or app.mesh_info is None:
+        _muted_wrapped("No meshes in the scene.")
+        return
+
+    if app.mesh_renaming:
+        just_opened = app.mesh_renaming_opened
+        if just_opened:
+            imgui.set_keyboard_focus_here()
+            app.mesh_renaming_opened = False
+        imgui.set_next_item_width(-1)
+        entered, app.mesh_name = imgui.input_text(
+            "##mesh_rename", app.mesh_name,
+            imgui.InputTextFlags_.enter_returns_true
+            | imgui.InputTextFlags_.auto_select_all,
+        )
+        if entered or imgui.is_item_deactivated_after_edit():
+            app.end_mesh_rename()
+        elif not just_opened and not imgui.is_item_active():
+            app.end_mesh_rename()
+        return
+
+    clicked, _ = imgui.selectable(
+        app.mesh_name,
+        app.mesh_selected_index == 0,
+        imgui.SelectableFlags_.allow_double_click,
+    )
+    if clicked:
+        app.select_scene_mesh(0)
+        if imgui.is_mouse_double_clicked(0):
+            app.begin_mesh_rename()
+    _tooltip("Select this mesh. Double-click to rename it.")
+
+
 def _draw_decals_in_use(app: "MeshMapApp") -> None:
     """Selectable scene list backed by the viewport's decal selection."""
     if not app.decals:
@@ -1069,15 +1233,66 @@ def _draw_decals_in_use(app: "MeshMapApp") -> None:
 
     for index, decal in enumerate(app.decals):
         imgui.push_id(f"decal_in_use_{index}")
-        name = Path(decal.path).name or f"Decal {index + 1}"
-        state = "" if decal.enabled else "  (disabled)"
+        if _draw_decal_visibility_icon(decal.enabled):
+            decal.enabled = not decal.enabled
+            app.mark_normal_dirty()
+        _tooltip("Show or hide this decal.")
+        imgui.same_line()
+
+        if app.decal_renaming_index == index:
+            just_opened = app.decal_renaming_opened
+            if just_opened:
+                imgui.set_keyboard_focus_here()
+                app.decal_renaming_opened = False
+            imgui.set_next_item_width(-1)
+            entered, decal.name = imgui.input_text(
+                "##decal_rename", decal.name,
+                imgui.InputTextFlags_.enter_returns_true
+                | imgui.InputTextFlags_.auto_select_all,
+            )
+            if entered or imgui.is_item_deactivated_after_edit():
+                app.end_decal_rename()
+            elif not just_opened and not imgui.is_item_active():
+                app.end_decal_rename()
+            imgui.pop_id()
+            continue
+
+        name = decal.display_name()
         clicked, _ = imgui.selectable(
-            f"{index + 1}.  {name}{state}", index == app.decal_index
+            name,
+            index == app.decal_index,
+            imgui.SelectableFlags_.allow_double_click,
         )
         if clicked:
             app.select_decal(index)
-        _tooltip("Select this decal in the inspector and viewport.")
+            if imgui.is_mouse_double_clicked(0):
+                app.begin_decal_rename(index)
+        _tooltip("Select this decal. Double-click to rename it.")
         imgui.pop_id()
+
+
+def _draw_decal_visibility_icon(enabled: bool) -> bool:
+    """Compact eye-style visibility control used by decal tree rows."""
+    size = imgui.get_frame_height()
+    clicked = imgui.invisible_button("##visibility", imgui.ImVec2(size, size))
+    start, end = imgui.get_item_rect_min(), imgui.get_item_rect_max()
+    draw = imgui.get_window_draw_list()
+    center = imgui.ImVec2((start.x + end.x) * 0.5, (start.y + end.y) * 0.5)
+    radius = size * 0.27
+    color = imgui.get_color_u32(
+        imgui.ImVec4(0.78, 0.84, 0.90, 1.0) if enabled
+        else imgui.ImVec4(0.42, 0.44, 0.48, 1.0)
+    )
+    draw.add_circle(center, radius, color, 18, max(1.2, size * 0.07))
+    if enabled:
+        draw.add_circle_filled(center, radius * 0.38, color, 12)
+    else:
+        draw.add_line(
+            imgui.ImVec2(center.x - radius, center.y + radius),
+            imgui.ImVec2(center.x + radius, center.y - radius),
+            color, max(1.2, size * 0.08),
+        )
+    return clicked
 
 
 def _draw_decal_library_tab(app: "MeshMapApp") -> None:
@@ -1143,6 +1358,156 @@ def _draw_library_item(app: "MeshMapApp", path: Path, size: float) -> None:
     _tooltip(f"{path.name}\nDrag onto the model to place it.")
 
 
+def _decal_number(
+    app: "MeshMapApp", label: str, value: float,
+    minimum: float, maximum: float, speed: float, default: float,
+    fmt: str = "%.3f", *, state_key: str | None = None,
+) -> tuple[bool, float]:
+    """Blender-style numeric field shared by all decal inspector values.
+
+    A stable ``state_key`` distinguishes identically labelled controls in a
+    stacked modifier list while the user transitions from clicking to typing.
+    """
+    scale = app.ui_pixel_scale
+    button = imgui.get_frame_height()
+    field_width = max(
+        70.0 * scale,
+        imgui.get_content_region_avail().x - 150.0 * scale - button * 2.0,
+    )
+    changed = False
+    original = float(value)
+    reset = False
+    io = imgui.get_io()
+    interaction_key = state_key or label
+    imgui.push_id(interaction_key)
+
+    if imgui.button("-", imgui.ImVec2(button, 0)):
+        value -= speed
+        changed = True
+    if imgui.is_item_hovered():
+        imgui.set_mouse_cursor(imgui.MouseCursor_.resize_ew)
+        reset |= io.key_super and imgui.is_mouse_clicked(0)
+    if imgui.is_item_active() and imgui.is_mouse_dragging(0):
+        value += io.mouse_delta.x * speed
+        changed = True
+
+    imgui.same_line(0.0, 0.0)
+    imgui.set_next_item_width(field_width)
+    editing = app.decal_transform_edit_field == interaction_key
+    if editing:
+        if app.decal_transform_edit_opened:
+            imgui.set_keyboard_focus_here()
+            app.decal_transform_edit_opened = False
+        edited, value = imgui.input_float(
+            "##value", float(value), 0.0, 0.0, fmt,
+            imgui.InputTextFlags_.auto_select_all
+            | imgui.InputTextFlags_.enter_returns_true,
+        )
+        changed |= edited
+        if edited or imgui.is_item_deactivated_after_edit():
+            app.decal_transform_edit_field = None
+        elif not imgui.is_item_active() and not app.decal_transform_edit_opened:
+            app.decal_transform_edit_field = None
+    else:
+        edited, value = imgui.drag_float(
+            "##value", float(value), speed, minimum, maximum, fmt,
+            imgui.SliderFlags_.always_clamp,
+        )
+        changed |= edited
+        hovered = imgui.is_item_hovered()
+        if hovered:
+            imgui.set_mouse_cursor(imgui.MouseCursor_.resize_ew)
+        if hovered and imgui.is_mouse_clicked(0):
+            app.decal_transform_pressed_field = interaction_key
+            app.decal_transform_field_dragged = False
+            if io.key_super:
+                reset = True
+        if (imgui.is_item_active() and imgui.is_mouse_dragging(0)):
+            app.decal_transform_field_dragged = True
+        if (app.decal_transform_pressed_field == interaction_key
+                and imgui.is_mouse_released(0)):
+            if hovered and not app.decal_transform_field_dragged and not reset:
+                app.decal_transform_edit_field = interaction_key
+                app.decal_transform_edit_opened = True
+            app.decal_transform_pressed_field = None
+            app.decal_transform_field_dragged = False
+    _tooltip(
+        "Click to type a value. Drag the field horizontally to adjust it.\n"
+        "Cmd-click to restore the default."
+    )
+
+    imgui.same_line(0.0, 0.0)
+    if imgui.button("+", imgui.ImVec2(button, 0)):
+        value += speed
+        changed = True
+    if imgui.is_item_hovered():
+        imgui.set_mouse_cursor(imgui.MouseCursor_.resize_ew)
+        reset |= io.key_super and imgui.is_mouse_clicked(0)
+    if imgui.is_item_active() and imgui.is_mouse_dragging(0):
+        value += io.mouse_delta.x * speed
+        changed = True
+    imgui.same_line()
+    imgui.text(label)
+    imgui.pop_id()
+    if reset:
+        value = float(default)
+        changed = True
+    value = float(min(max(value, minimum), maximum))
+    return changed or value != original, value
+
+
+def _draw_decal_transform(app: "MeshMapApp", decal) -> bool:
+    """Position, rotation and scale grouped at the inspector's top."""
+    if not imgui.collapsing_header("Transform", imgui.TreeNodeFlags_.default_open):
+        return False
+
+    dirty = False
+    blank = type(decal)()
+    imgui.separator_text("Location")
+    changed, decal.center_u = _decal_number(
+        app, "U", decal.center_u, 0.0, 1.0, 0.002, blank.center_u
+    )
+    dirty |= changed
+    changed, decal.center_v = _decal_number(
+        app, "V", decal.center_v, 0.0, 1.0, 0.002, blank.center_v
+    )
+    dirty |= changed
+
+    imgui.separator_text("Rotation")
+    changed, decal.rotation = _decal_number(
+        app, "Angle", decal.rotation, -180.0, 180.0, 0.5,
+        blank.rotation, "%.1f"
+    )
+    dirty |= changed
+
+    imgui.separator_text("Scale")
+    width = decal.scale * decal.scale_x
+    height = decal.scale * decal.scale_y
+    changed, width = _decal_number(
+        app, "Width", width, 0.00004, 200.0, 0.005,
+        blank.scale * blank.scale_x,
+    )
+    if changed:
+        decal.scale_x = width / max(decal.scale, 1e-6)
+    dirty |= changed
+    changed, height = _decal_number(
+        app, "Height", height, 0.00004, 200.0, 0.005,
+        blank.scale * blank.scale_y,
+    )
+    if changed:
+        decal.scale_y = height / max(decal.scale, 1e-6)
+    dirty |= changed
+
+    if imgui.button("Reset transform"):
+        decal.center_u, decal.center_v = blank.center_u, blank.center_v
+        decal.scale, decal.scale_x, decal.scale_y = (
+            blank.scale, blank.scale_x, blank.scale_y
+        )
+        decal.rotation = blank.rotation
+        dirty = True
+    return dirty
+
+
 def _draw_decal_inspector(app: "MeshMapApp") -> None:
     """The selected decal's own controls."""
     scale = app.ui_pixel_scale
@@ -1160,29 +1525,21 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
         imgui.pop_item_width()
         return
 
-    image = app.decal_image_for(decal)
-    texture = app.decal_textures.get(decal.path)
-    if image is not None and texture is not None:
-        thumbnail = DECAL_THUMBNAIL * scale
-        width, height = image.size
-        imgui.image(
-            imgui.ImTextureRef(texture.glo),
-            imgui.ImVec2(thumbnail, thumbnail * height / max(width, 1)),
-        )
-        imgui.same_line()
+    projector_input = (
+        decal.center_u, decal.center_v,
+        decal.scale, decal.scale_x, decal.scale_y, decal.rotation,
+    )
 
-    imgui.begin_group()
+    image = app.decal_image_for(decal)
     origin = "height map, converted" if image and image.from_height else "normal map"
     imgui.text_colored(
         MUTED_COLOR,
-        f"{Path(decal.path).name}\n"
+        f"{decal.display_name()}\n"
         f"{decal.image_aspect:.2f} : 1  ({origin})\n"
         f"{app.decal_index + 1} of {len(app.decals)} on the mesh",
     )
-    changed, decal.enabled = imgui.checkbox("Enabled", decal.enabled)
-    dirty |= changed
-    _tooltip("Off leaves this decal out of the normal map, without removing it.")
-    imgui.end_group()
+
+    dirty |= _draw_decal_transform(app, decal)
 
     if imgui.button("Remove"):
         app.remove_decal()
@@ -1227,8 +1584,10 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
     )
 
     imgui.separator_text("Depth")
-    changed, decal.intensity = imgui.slider_float(
-        "Height intensity", decal.intensity, 0.0, 4.0, "%.2f"
+    decal_defaults = type(decal)()
+    changed, decal.intensity = _decal_number(
+        app, "Height intensity", decal.intensity, 0.0, 4.0, 0.02,
+        decal_defaults.intensity, "%.2f", state_key="appearance:intensity",
     )
     dirty |= changed
     _tooltip(
@@ -1246,38 +1605,10 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
         "inside-out -- raised where it should be recessed -- this is why."
     )
 
-    imgui.separator_text("Surface placement")
-    changed, decal.scale = imgui.slider_float(
-        "Scale", decal.scale, 0.01, 1.0, "%.3f", imgui.SliderFlags_.logarithmic
-    )
-    dirty |= changed
-    _tooltip(
-        "Size on the anchor face. Its height follows from\n"
-        "two things: the image's own aspect ratio, so a wide vent stays wide,\n"
-        "and how stretched the mesh's UVs are where the decal sits, so a round\n"
-        "one comes out round. Across a UV seam it continues on the connected face."
-    )
-
-    changed, decal.scale_x = imgui.slider_float(
-        "Width factor", decal.scale_x, 0.02, 4.0, "%.3f", imgui.SliderFlags_.logarithmic
-    )
-    dirty |= changed
-    changed, decal.scale_y = imgui.slider_float(
-        "Height factor", decal.scale_y, 0.02, 4.0, "%.3f", imgui.SliderFlags_.logarithmic
-    )
-    dirty |= changed
-    _tooltip("Independent factors changed by S then X or Y. 1.0 preserves the image shape.")
-
-    stretch = float(decal.surface_aspect)
-    if abs(stretch - 1.0) > 0.02:
-        wider = "across" if stretch > 1.0 else "up"
-        _muted_wrapped(
-            f"UV here is {max(stretch, 1 / stretch):.2f}x stretched {wider}; "
-            "the decal's shape is corrected for it."
-        )
-
-    changed, decal.falloff = imgui.slider_float(
-        "Edge falloff", decal.falloff, 0.0, 1.0, "%.2f"
+    imgui.separator_text("Edges")
+    changed, decal.falloff = _decal_number(
+        app, "Edge falloff", decal.falloff, 0.0, 1.0, 0.01,
+        decal_defaults.falloff, "%.2f", state_key="appearance:falloff",
     )
     dirty |= changed
     _tooltip(
@@ -1291,27 +1622,92 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
         "needs no help."
     )
 
-    changed, decal.center_u = imgui.slider_float("Position U", decal.center_u, 0.0, 1.0, "%.3f")
-    dirty |= changed
-    changed, decal.center_v = imgui.slider_float("Position V", decal.center_v, 0.0, 1.0, "%.3f")
-    dirty |= changed
-    _tooltip(
-        "Where the middle of the decal sits in the UV layout. Usually easier to\n"
-        "set by pointing: click the decal above, or 'Place on the mesh', and put\n"
-        "it where you want it on the model."
+    imgui.separator_text("Modifiers")
+    remove_modifier = None
+    distance_limit = max(
+        float(app.mesh_info.scale) * 2.0 if app.mesh_info is not None else 2.0,
+        0.1,
     )
+    modifier_defaults = DecalArrayModifier()
+    distance_speed = max(distance_limit / 500.0, 0.001)
+    for modifier_index, modifier in enumerate(decal.modifiers):
+        imgui.push_id(f"array_modifier_{modifier_index}")
+        imgui.separator_text(f"Array {modifier_index + 1}")
+        if imgui.small_button("Remove"):
+            remove_modifier = modifier_index
 
-    changed, decal.rotation = imgui.slider_float(
-        "Rotation", decal.rotation, -180.0, 180.0, "%.0f deg"
-    )
-    dirty |= changed
+        modes = ("Line", "Radial")
+        mode_index = 1 if modifier.mode == "radial" else 0
+        changed, mode_index = imgui.combo("Mode", mode_index, list(modes))
+        if changed:
+            modifier.mode = "radial" if mode_index == 1 else "axes"
+            dirty = True
 
-    if imgui.button("Reset placement"):
-        blank = type(decal)()
-        decal.center_u, decal.center_v = blank.center_u, blank.center_v
-        decal.scale, decal.scale_x, decal.scale_y = blank.scale, blank.scale_x, blank.scale_y
-        decal.rotation = blank.rotation
+        changed, copies = _decal_number(
+            app, "Copies", float(modifier.count), 1.0, 100.0, 1.0,
+            float(modifier_defaults.count), "%.0f",
+            state_key=f"modifier:{modifier_index}:count",
+        )
+        if changed:
+            modifier.count = int(round(copies))
+            dirty = True
+        _tooltip("Generated copies; the selected decal is the first element.")
+
+        if modifier.mode == "axes":
+            for axis_name, attribute in (
+                ("X distance", "offset_x"),
+                ("Y distance", "offset_y"),
+                ("Z distance", "offset_z"),
+            ):
+                changed, value = _decal_number(
+                    app, axis_name, float(getattr(modifier, attribute)),
+                    -distance_limit, distance_limit, distance_speed,
+                    float(getattr(modifier_defaults, attribute)), "%.3f",
+                    state_key=f"modifier:{modifier_index}:{attribute}",
+                )
+                if changed:
+                    setattr(modifier, attribute, float(value))
+                    dirty = True
+            _tooltip(
+                "Signed world-space offset per copy along each local decal axis. "
+                "Negative values travel in the negative direction."
+            )
+            if not (modifier.offset_x or modifier.offset_y or modifier.offset_z):
+                imgui.text_colored(WARN_COLOR, "Set at least one non-zero distance.")
+        else:
+            radial_axes = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
+            radial_values = ("x", "-x", "y", "-y", "z", "-z")
+            radial_index = (
+                radial_values.index(modifier.radial_axis)
+                if modifier.radial_axis in radial_values else 4
+            )
+            changed, radial_index = imgui.combo(
+                "Rotation axis", radial_index, list(radial_axes)
+            )
+            if changed:
+                modifier.radial_axis = radial_values[radial_index]
+                dirty = True
+            changed, modifier.radius = _decal_number(
+                app, "Radius", modifier.radius, 0.001, distance_limit,
+                distance_speed, modifier_defaults.radius, "%.3f",
+                state_key=f"modifier:{modifier_index}:radius",
+            )
+            dirty |= changed
+            _tooltip(
+                "Distance from the circle's center to every decal. The selected "
+                "decal's transform marks the center; its rendered original and "
+                "all copies are spaced evenly around the complete circle."
+            )
+        imgui.pop_id()
+
+    if remove_modifier is not None:
+        del decal.modifiers[remove_modifier]
         dirty = True
+
+    if imgui.button("Add modifier"):
+        decal.modifiers.append(DecalArrayModifier())
+        dirty = True
+    _tooltip("Add another non-destructive Array modifier to this decal's stack.")
 
     imgui.end_disabled()
 
@@ -1324,14 +1720,16 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
         )
 
     if info is not None and not info.has_uvs:
-        imgui.text_colored(
-            WARN_COLOR,
-            "! This mesh carries no UVs, so there is no layout to place into\n"
-            "  yet. Bake once to generate an atlas -- but that atlas fits only\n"
-            "  the OBJ this app exports, not your original mesh.",
+        app.console_log(
+            "WARNING",
+            "This mesh carries no UVs, so there is no decal layout yet. Bake "
+            "once to generate an atlas; that atlas fits the exported OBJ, not "
+            "the original mesh.",
+            key="decal_mesh_has_no_uvs",
         )
 
     if dirty:
+        app.sync_decal_inspector_projector(decal, projector_input)
         app.mark_normal_dirty()
 
     imgui.pop_item_width()
@@ -1372,6 +1770,30 @@ def _draw_map_switches(app: "MeshMapApp") -> None:
             "Occlusion is switched off, so the bake skips it -- which is most "
             "of what a bake costs. Switching it back on needs a re-bake."
         )
+
+
+def _draw_console_tab(app: "MeshMapApp") -> None:
+    """Diagnostics collected without interrupting the normal workflow."""
+    if imgui.button("Clear"):
+        app.clear_console()
+    imgui.same_line()
+    imgui.text_colored(MUTED_COLOR, f"{len(app.console_messages)} messages")
+    imgui.separator()
+
+    imgui.begin_child("console_output", imgui.ImVec2(0, 0))
+    for index, (level, message) in enumerate(app.console_messages):
+        color = ERROR_COLOR if level == "ERROR" else WARN_COLOR \
+            if level == "WARNING" else MUTED_COLOR
+        imgui.push_id(f"console_{index}")
+        imgui.text_colored(color, f"[{level}]")
+        imgui.same_line()
+        imgui.push_text_wrap_pos(0.0)
+        imgui.text_wrapped(message)
+        imgui.pop_text_wrap_pos()
+        imgui.pop_id()
+    if not app.console_messages:
+        imgui.text_colored(MUTED_COLOR, "No diagnostics recorded.")
+    imgui.end_child()
 
 
 def _draw_settings_tab(app: "MeshMapApp") -> None:
@@ -1574,7 +1996,8 @@ def _draw_bake_controls(app: "MeshMapApp") -> None:
         imgui.text_colored(MUTED_COLOR, "Stale: " + ", ".join(pending))
 
     if controller.error:
-        imgui.text_colored(ERROR_COLOR, controller.error.strip().splitlines()[-1])
+        message = controller.error.strip()
+        app.console_log("ERROR", message, key="bake_error")
 
 
 # --------------------------------------------------------------------------
@@ -1593,7 +2016,7 @@ def _draw_status_bar(app: "MeshMapApp") -> None:
     imgui.begin("##status", None, flags)
     line = app.status.strip().splitlines()[-1] if app.status.strip() else ""
     if app.status_is_error:
-        imgui.text_colored(ERROR_COLOR, line)
+        imgui.text_colored(ERROR_COLOR, "Error - see Console")
     else:
         imgui.text_colored(MUTED_COLOR, line)
     imgui.end()

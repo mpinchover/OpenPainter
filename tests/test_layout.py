@@ -160,6 +160,37 @@ def test_the_app_opens_with_a_texture_to_work_on(starter_app):
     assert starter_app.texture.name == "Texture 01"
 
 
+def test_new_material_joins_the_project_and_is_assigned(starter_app):
+    before = len(starter_app.textures)
+    starter_app.create_texture()
+
+    assert len(starter_app.textures) == before + 1
+    assert starter_app.texture_index == before
+    assert starter_app.mesh_material_index == before
+
+
+def test_scene_mesh_selection_has_a_viewport_outline(starter_app):
+    starter_app.select_scene_mesh(0)
+
+    assert starter_app.mesh_selected_index == 0
+    assert starter_app.decal_index == -1
+    outline = starter_app.mesh_selection_outline()
+    assert outline is not None
+    assert len(outline) == 12
+
+
+def test_mesh_tree_name_is_editable_without_renaming_the_source(starter_app):
+    source_path = starter_app.mesh_info.path
+    starter_app.begin_mesh_rename()
+    assert starter_app.mesh_renaming and starter_app.mesh_renaming_opened
+
+    starter_app.mesh_name = "  Hero Cube  "
+    starter_app.end_mesh_rename()
+
+    assert starter_app.mesh_name == "Hero Cube"
+    assert starter_app.mesh_info.path == source_path
+
+
 def test_the_double_click_thresholds_are_loosened(starter_app):
     """Renaming is a double-click, and ImGui's defaults make it a hard one:
     6 physical pixels of travel is a third of a hand's on a HiDPI display,
@@ -333,6 +364,7 @@ def test_the_texture_panes_start_even_and_stay_usable(starter_app):
     from render.viewport import MIN_SPLIT
 
     assert starter_app.texture_split == pytest.approx(0.5)
+    assert starter_app.mesh_split == pytest.approx(0.5)
 
     starter_app.set_texture_split(0.9)
     assert starter_app.texture_split == pytest.approx(1.0 - MIN_SPLIT)
@@ -341,6 +373,8 @@ def test_the_texture_panes_start_even_and_stay_usable(starter_app):
 
     starter_app.set_texture_split(0.7)
     assert starter_app.texture_split == pytest.approx(0.7)
+    starter_app.set_mesh_split(0.75)
+    assert starter_app.mesh_split == pytest.approx(0.75)
 
 
 def test_the_layout_is_remembered_between_runs(starter_app, isolated_settings):
@@ -349,16 +383,30 @@ def test_the_layout_is_remembered_between_runs(starter_app, isolated_settings):
     import json
 
     starter_app.set_texture_split(0.32)
+    starter_app.set_mesh_split(0.43)
     starter_app.set_sidebar_width(512.0)
     starter_app.save_prefs()
 
     stored = json.loads((isolated_settings / "prefs.json").read_text())
     assert stored["texture_split"] == pytest.approx(0.32)
+    assert stored["mesh_split"] == pytest.approx(0.43)
     assert stored["sidebar_width"] == pytest.approx(512.0)
 
     from render.viewport import _load_prefs
 
     assert _load_prefs()["texture_split"] == pytest.approx(0.32)
+
+
+def test_console_is_always_on_and_deduplicated(starter_app):
+    starter_app.set_status("ordinary failure", error=True)
+    starter_app.console_log("WARNING", "same warning", key="flat")
+    starter_app.console_log("WARNING", "same warning", key="flat")
+
+    assert sum(message == "same warning" for _, message in starter_app.console_messages) == 1
+    assert ("ERROR", "ordinary failure") in starter_app.console_messages
+
+    starter_app.clear_console()
+    assert starter_app.console_messages == []
 
 
 def test_a_rename_cannot_get_stuck(starter_app):

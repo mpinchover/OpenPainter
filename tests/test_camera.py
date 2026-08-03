@@ -461,6 +461,7 @@ class FakeApp:
         self._queue = MeshMapApp._queue_scroll.__get__(self)
         self._track_arrival_rate = MeshMapApp._track_arrival_rate.__get__(self)
         self._drain = MeshMapApp._drain_scroll.__get__(self)
+        self.clear = MeshMapApp._clear_pending_navigation.__get__(self)
 
     def push_orbit(self, pixels: float) -> None:
         """One scroll event's worth of orbit, in pixels of equivalent drag."""
@@ -589,6 +590,20 @@ def test_the_pending_buffer_always_drains():
         app.frame()
     assert abs(app._pending_orbit[0]) == 0.0
     assert abs(app._pending_orbit[1]) == 0.0
+
+
+def test_discrete_axis_view_discards_previous_navigation_tail():
+    camera = PanOrbitCamera(target=(0.0, 0.0, 0.0), radius=2.0, aspect_ratio=1.0)
+    camera.frame((0.0, 0.0, 0.0), 2.0)
+    app = FakeApp(camera, 1.0)
+    app._queue(orbit=(4.0, 3.0), pan=(2.0, 1.0), zoom=5.0)
+
+    app.clear()
+
+    assert app._pending_orbit == [0.0, 0.0]
+    assert app._pending_pan == [0.0, 0.0]
+    assert app._pending_zoom == 0.0
+    assert app._scroll_arrived == 0.0
 
 
 def test_a_stalled_gesture_cannot_leave_the_buffer_sitting():

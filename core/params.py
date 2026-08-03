@@ -16,6 +16,7 @@ the Curvature Texture node inside pins Offset to -2.0.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -197,6 +198,30 @@ class EdgeWearParams:
 
 
 @dataclass
+class DecalArrayModifier:
+    """One non-destructive array operation in a decal's modifier stack."""
+
+    mode: str = "axes"
+    count: int = 1
+    offset_x: float = 0.1
+    offset_y: float = 0.0
+    offset_z: float = 0.0
+    radius: float = 0.1
+    radial_axis: str = "z"
+
+    def key(self) -> tuple:
+        return (
+            self.mode,
+            int(self.count),
+            round(float(self.offset_x), 6),
+            round(float(self.offset_y), 6),
+            round(float(self.offset_z), 6),
+            round(float(self.radius), 6),
+            self.radial_axis,
+        )
+
+
+@dataclass
 class DecalParams:
     """A normal-map decal stamped into the mesh's UV layout.
 
@@ -210,6 +235,11 @@ class DecalParams:
 
     enabled: bool = True
     path: str = ""
+    name: str = ""
+    """Editable scene name; ``path`` remains the source image identity."""
+
+    def display_name(self) -> str:
+        return self.name.strip() or Path(self.path).name or "Decal"
 
     center_u: float = 0.5
     center_v: float = 0.5
@@ -277,6 +307,9 @@ class DecalParams:
     texture_index: int = -1
     """Optional index of a Texture-tab material used to colour this decal."""
 
+    modifiers: list[DecalArrayModifier] = field(default_factory=list)
+    """Ordered generators evaluated without creating scene-tree decals."""
+
     def loaded(self) -> bool:
         return bool(self.path)
 
@@ -306,6 +339,7 @@ class DecalParams:
             self.projector_forward,
             self.projector_size,
             self.texture_index,
+            tuple(modifier.key() for modifier in self.modifiers),
         )
 
     def size(self) -> tuple[float, float]:

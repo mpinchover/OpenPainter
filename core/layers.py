@@ -57,6 +57,16 @@ EDGE_WEAR_KIND = "edge_wear"
 MASK_KINDS = {
     EDGE_WEAR_KIND: "Edge wear",
     "noise": "Noise",
+    "grunge": "Grunge",
+    "scratches": "Scratches",
+    "brushed_metal": "Brushed metal",
+    "cells": "Cells",
+    "clouds": "Clouds",
+    "directional_streaks": "Directional streaks",
+    "gradient": "Gradient",
+    "brick": "Brick / tile",
+    "wood_grain": "Wood grain",
+    "marble": "Marble",
 }
 SLOT_KINDS = {COLOR_KIND: "Colour", **MASK_KINDS}
 
@@ -85,12 +95,31 @@ class NoiseMaskParams:
     roughness: float = 0.55
     lacunarity: float = 2.5
     distortion: float = 0.0
+    rotation: float = 0.0
+    """Pattern rotation in degrees around object-space Z."""
+
+    seed: float = 0.0
+    """Stable variation of the generated pattern."""
 
     bias: float = 0.5
     """The noise value that lands on the midpoint. Lower gives more white."""
 
     contrast: float = 4.0
     """How hard the threshold is. 0 is flat grey, high values are a hard edge."""
+
+    scratch_width: float = 0.04
+    scratch_length: float = 0.55
+    scratch_irregularity: float = 0.5
+    brush_density: float = 42.0
+    brush_waviness: float = 0.35
+    brush_variation: float = 0.38
+    cell_jitter: float = 1.0
+    cell_edge: float = 0.2
+    streak_length: float = 8.0
+    streak_width: float = 0.12
+    mortar_thickness: float = 0.08
+    brick_aspect: float = 2.0
+    vein_width: float = 0.5
 
     def as_uniforms(self) -> dict[str, float]:
         return {
@@ -101,6 +130,25 @@ class NoiseMaskParams:
             "u_noiseDistortion": self.distortion,
             "u_noiseBias": self.bias,
             "u_noiseContrast": self.contrast,
+        }
+
+    def generator_uniforms(self) -> dict[str, float]:
+        return {
+            "u_generatorRotation": self.rotation,
+            "u_generatorSeed": self.seed,
+            "u_scratchWidth": self.scratch_width,
+            "u_scratchLength": self.scratch_length,
+            "u_scratchIrregularity": self.scratch_irregularity,
+            "u_brushDensity": self.brush_density,
+            "u_brushWaviness": self.brush_waviness,
+            "u_brushVariation": self.brush_variation,
+            "u_cellJitter": self.cell_jitter,
+            "u_cellEdge": self.cell_edge,
+            "u_streakLength": self.streak_length,
+            "u_streakWidth": self.streak_width,
+            "u_mortarThickness": self.mortar_thickness,
+            "u_brickAspect": self.brick_aspect,
+            "u_veinWidth": self.vein_width,
         }
 
 
@@ -127,11 +175,17 @@ class ColorSlot:
 
     alpha: float = 1.0
     """Opacity. 1 is solid; below that the surface lets what is behind it
-    through, and the exported alpha map says where."""
+    through. The internal name remains ``alpha`` for compatibility with older
+    project state; the interface exposes this only as Opacity."""
 
     emission: float = 0.0
     """How much light the surface gives off, in multiples of its own colour.
     0 for anything that is only lit; above 0 for a screen, a lamp, hot metal."""
+
+    ambient_occlusion: float = 1.0
+    """Material-authored occlusion. 1 leaves ambient light unchanged; lower
+    values darken creases or details supplied by the material generator. It is
+    multiplied by the mesh AO bake when both are exported."""
 
     name: str = ""
     """What to call it in the tree. Empty falls back to the hex code, which is
@@ -146,6 +200,13 @@ class ColorSlot:
         """The same four, with emission scaled into 0..1 -- see MAX_EMISSION."""
         metallic, roughness, alpha, emission = self.material()
         return (metallic, roughness, alpha, emission / MAX_EMISSION)
+
+    def channels(self) -> tuple[float, float, float, float, float]:
+        """All scalar PBR channels: metal, rough, opacity, AO, emission."""
+        return (
+            self.metallic, self.roughness, self.alpha,
+            self.ambient_occlusion, self.emission,
+        )
 
     @property
     def label(self) -> str:
@@ -330,6 +391,7 @@ def texture_key(slot: Slot) -> tuple:
             "color",
             tuple(round(float(c), 6) for c in slot.color),
             tuple(round(float(c), 6) for c in slot.material()),
+            round(float(slot.ambient_occlusion), 6),
         )
 
     wear = slot.edge_wear
@@ -343,6 +405,7 @@ def texture_key(slot: Slot) -> tuple:
         round(slot.range_high, 6),
         tuple(round(float(value), 6) for value in wear.as_uniforms().values()),
         tuple(round(float(value), 6) for value in noise.as_uniforms().values()),
+        tuple(round(float(value), 6) for value in noise.generator_uniforms().values()),
         texture_key(slot.white),
         texture_key(slot.black),
     )

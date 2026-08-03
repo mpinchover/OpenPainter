@@ -31,6 +31,7 @@ from core.decal import (
     outline_uvs,
     uv_aspect,
 )
+from core.action_log import log_action
 from core.decal_wrap import wrapped_vertices
 from core.decal_thumbnail import DecalThumbnail, load_thumbnail
 from core.export import (
@@ -71,6 +72,26 @@ from ui.panel import draw_panel
 #: The Shaded view, which the app falls back to when a mode's map goes away.
 #: It draws the mask tree, and plain grey until there is one -- see FLAT_MODE.
 SHADED_INDEX = 0
+
+
+def _primary_shortcut_down(modifiers) -> bool:
+    """Return Cmd on macOS and Ctrl everywhere else.
+
+    moderngl-window's Pyglet adapter only copies Ctrl, Shift and Alt into its
+    portable modifier object.  Pyglet does receive Command from Cocoa, but the
+    adapter discards that bit before :meth:`on_key_event` runs, so read Cocoa's
+    current modifier flags directly on macOS.
+    """
+    if sys.platform != "darwin":
+        return bool(getattr(modifiers, "ctrl", False))
+    try:
+        from pyglet.libs.darwin.cocoapy import NSCommandKeyMask, ObjCClass
+
+        return bool(ObjCClass("NSEvent").modifierFlags() & NSCommandKeyMask)
+    except Exception:
+        # Useful for headless runs and future Pyglet versions. ImGui's native
+        # backend may still know about Super even when Cocoa is unavailable.
+        return bool(getattr(imgui.get_io(), "key_super", False))
 
 
 @dataclass(frozen=True)
@@ -681,6 +702,8 @@ class MeshMapApp(mglw.WindowConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+        log_action("window_created", size=self.wnd.size, buffer_size=self.wnd.buffer_size)
+
         self._apply_icon()
 
         # moderngl-window quits on its exit_key, which defaults to Escape and is
@@ -706,6 +729,15 @@ class MeshMapApp(mglw.WindowConfig):
         #: are kept so a variant can be gone back to.
         self.textures: list[Slot] = []
         self.texture_index: int = -1
+        #: Material assigned to the scene mesh. The current renderer owns one
+        #: mesh; keeping assignment explicit makes the scene UI extensible.
+        self.mesh_material_index: int = -1
+        #: Selected row in the scene mesh tree, or -1 for no mesh selection.
+        self.mesh_selected_index: int = -1
+        #: Scene display name; renaming never changes the source file path.
+        self.mesh_name: str = "Mesh"
+        self.mesh_renaming = False
+        self.mesh_renaming_opened = False
         #: The slot the Texture tab is editing, within the active texture: a
         #: colour or a mask, either way.
         self.texture_path: tuple[str, ...] = ()
@@ -730,6 +762,13 @@ class MeshMapApp(mglw.WindowConfig):
         self.decals: list[DecalParams] = []
         #: Which one the Decal tab is inspecting, or -1 for none.
         self.decal_index: int = -1
+        self.decal_renaming_index: int = -1
+        self.decal_renaming_opened = False
+        #: Click-versus-drag state for direct decal transform number fields.
+        self.decal_transform_edit_field: Optional[str] = None
+        self.decal_transform_edit_opened = False
+        self.decal_transform_pressed_field: Optional[str] = None
+        self.decal_transform_field_dragged = False
         #: Images and their GL textures, cached by path. Several placements of
         #: one picture share both.
         self.decal_images: dict[str, DecalImage] = {}
@@ -768,7 +807,14 @@ class MeshMapApp(mglw.WindowConfig):
         self._decal_transform_mode: Optional[str] = None
         self._decal_transform_axis: Optional[str] = None
         self._decal_transform_anchor: Optional[tuple] = None
+        self._decal_transform_plane_anchor: Optional[np.ndarray] = None
+        #: Cursor-to-projector offset while G is over the mesh. Establishing
+        #: this on entry keeps relative off-mesh motion from becoming an
+        #: absolute snap-to-cursor the instant the pointer crosses a face.
+        self._decal_transform_surface_offset: Optional[np.ndarray] = None
         self._decal_transform_last_hit: Optional[tuple[tuple[float, float], int]] = None
+        self._decal_transform_undo: Optional[tuple[list[DecalParams], int]] = None
+        self._decal_transform_app_undo: Optional[dict] = None
         self._delete_decal_index: Optional[int] = None
         self._decal_undo: list[tuple[list[DecalParams], int]] = []
         self._decal_redo: list[tuple[list[DecalParams], int]] = []
@@ -807,6 +853,17 @@ class MeshMapApp(mglw.WindowConfig):
         #: What the in-flight drag belongs to: "camera", "gizmo", "ui" or None.
         #: Latched on press so a gesture cannot change hands halfway through.
         self._drag_owner: Optional[str] = None
+        #: macOS delivers an activation event immediately before the click
+        #: that raises an inactive window. Remember that short handoff so the
+        #: raising click cannot also alter scene selection.
+        self._window_active = True
+        self._window_activated_at = float("-inf")
+        native_window = getattr(self.wnd, "_window", None)
+        if native_window is not None and hasattr(native_window, "push_handlers"):
+            native_window.push_handlers(
+                on_activate=self._on_window_activate,
+                on_deactivate=self._on_window_deactivate,
+            )
 
         #: Scroll input waiting to be applied, drained a share per frame by
         #: :meth:`_drain_scroll`.
@@ -825,6 +882,8 @@ class MeshMapApp(mglw.WindowConfig):
         self._shift_down = False
 
         self._prefs = _load_prefs()
+        self.console_messages: list[tuple[str, str]] = []
+        self._console_notices: dict[str, str] = {}
         self.navigation = NavigationPrefs.from_dict(self._prefs.get("navigation", {}))
         self.world = WorldPrefs.from_dict(self._prefs.get("world", {}))
         #: Which maps an export writes. Everything, until told otherwise --
@@ -856,10 +915,19 @@ class MeshMapApp(mglw.WindowConfig):
         self.texture_split = 0.5
         #: Where the Decal tab's inspector ends and its shelf begins.
         self.decal_split = 0.5
+        #: Where the Mesh tab's inspector ends and its scene tree begins.
+        self.mesh_split = 0.5
         try:
             stored_decal_split = self._prefs.get("decal_split")
             if stored_decal_split is not None:
                 self.decal_split = _clamp_split(float(stored_decal_split))
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            stored_mesh_split = self._prefs.get("mesh_split")
+            if stored_mesh_split is not None:
+                self.mesh_split = _clamp_split(float(stored_mesh_split))
         except (TypeError, ValueError):
             pass
 
@@ -914,6 +982,7 @@ class MeshMapApp(mglw.WindowConfig):
         self.preview_program["u_map"].value = 0
         self.preview_program["u_normalMap"].value = 1
         self.preview_program["u_material"].value = 2
+        self.preview_program["u_materialAO"].value = 12
         self.preview_program["u_liveDecal"].value = 3
         self.preview_program["u_viewProjectorTextures"].value = tuple(
             range(4, 4 + MAX_VIEW_PROJECTORS)
@@ -1003,6 +1072,9 @@ class MeshMapApp(mglw.WindowConfig):
             (1, 1), 4, data=np.array([0.0, 0.5, 1.0, 0.0], dtype="f4").tobytes(),
             dtype="f4",
         )
+        self._flat_material_ao = self.ctx.texture(
+            (1, 1), 1, data=np.ones(1, dtype="f4").tobytes(), dtype="f4"
+        )
 
         self.camera = PanOrbitCamera(
             target=(0.0, 0.0, 0.0), radius=3.0, aspect_ratio=self.wnd.aspect_ratio,
@@ -1074,6 +1146,10 @@ class MeshMapApp(mglw.WindowConfig):
         """Where the Decal tab's divider sits, as a share of the room."""
         self.decal_split = _clamp_split(value)
 
+    def set_mesh_split(self, value: float) -> None:
+        """Where the Mesh tab's divider sits, as a share of the room."""
+        self.mesh_split = _clamp_split(value)
+
     def set_texture_split(self, value: float) -> None:
         """Move the divider between the Texture tab's two panes."""
         self.texture_split = _clamp_split(value)
@@ -1123,6 +1199,7 @@ class MeshMapApp(mglw.WindowConfig):
         self._prefs["sidebar_width"] = round(self.sidebar_width, 1)
         self._prefs["texture_split"] = round(self.texture_split, 3)
         self._prefs["decal_split"] = round(self.decal_split, 3)
+        self._prefs["mesh_split"] = round(self.mesh_split, 3)
         self._prefs["navigation"] = self.navigation.as_dict()
         self._prefs["world"] = self.world.as_dict()
         self._prefs["maps"] = [name for name in MAP_NAMES if name in self.enabled_maps]
@@ -1144,7 +1221,7 @@ class MeshMapApp(mglw.WindowConfig):
             NORMAL_NAME: self.any_decal_active(),
             METALLIC_NAME: textured,
             ROUGHNESS_NAME: textured,
-            OCCLUSION_NAME: self.controller.occlusion_map is not None,
+            OCCLUSION_NAME: textured or self.controller.occlusion_map is not None,
         }
         return [
             name for name in MAP_NAMES
@@ -1213,6 +1290,10 @@ class MeshMapApp(mglw.WindowConfig):
     def _show_mesh(self, mesh: trimesh.Trimesh, info: MeshInfo) -> None:
         self.mesh = mesh
         self.mesh_info = info
+        self.mesh_name = Path(info.path).name or "Mesh"
+        self.mesh_renaming = False
+        self.mesh_renaming_opened = False
+        self.mesh_selected_index = -1
         self.controller.set_mesh(mesh)
 
         # Show the raw geometry immediately; the unwrap pass replaces this VAO
@@ -1239,6 +1320,27 @@ class MeshMapApp(mglw.WindowConfig):
     def set_status(self, message: str, *, error: bool = False) -> None:
         self.status = message
         self.status_is_error = error
+        if error:
+            self.console_log("ERROR", message)
+
+    def console_log(self, level: str, message: str, *, key: Optional[str] = None) -> None:
+        """Record a console diagnostic, deduplicating repeating frame checks."""
+        text = str(message).strip()
+        if not text:
+            return
+        if key is not None:
+            if self._console_notices.get(key) == text:
+                return
+            self._console_notices[key] = text
+        messages = getattr(self, "console_messages", None)
+        if messages is None:
+            return
+        messages.append((str(level).upper(), text))
+        del messages[:-500]
+
+    def clear_console(self) -> None:
+        self.console_messages.clear()
+        self._console_notices.clear()
 
     # -- decals -----------------------------------------------------------
 
@@ -1255,6 +1357,21 @@ class MeshMapApp(mglw.WindowConfig):
         self.decal_index = -1 if index is None else int(index)
         if not (0 <= self.decal_index < len(self.decals)):
             self.decal_index = -1
+        else:
+            self.mesh_selected_index = -1
+
+    def begin_decal_rename(self, index: int) -> None:
+        if not 0 <= index < len(self.decals):
+            return
+        self.decal_renaming_index = int(index)
+        self.decal_renaming_opened = True
+
+    def end_decal_rename(self) -> None:
+        if 0 <= self.decal_renaming_index < len(self.decals):
+            decal = self.decals[self.decal_renaming_index]
+            decal.name = decal.name.strip() or Path(decal.path).name or "Decal"
+        self.decal_renaming_index = -1
+        self.decal_renaming_opened = False
 
     def decal_image_for(self, params: DecalParams) -> Optional[DecalImage]:
         return self.decal_images.get(params.path)
@@ -1272,6 +1389,104 @@ class MeshMapApp(mglw.WindowConfig):
         return tuple(
             float(value) for value in representative(self.textures[params.texture_index])
         )
+
+    @staticmethod
+    def _rotate_vector(vector: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
+        """Rodrigues rotation used by radial decal-array instances."""
+        axis = np.asarray(axis, dtype=np.float64)
+        axis /= max(float(np.linalg.norm(axis)), 1e-12)
+        vector = np.asarray(vector, dtype=np.float64)
+        return (vector * math.cos(angle) + np.cross(axis, vector) * math.sin(angle)
+                + axis * np.dot(axis, vector) * (1.0 - math.cos(angle)))
+
+    def decal_instances(self, source: DecalParams) -> list[DecalParams]:
+        """Return the source plus transient instances made by its modifier.
+
+        Instances deliberately never enter ``self.decals``: the source remains
+        the one scene-tree item, undo subject, and inspector selection.
+        """
+        instances = [source]
+        if not source.modifiers or source.projector_center is None:
+            return instances
+
+        # Ordered modifier evaluation: every entry receives the complete
+        # result of the entry above it, exactly as an object modifier stack
+        # does. Two arrays of N and M therefore evaluate to (N+1)*(M+1)
+        # instances, while only ``source`` remains a real scene-tree decal.
+        for modifier in source.modifiers:
+            count = min(max(int(modifier.count), 0), 100)
+            evaluated = []
+            for base in instances:
+                center = np.asarray(base.projector_center, dtype=np.float64)
+                right = np.asarray(base.projector_right, dtype=np.float64)
+                up = np.asarray(base.projector_up, dtype=np.float64)
+                forward = np.asarray(base.projector_forward, dtype=np.float64)
+                local_axes = {"x": right, "y": up, "z": forward}
+                if modifier.mode == "radial":
+                    radial_axis = str(modifier.radial_axis)
+                    axis = local_axes.get(radial_axis.lstrip("-"), forward)
+                    if radial_axis.startswith("-"):
+                        axis = -axis
+                    radial = right if abs(float(np.dot(axis, right))) < 0.9 else up
+                    radius = max(float(modifier.radius), 1e-6)
+                    # The stored decal transform is the ring's pivot. Its
+                    # rendered original is index zero on the circumference;
+                    # generated copies fill the remaining equal-angle points.
+                    # Moving the stored decal therefore moves the whole ring
+                    # without offsetting the circle's center.
+                    for copy_index in range(count + 1):
+                        instance = copy.copy(base)
+                        instance.modifiers = []
+                        angle = copy_index * math.tau / (count + 1)
+                        offset = self._rotate_vector(radial * radius, axis, angle)
+                        instance.projector_center = tuple(center + offset)
+                        rotated_forward = self._rotate_vector(
+                            forward, axis, angle
+                        )
+                        # Aim every decal toward the pivot, including the
+                        # rendered original at index zero. Merely rotating the
+                        # source basis by its orbital angle leaves index zero
+                        # unchanged and makes it read as the odd static member.
+                        inward = -offset / max(float(np.linalg.norm(offset)), 1e-12)
+                        rotated_right = np.cross(inward, rotated_forward)
+                        rotated_right /= max(
+                            float(np.linalg.norm(rotated_right)), 1e-12
+                        )
+                        rotated_up = np.cross(rotated_forward, rotated_right)
+                        rotated_up /= max(float(np.linalg.norm(rotated_up)), 1e-12)
+                        instance.projector_right = tuple(rotated_right)
+                        instance.projector_up = tuple(rotated_up)
+                        instance.projector_forward = tuple(rotated_forward)
+                        evaluated.append(instance)
+                else:
+                    evaluated.append(base)
+                    for copy_index in range(1, count + 1):
+                        instance = copy.copy(base)
+                        instance.modifiers = []
+                        direction = (
+                            right * float(modifier.offset_x)
+                            + up * float(modifier.offset_y)
+                            + forward * float(modifier.offset_z)
+                        )
+                        instance.projector_center = tuple(
+                            center + direction * copy_index
+                        )
+                        evaluated.append(instance)
+            instances = evaluated
+        return instances
+
+    def live_decal_source(self, source: DecalParams) -> DecalParams:
+        """Source placement with the current G/S/R projector applied."""
+        projector = self._live_decal_projector
+        if projector is None:
+            return source
+        live = copy.copy(source)
+        live.projector_center = tuple(projector["center"])
+        live.projector_right = tuple(projector["right"])
+        live.projector_up = tuple(projector["up"])
+        live.projector_forward = tuple(projector["forward"])
+        live.projector_size = tuple(projector["size"])
+        return live
 
     def any_decal_active(self) -> bool:
         return any(params.active() for params in self.decals)
@@ -1298,7 +1513,11 @@ class MeshMapApp(mglw.WindowConfig):
         if image is None:
             return None
 
-        params = DecalParams(path=image.path, image_aspect=image.aspect)
+        params = DecalParams(
+            path=image.path,
+            name=Path(image.path).name,
+            image_aspect=image.aspect,
+        )
         if center is not None:
             params.center_u, params.center_v = center
         if face is not None:
@@ -1417,8 +1636,13 @@ class MeshMapApp(mglw.WindowConfig):
             return
         if record_undo:
             self._record_decal_undo()
-        name = Path(self.decals[index].path).name
+        name = self.decals[index].display_name()
         del self.decals[index]
+        if self.decal_renaming_index == index:
+            self.decal_renaming_index = -1
+            self.decal_renaming_opened = False
+        elif self.decal_renaming_index > index:
+            self.decal_renaming_index -= 1
         self.decal_index = min(index, len(self.decals) - 1)
         self.mark_normal_dirty()
         self.set_status(f"Removed {name}")
@@ -1476,6 +1700,9 @@ class MeshMapApp(mglw.WindowConfig):
             "bake_occlusion": self.controller.bake_occlusion,
             "textures": copy.deepcopy(self.textures),
             "texture_index": self.texture_index,
+            "mesh_material_index": self.mesh_material_index,
+            "mesh_selected_index": self.mesh_selected_index,
+            "mesh_name": self.mesh_name,
             "texture_path": self.texture_path,
             "texture_serial": self._texture_serial,
             "decals": copy.deepcopy(self.decals),
@@ -1493,6 +1720,7 @@ class MeshMapApp(mglw.WindowConfig):
             "sidebar_width": self.sidebar_width,
             "texture_split": self.texture_split,
             "decal_split": self.decal_split,
+            "mesh_split": self.mesh_split,
             "camera_target": tuple(float(value) for value in camera.target),
             "camera_radius": float(camera.radius),
             "camera_orientation": (
@@ -1556,6 +1784,9 @@ class MeshMapApp(mglw.WindowConfig):
         self.controller.bake_occlusion = snapshot["bake_occlusion"]
         self.textures = copy.deepcopy(snapshot["textures"])
         self.texture_index = snapshot["texture_index"]
+        self.mesh_material_index = snapshot["mesh_material_index"]
+        self.mesh_selected_index = snapshot["mesh_selected_index"]
+        self.mesh_name = snapshot["mesh_name"]
         self.texture_path = snapshot["texture_path"]
         self._texture_serial = snapshot["texture_serial"]
         self.decals = copy.deepcopy(snapshot["decals"])
@@ -1573,6 +1804,7 @@ class MeshMapApp(mglw.WindowConfig):
         self.sidebar_width = snapshot["sidebar_width"]
         self.texture_split = snapshot["texture_split"]
         self.decal_split = snapshot["decal_split"]
+        self.mesh_split = snapshot["mesh_split"]
         self.apply_navigation()
         self.apply_ui_scale()
         self.camera.target = glm.vec3(*snapshot["camera_target"])
@@ -1615,6 +1847,18 @@ class MeshMapApp(mglw.WindowConfig):
             self._app_undo.append(self._app_history_pending)
             del self._app_undo[:-100]
             self._app_redo.clear()
+            changed_keys = [
+                key for key in current
+                if not self._snapshots_equal(
+                    {"mesh": current["mesh"], key: current[key]},
+                    {"mesh": self._app_history_pending["mesh"],
+                     key: self._app_history_pending[key]},
+                )
+            ]
+            self._trace_action(
+                "ui_action_commit", changed=changed_keys,
+                undo_depth=len(self._app_undo), redo_depth=0,
+            )
             self._app_history_pending = None
         self._app_history_state = current
 
@@ -1634,6 +1878,9 @@ class MeshMapApp(mglw.WindowConfig):
         self._app_history_state = self._app_snapshot()
         self._app_history_pending = None
         self.set_status("Undo")
+        self._trace_action(
+            "undo", undo_depth=len(self._app_undo), redo_depth=len(self._app_redo)
+        )
         return True
 
     def redo_action(self) -> bool:
@@ -1648,7 +1895,34 @@ class MeshMapApp(mglw.WindowConfig):
         self._app_history_state = self._app_snapshot()
         self._app_history_pending = None
         self.set_status("Redo")
+        self._trace_action(
+            "redo", undo_depth=len(self._app_undo), redo_depth=len(self._app_redo)
+        )
         return True
+
+    def _record_app_undo(self, snapshot: dict) -> None:
+        """Commit an explicit interaction as one app-wide history entry."""
+        current = self._app_snapshot()
+        if self._snapshots_equal(snapshot, current):
+            self._app_history_state = current
+            self._app_history_pending = None
+            return
+        self._app_undo.append(snapshot)
+        del self._app_undo[:-100]
+        self._app_redo.clear()
+        self._app_history_state = current
+        self._app_history_pending = None
+        changed_keys = [
+            key for key in current
+            if key != "mesh" and not self._snapshots_equal(
+                {"mesh": current["mesh"], key: current[key]},
+                {"mesh": snapshot["mesh"], key: snapshot[key]},
+            )
+        ]
+        self._trace_action(
+            "app_action_commit", changed=changed_keys,
+            undo_depth=len(self._app_undo), redo_depth=0,
+        )
 
     def open_decal(self, path: str | Path) -> None:
         """Import an image and stamp it on the mesh, in the middle of the atlas.
@@ -1675,6 +1949,8 @@ class MeshMapApp(mglw.WindowConfig):
             self.end_decal_transform(keep=False)
         self.decals.clear()
         self.decal_index = -1
+        self.decal_renaming_index = -1
+        self.decal_renaming_opened = False
         self.decal_placing = False
         self.mark_normal_dirty()
         self.set_status("Decals cleared")
@@ -1682,9 +1958,49 @@ class MeshMapApp(mglw.WindowConfig):
     def mark_normal_dirty(self) -> None:
         self._normal_dirty = True
 
+    def _trace_action(self, event: str, **details) -> None:
+        """Record input together with the state needed to diagnose gestures."""
+        camera = getattr(self, "camera", None)
+        log_action(
+            event,
+            mouse=tuple(round(float(value), 2) for value in getattr(self, "_mouse", (0, 0))),
+            drag_owner=getattr(self, "_drag_owner", None),
+            decal_transform=getattr(self, "_decal_transform_mode", None),
+            decal_placing=bool(getattr(self, "decal_placing", False)),
+            dragging_decal=str(getattr(self, "dragging_decal", None)),
+            decal_index=int(getattr(self, "decal_index", -1)),
+            camera_radius=None if camera is None else float(camera.radius),
+            camera_orthographic=False if camera is None else bool(camera.orthographic),
+            pending_orbit=tuple(getattr(self, "_pending_orbit", (0.0, 0.0))),
+            pending_pan=tuple(getattr(self, "_pending_pan", (0.0, 0.0))),
+            pending_zoom=float(getattr(self, "_pending_zoom", 0.0)),
+            **details,
+        )
+
+    def _finish_decal_pointer_interaction(self, *, clear_navigation: bool) -> None:
+        """Return pointer/trackpad ownership cleanly to viewport navigation."""
+        if self._drag_owner in ("decal", "decal_transform"):
+            self._drag_owner = None
+        if clear_navigation:
+            # Placement is a discrete operation. A smoothing tail accumulated
+            # before or during its drag must not cancel the first pinch that
+            # follows and make zoom-in appear dead.
+            self._clear_pending_navigation()
+        # Re-arm the Cocoa view callback as well. Installation is idempotent,
+        # and assigning again repairs the per-window handler if AppKit changed
+        # responder state during the drag/drop operation.
+        if install_pinch_zoom(self.wnd, self.on_pinch_zoom):
+            self.pinch_zoom = True
+
     # -- keyboard decal transforms --------------------------------------
 
-    def begin_decal_transform(self, mode: str) -> bool:
+    def begin_decal_transform(
+        self,
+        mode: str,
+        *,
+        undo_snapshot: Optional[tuple[list[DecalParams], int]] = None,
+        app_undo_snapshot: Optional[dict] = None,
+    ) -> bool:
         """Start a pointer-driven G (move) or S (scale) transform."""
         params = self.selected_decal
         if params is None:
@@ -1692,6 +2008,7 @@ class MeshMapApp(mglw.WindowConfig):
             return False
         if mode not in ("move", "scale", "rotate"):
             return False
+        self._trace_action("decal_transform_begin", mode=mode)
         if self._decal_transform_mode is not None:
             if self._decal_transform_mode == mode:
                 return True
@@ -1704,6 +2021,8 @@ class MeshMapApp(mglw.WindowConfig):
             params.projector_center, params.projector_right, params.projector_up,
             params.projector_forward, params.projector_size,
         )
+        self._decal_transform_undo = undo_snapshot or self._decal_snapshot()
+        self._decal_transform_app_undo = app_undo_snapshot or self._app_snapshot()
         self._decal_transform_last_hit = None
         if params.projector_center is not None:
             self._live_decal_projector = {
@@ -1715,6 +2034,7 @@ class MeshMapApp(mglw.WindowConfig):
                 "size": params.projector_size,
                 "intensity": float(params.intensity),
                 "flip_green": 1.0 if params.flip_green else 0.0,
+                "falloff": float(params.falloff),
                 "color": self.decal_texture_color(params),
             }
         elif self._pick_geometry is not None:
@@ -1727,6 +2047,20 @@ class MeshMapApp(mglw.WindowConfig):
                 self._set_live_decal_projector(
                     image, point, params,
                     params.surface_face if params.surface_face >= 0 else None,
+                )
+        projector = self._live_decal_projector
+        self._decal_transform_plane_anchor = (
+            None if projector is None else self._cursor_plane_point(
+                self._mouse, projector["center"], projector["forward"]
+            )
+        )
+        self._decal_transform_surface_offset = None
+        if mode == "move" and projector is not None:
+            initial_hit = self.world_surface_hit_at(self._mouse)
+            if initial_hit is not None:
+                self._decal_transform_surface_offset = (
+                    np.asarray(projector["center"], dtype=np.float64)
+                    - np.asarray(initial_hit[0], dtype=np.float64)
                 )
         # Rebuild once without the decal being transformed. From here until
         # confirmation the shader projector is the only moving contribution.
@@ -1771,26 +2105,33 @@ class MeshMapApp(mglw.WindowConfig):
     def end_decal_transform(self, *, keep: bool) -> None:
         if self._decal_transform_mode is None:
             return
+        self._trace_action("decal_transform_end", keep=keep)
         params = self.selected_decal
-        before = self._decal_snapshot()
-        if params is not None and self._decal_transform_anchor is not None:
-            restored = before[0][self.decal_index]
-            (restored.center_u, restored.center_v, restored.surface_face, restored.scale,
-             restored.scale_x, restored.scale_y, restored.rotation,
-             restored.projector_center, restored.projector_right, restored.projector_up,
-             restored.projector_forward, restored.projector_size) = self._decal_transform_anchor
-        if not keep and params is not None and self._decal_transform_anchor is not None:
-            (params.center_u, params.center_v, params.surface_face, params.scale,
-             params.scale_x, params.scale_y, params.rotation,
-             params.projector_center, params.projector_right, params.projector_up,
-             params.projector_forward, params.projector_size) = self._decal_transform_anchor
+        before = self._decal_transform_undo or self._decal_snapshot()
+        app_before = self._decal_transform_app_undo
+        if not keep:
+            self.decals, self.decal_index = copy.deepcopy(before)
+            params = self.selected_decal
             self.mark_normal_dirty()
-        elif keep and params is not None and self._decal_transform_last_hit is not None:
-            uv, face = self._decal_transform_last_hit
-            params.center_u, params.center_v = uv
-            params.surface_face = int(face)
-            params.surface_aspect = self.measure_uv_aspect(face)
-            self.mark_normal_dirty()
+        elif params is not None and self._decal_transform_last_hit is not None:
+            # G is relative to the cursor. Once an off-mesh grab offset has
+            # been established, the cursor hit and visible projector centre
+            # are deliberately different. Persist the projector's actual
+            # surface point or a radial stack rebuilds around another pivot
+            # and jumps as soon as the transform is confirmed.
+            location = None
+            if self._live_decal_projector is not None:
+                location = self._surface_location_at_world_point(
+                    self._live_decal_projector["center"]
+                )
+            if location is None:
+                location = self._decal_transform_last_hit
+            if location is not None:
+                uv, face = location
+                params.center_u, params.center_v = uv
+                params.surface_face = int(face)
+                params.surface_aspect = self.measure_uv_aspect(face)
+                self.mark_normal_dirty()
         if keep and params is not None and self._live_decal_projector is not None:
             self._commit_live_projector(params, self._live_decal_projector)
         if keep:
@@ -1799,9 +2140,43 @@ class MeshMapApp(mglw.WindowConfig):
         self._decal_transform_mode = None
         self._decal_transform_axis = None
         self._decal_transform_anchor = None
+        self._decal_transform_plane_anchor = None
+        self._decal_transform_surface_offset = None
         self._decal_transform_last_hit = None
+        self._decal_transform_undo = None
+        self._decal_transform_app_undo = None
         self._live_decal_projector = None
+        # A confirming click is fully consumed by this modal operation. Do
+        # not leave its owner latched until a release event that Cocoa may
+        # coalesce with the next trackpad gesture.
+        self._finish_decal_pointer_interaction(clear_navigation=False)
         self.mark_normal_dirty()
+        if keep and app_before is not None:
+            self._record_app_undo(app_before)
+
+    def duplicate_selected_decal(self) -> bool:
+        """Clone the selected decal and immediately move the clone."""
+        if self._decal_transform_mode is not None:
+            self.end_decal_transform(keep=False)
+        source = self.selected_decal
+        if source is None:
+            self.set_status("Select a decal before pressing Shift+D", error=True)
+            return False
+
+        before = self._decal_snapshot()
+        app_before = self._app_snapshot()
+        self.decals.append(copy.deepcopy(source))
+        self.decal_index = len(self.decals) - 1
+        self.mark_normal_dirty()
+        if not self.begin_decal_transform(
+            "move", undo_snapshot=before, app_undo_snapshot=app_before
+        ):
+            self.decals, self.decal_index = before
+            return False
+        self.set_status(
+            "Duplicated decal - move the pointer, then click or press Enter to place"
+        )
+        return True
 
     def transform_decal_with_pointer(self, dx: float, dy: float) -> bool:
         """Apply ordinary cursor motion to the active decal transform.
@@ -1822,13 +2197,49 @@ class MeshMapApp(mglw.WindowConfig):
             if axis is None:
                 hit = self.surface_hit_at(self._mouse)
                 world_hit = self.world_surface_hit_at(self._mouse)
-                if hit is None or world_hit is None:
-                    return False
-                uv, face = hit
-                self._decal_transform_last_hit = (uv, int(face))
                 image = self.decal_images.get(params.path)
-                if image is not None:
-                    self._set_live_decal_projector(image, world_hit[0], params, int(face))
+                if hit is not None and world_hit is not None:
+                    uv, face = hit
+                    self._decal_transform_last_hit = (uv, int(face))
+                    projector = self._live_decal_projector
+                    point = np.asarray(world_hit[0], dtype=np.float64)
+                    if projector is not None and self._decal_transform_surface_offset is None:
+                        # Crossing from empty viewport space onto a polygon is
+                        # a coordinate-system transition, not a request to put
+                        # the decal under the cursor. Latch the current grab
+                        # offset before applying this hit, making the first
+                        # surface frame exactly continuous with the last plane
+                        # frame.
+                        self._decal_transform_surface_offset = (
+                            np.asarray(projector["center"], dtype=np.float64) - point
+                        )
+                    if self._decal_transform_surface_offset is not None:
+                        point = point + self._decal_transform_surface_offset
+                    if image is not None:
+                        self._set_live_decal_projector(
+                            image, point, params, int(face)
+                        )
+                else:
+                    projector = self._live_decal_projector
+                    anchor = self._decal_transform_plane_anchor
+                    original = (
+                        None if self._decal_transform_anchor is None
+                        else self._decal_transform_anchor[7]
+                    )
+                    if projector is None or anchor is None or original is None:
+                        return False
+                    point = self._cursor_plane_point(
+                        self._mouse, original, projector["forward"]
+                    )
+                    if point is None:
+                        return False
+                    projector["center"] = tuple(
+                        np.asarray(original, dtype=np.float64) + point - anchor
+                    )
+                    # Re-establish the cursor grab offset if the pointer later
+                    # enters the mesh; the off-mesh plane may have moved the
+                    # projector any distance from its previous surface hit.
+                    self._decal_transform_surface_offset = None
             else:
                 _, _, width, height = self.viewport_rect
                 if axis == "x":
@@ -1879,6 +2290,8 @@ class MeshMapApp(mglw.WindowConfig):
                 up = np.asarray(projector["up"], dtype=np.float64)
                 projector["right"] = tuple(right * cosine + up * sine)
                 projector["up"] = tuple(up * cosine - right * sine)
+        if params.modifiers:
+            self.mark_normal_dirty()
         return True
 
     # -- placing a decal by pointing at the mesh --------------------------
@@ -1890,6 +2303,7 @@ class MeshMapApp(mglw.WindowConfig):
         than leaving it wherever the cursor last wandered.
         """
         params = self.selected_decal
+        self._trace_action("decal_placement_begin")
         if params is None or not params.loaded():
             self.set_status("Import a normal map first", error=True)
             return
@@ -1908,6 +2322,7 @@ class MeshMapApp(mglw.WindowConfig):
         """Drop the decal where it is, or put it back where it came from."""
         if not self.decal_placing:
             return
+        self._trace_action("decal_placement_end", keep=keep)
         self.decal_placing = False
 
         params = self.selected_decal
@@ -1925,6 +2340,7 @@ class MeshMapApp(mglw.WindowConfig):
             )
         self._decal_anchor = None
         self._decal_placement_undo = None
+        self._finish_decal_pointer_interaction(clear_navigation=True)
 
     def follow_cursor_with_decal(self) -> bool:
         """Move the decal to the surface under the cursor. False if it missed.
@@ -1994,6 +2410,29 @@ class MeshMapApp(mglw.WindowConfig):
         point = np.asarray(ray[0]) + np.asarray(ray[1]) * float(distance)
         return point, int(face)
 
+    def _surface_location_at_world_point(
+        self, point
+    ) -> Optional[tuple[tuple[float, float], int]]:
+        """Find the nearest mesh UV and face to a live projector centre."""
+        if self._pick_geometry is None:
+            return None
+        vertices, faces, uvs = self._pick_geometry
+        if len(faces) == 0:
+            return None
+        triangles = vertices[faces]
+        query = np.broadcast_to(
+            np.asarray(point, dtype=np.float64), (len(triangles), 3)
+        )
+        closest = trimesh.triangles.closest_point(triangles, query)
+        delta = closest - query
+        distances = np.einsum("ij,ij->i", delta, delta)
+        face = int(np.argmin(distances))
+        barycentric = trimesh.triangles.points_to_barycentric(
+            triangles[face:face + 1], closest[face:face + 1]
+        )[0]
+        uv = barycentric @ uvs[faces[face]]
+        return (float(uv[0]), float(uv[1])), face
+
     def _cursor_ray(self, mouse: tuple[float, float]):
         """The ray a cursor position casts into the scene, in world space."""
         if self._pick_geometry is None:
@@ -2015,6 +2454,26 @@ class MeshMapApp(mglw.WindowConfig):
         mvp = self.camera.projection_matrix * self.camera.matrix
         inverse = np.array(glm.inverse(mvp).to_list(), dtype=np.float64).T
         return screen_ray(inverse, ndc_x, ndc_y)
+
+    def _cursor_plane_point(self, mouse, plane_point, plane_normal):
+        """Intersect the cursor ray with a decal's tangent plane.
+
+        Unlike mesh picking this remains defined over empty viewport space,
+        which lets Blender-style transforms follow pointer deltas without the
+        cursor having to remain directly over a polygon.
+        """
+        ray = self._cursor_ray(mouse)
+        if ray is None:
+            return None
+        origin = np.asarray(ray[0], dtype=np.float64)
+        direction = np.asarray(ray[1], dtype=np.float64)
+        point = np.asarray(plane_point, dtype=np.float64)
+        normal = np.asarray(plane_normal, dtype=np.float64)
+        denominator = float(np.dot(direction, normal))
+        if abs(denominator) < 1e-8:
+            return None
+        distance = float(np.dot(point - origin, normal) / denominator)
+        return origin + direction * distance
 
     def measure_uv_aspect(self, face: Optional[int] = None) -> float:
         """How far from square a UV rectangle lands on this mesh. 1.0 is square.
@@ -2154,9 +2613,23 @@ class MeshMapApp(mglw.WindowConfig):
         # Additive, so the passes accumulate instead of overwriting.
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.ONE, moderngl.ONE
-        placements = list(self.decals)
-        if self._decal_transform_mode is not None and 0 <= self.decal_index < len(placements):
-            del placements[self.decal_index]
+        placements = []
+        for index, source in enumerate(self.decals):
+            evaluated = (
+                self.live_decal_source(source)
+                if self._decal_transform_mode is not None and index == self.decal_index
+                else source
+            )
+            instances = self.decal_instances(evaluated)
+            if self._decal_transform_mode is not None and index == self.decal_index:
+                # With no modifiers, the editable source is the sharp live
+                # projector below. A modifier stack must evaluate *all* of its
+                # output instead: radial mode uses the live source transform
+                # as its circle centre, so drawing the bare source would make
+                # a decal snap into the middle during G/S/R.
+                if not source.modifiers:
+                    instances = instances[1:]
+            placements.extend(instances)
         if not self._full_decal_render_requested:
             # The newest projectors are sampled from their source images in
             # the mesh shader, preserving detail at any on-screen size. Keep
@@ -2472,17 +2945,23 @@ class MeshMapApp(mglw.WindowConfig):
             return None
 
         if params.projector_center is not None:
-            center = np.asarray(params.projector_center, dtype=np.float64)
-            right = np.asarray(params.projector_right, dtype=np.float64)
-            up = np.asarray(params.projector_up, dtype=np.float64)
-            width, height = params.projector_size
-            corners = [
-                center - right * width * 0.5 - up * height * 0.5,
-                center + right * width * 0.5 - up * height * 0.5,
-                center + right * width * 0.5 + up * height * 0.5,
-                center - right * width * 0.5 + up * height * 0.5,
-            ]
-            return np.asarray(corners + [corners[0]])
+            outlines = []
+            for instance in self.decal_instances(params):
+                center = np.asarray(instance.projector_center, dtype=np.float64)
+                right = np.asarray(instance.projector_right, dtype=np.float64)
+                up = np.asarray(instance.projector_up, dtype=np.float64)
+                width, height = instance.projector_size
+                corners = [
+                    center - right * width * 0.5 - up * height * 0.5,
+                    center + right * width * 0.5 - up * height * 0.5,
+                    center + right * width * 0.5 + up * height * 0.5,
+                    center - right * width * 0.5 + up * height * 0.5,
+                ]
+                outlines.extend(
+                    (corners[index], corners[(index + 1) % 4])
+                    for index in range(4)
+                )
+            return outlines
 
         key = (params.key(), self._vao_token)
         if key != self._outline_key:
@@ -2540,6 +3019,10 @@ class MeshMapApp(mglw.WindowConfig):
         if not 0 <= index < len(self.textures):
             return
         self.texture_index = index
+        # One renderable mesh currently means the material being inspected is
+        # also the one assigned to it. The explicit field prevents this
+        # relationship being buried in the UI when multi-mesh rendering lands.
+        self.mesh_material_index = index
         self.texture_path = ()
         self.end_rename()
         self.mark_texture_dirty()
@@ -2555,6 +3038,10 @@ class MeshMapApp(mglw.WindowConfig):
                 decal.texture_index = -1
             elif decal.texture_index > removed:
                 decal.texture_index -= 1
+        if self.mesh_material_index == removed:
+            self.mesh_material_index = min(removed, len(self.textures) - 1)
+        elif self.mesh_material_index > removed:
+            self.mesh_material_index -= 1
         self.texture_index = min(self.texture_index, len(self.textures) - 1)
         self.texture_path = ()
         self.end_rename()
@@ -2563,6 +3050,49 @@ class MeshMapApp(mglw.WindowConfig):
             self._sync_texture_thumbnails()
         self.mark_texture_dirty()
         self.set_status(f"Removed {name}")
+
+    def select_scene_mesh(self, index: Optional[int]) -> None:
+        """Select the current scene mesh, or clear scene selection."""
+        self.mesh_selected_index = 0 if index == 0 and self.mesh is not None else -1
+        if self.mesh_selected_index == 0:
+            self.select_decal(None)
+
+    def begin_mesh_rename(self) -> None:
+        if self.mesh is None:
+            return
+        self.mesh_renaming = True
+        self.mesh_renaming_opened = True
+
+    def end_mesh_rename(self) -> None:
+        self.mesh_name = self.mesh_name.strip() or "Mesh"
+        self.mesh_renaming = False
+        self.mesh_renaming_opened = False
+
+    def assign_mesh_material(self, index: int) -> None:
+        """Assign a project material to the selected scene mesh."""
+        if self.mesh_selected_index != 0 or not 0 <= index < len(self.textures):
+            return
+        self.mesh_material_index = int(index)
+        self.select_texture(index)
+        self.set_status(f"Assigned {describe(self.textures[index])} to the mesh")
+
+    def mesh_selection_outline(self):
+        """World-space bounding-box edges for the selected scene mesh."""
+        if self.mesh_selected_index != 0 or self.mesh is None:
+            return None
+        low, high = np.asarray(self.mesh.bounds, dtype=np.float64)
+        corners = np.asarray([
+            (low[0], low[1], low[2]), (high[0], low[1], low[2]),
+            (high[0], high[1], low[2]), (low[0], high[1], low[2]),
+            (low[0], low[1], high[2]), (high[0], low[1], high[2]),
+            (high[0], high[1], high[2]), (low[0], high[1], high[2]),
+        ])
+        edges = (
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        )
+        return [(corners[first], corners[second]) for first, second in edges]
 
     @property
     def selected_slot(self) -> Optional[Slot]:
@@ -2833,6 +3363,8 @@ class MeshMapApp(mglw.WindowConfig):
         # The surface channels the texture carries: metal, rough, alpha, glow.
         material = self.compositor.material_texture
         (material or self._flat_material).use(2)
+        material_ao = self.compositor.ambient_occlusion_texture
+        (material_ao or self._flat_material_ao).use(12)
 
         view = self.camera.matrix
         mvp = self.camera.projection_matrix * view
@@ -2852,7 +3384,16 @@ class MeshMapApp(mglw.WindowConfig):
 
         projector = self._live_decal_projector
         live_texture = None if projector is None else self.decal_textures.get(projector["path"])
-        live = projector is not None and live_texture is not None
+        selected = self.selected_decal
+        modifier_transform = (
+            self._decal_transform_mode is not None
+            and selected is not None
+            and bool(selected.modifiers)
+        )
+        # A bare live projector is correct only for an unmodified decal. With
+        # modifiers, the source transform is an evaluation pivot and the
+        # complete stack is supplied through u_viewProjectors below.
+        live = projector is not None and live_texture is not None and not modifier_transform
         self.preview_program["u_useLiveDecal"].value = 1.0 if live else 0.0
         if live:
             live_texture.use(3)
@@ -2863,6 +3404,7 @@ class MeshMapApp(mglw.WindowConfig):
             self.preview_program["u_projectorSize"].value = projector["size"]
             self.preview_program["u_projectorIntensity"].value = projector["intensity"]
             self.preview_program["u_projectorFlipGreen"].value = projector["flip_green"]
+            self.preview_program["u_projectorFalloff"].value = projector["falloff"]
         live_color = None if projector is None else projector.get("color")
         self.preview_program["u_liveProjectorUseColor"].value = (
             1.0 if live and live_color is not None else 0.0
@@ -2875,14 +3417,27 @@ class MeshMapApp(mglw.WindowConfig):
             if params.projector_center is None or not params.active():
                 continue
             if self._decal_transform_mode is not None and index == self.decal_index:
+                decal_texture = self.decal_textures.get(params.path)
+                if decal_texture is not None:
+                    evaluated = self.decal_instances(self.live_decal_source(params))
+                    view_projectors.extend(
+                        (instance, decal_texture)
+                        for instance in (
+                            evaluated if params.modifiers else evaluated[1:]
+                        )
+                    )
                 continue
             decal_texture = self.decal_textures.get(params.path)
             if decal_texture is not None:
-                view_projectors.append((params, decal_texture))
+                view_projectors.extend(
+                    (instance, decal_texture)
+                    for instance in self.decal_instances(params)
+                )
         view_projectors = view_projectors[-MAX_VIEW_PROJECTORS:]
         self.preview_program["u_viewProjectorCount"].value = len(view_projectors)
         if view_projectors:
-            centers, rights, ups, forwards, sizes, intensities, flips = [], [], [], [], [], [], []
+            centers, rights, ups, forwards, sizes = [], [], [], [], []
+            intensities, flips, falloffs = [], [], []
             colors, use_colors = [], []
             for unit, (params, decal_texture) in enumerate(view_projectors, start=4):
                 decal_texture.use(unit)
@@ -2893,6 +3448,7 @@ class MeshMapApp(mglw.WindowConfig):
                 sizes.append(params.projector_size)
                 intensities.append(float(params.intensity))
                 flips.append(1.0 if params.flip_green else 0.0)
+                falloffs.append(float(params.falloff))
                 color = self.decal_texture_color(params)
                 colors.append(color or (0.0, 0.0, 0.0))
                 use_colors.append(1.0 if color is not None else 0.0)
@@ -2912,6 +3468,7 @@ class MeshMapApp(mglw.WindowConfig):
             program["u_viewProjectorSizes"].write(padded(sizes, 2))
             program["u_viewProjectorIntensities"].write(padded(intensities))
             program["u_viewProjectorFlipGreens"].write(padded(flips))
+            program["u_viewProjectorFalloffs"].write(padded(falloffs))
             program["u_viewProjectorColors"].write(padded(colors, 3))
             program["u_viewProjectorUseColors"].write(padded(use_colors))
 
@@ -2958,6 +3515,12 @@ class MeshMapApp(mglw.WindowConfig):
                 self.camera, outline, self.viewport_rect,
                 self.wnd.buffer_size[1], self.ui_pixel_scale,
             )
+        mesh_outline = self.mesh_selection_outline()
+        if mesh_outline is not None:
+            decal_gizmo.draw(
+                self.camera, mesh_outline, self.viewport_rect,
+                self.wnd.buffer_size[1], self.ui_pixel_scale,
+            )
 
         alpha = self.light_hint_alpha()
         if alpha > 0.0 and self.mesh is not None:
@@ -2992,6 +3555,7 @@ class MeshMapApp(mglw.WindowConfig):
         self.camera.projection.update(aspect_ratio=self.wnd.aspect_ratio)
 
     def on_files_dropped_event(self, x: int, y: int, paths: list[str]) -> None:
+        self._trace_action("files_dropped", x=x, y=y, paths=list(paths))
         for raw in paths:
             candidate = Path(raw)
             if candidate.suffix.lower() in SUPPORTED_SUFFIXES:
@@ -3002,22 +3566,34 @@ class MeshMapApp(mglw.WindowConfig):
     def on_key_event(self, key, action, modifiers) -> None:
         self.gui.key_event(key, action, modifiers)
         self._modifiers = modifiers
+        self._trace_action(
+            "key", key=str(key), action=str(action),
+            shift=bool(modifiers.shift), ctrl=bool(modifiers.ctrl),
+            alt=bool(modifiers.alt),
+        )
         keys = self.wnd.keys
         if key in (getattr(keys, "LEFT_SHIFT", None), getattr(keys, "RIGHT_SHIFT", None)):
             self._shift_down = action != keys.ACTION_RELEASE
-        if imgui.get_io().want_capture_keyboard:
-            return
-
         if action != keys.ACTION_PRESS:
             return
 
-        if key == getattr(keys, "Z", None) and modifiers.ctrl:
+        # Application undo is a global shortcut, including while a numeric
+        # inspector field has keyboard focus. On macOS the expected modifier
+        # is Command; Ctrl-Z remains the convention on other platforms.
+        if key == getattr(keys, "Z", None) and _primary_shortcut_down(modifiers):
             if self._decal_transform_mode is not None:
                 self.end_decal_transform(keep=False)
             if modifiers.shift:
                 self.redo_action()
             else:
                 self.undo_action()
+            return
+
+        if imgui.get_io().want_capture_keyboard:
+            return
+
+        if key == getattr(keys, "D", None) and modifiers.shift:
+            self.duplicate_selected_decal()
             return
 
         if key == keys.ESCAPE:
@@ -3064,11 +3640,14 @@ class MeshMapApp(mglw.WindowConfig):
         elif key == keys.L:
             self.lighting = not self.lighting
         elif key == getattr(keys, "G", None):
-            self.begin_decal_transform("move")
+            if self.mouse_over_viewport():
+                self.begin_decal_transform("move")
         elif key == getattr(keys, "S", None):
-            self.begin_decal_transform("scale")
+            if self.mouse_over_viewport():
+                self.begin_decal_transform("scale")
         elif key == getattr(keys, "R", None):
-            self.begin_decal_transform("rotate")
+            if self.mouse_over_viewport():
+                self.begin_decal_transform("rotate")
         elif key == getattr(keys, "X", None):
             self.request_delete_selected()
         elif key in (getattr(keys, "EQUAL", None), getattr(keys, "PLUS", None)):
@@ -3077,12 +3656,25 @@ class MeshMapApp(mglw.WindowConfig):
             self.set_ui_scale(self.ui_scale - 0.1)
 
     def on_unicode_char_entered(self, char: str) -> None:
+        self._trace_action("text_input", char=char)
         self.gui.unicode_char_entered(char)
+
+    def _on_window_activate(self) -> None:
+        """Mark the imminent mouse press as focus-only when raising the app."""
+        if not self._window_active:
+            self._window_activated_at = time.monotonic()
+        self._window_active = True
+        self._trace_action("window_activate")
+
+    def _on_window_deactivate(self) -> None:
+        self._window_active = False
+        self._trace_action("window_deactivate")
 
     def on_mouse_position_event(self, x: int, y: int, dx: int, dy: int) -> None:
         self.gui.mouse_position_event(x, y, dx, dy)
         self._mouse = (float(x), float(y))
         self._modifiers = self.wnd.modifiers
+        self._trace_action("mouse_move", x=x, y=y, dx=dx, dy=dy)
 
         if self.dragging_decal is not None:
             self._update_dragged_decal_preview()
@@ -3098,6 +3690,21 @@ class MeshMapApp(mglw.WindowConfig):
     def on_mouse_press_event(self, x: int, y: int, button: int) -> None:
         self._mouse = (float(x), float(y))
         self._modifiers = self.wnd.modifiers
+        # A click carries a trustworthy modifier snapshot. Reset the cached
+        # Shift latch from it so a release event missed while a native popup or
+        # combo owned focus cannot leave subsequent two-finger gestures panning.
+        self._shift_down = bool(self._modifiers.shift)
+        self._trace_action(
+            "mouse_press", x=x, y=y, button=button,
+            shift=bool(self._modifiers.shift), ctrl=bool(self._modifiers.ctrl),
+            alt=bool(self._modifiers.alt),
+        )
+
+        if time.monotonic() - self._window_activated_at < 0.25:
+            self._window_activated_at = float("-inf")
+            self._drag_owner = "activation"
+            self._press_at = None
+            return
 
         # The sidebar's edge is claimed before ImGui is even told about the
         # press. Half the band lies over the panel's last few pixels -- which
@@ -3143,6 +3750,10 @@ class MeshMapApp(mglw.WindowConfig):
             target = gizmo.pick(self.camera, self._gizmo_center(), self.ui_pixel_scale,
                                 self._mouse)
             if target is not None:
+                # Axis alignment is a discrete camera command. Any smoothed
+                # tail left by the preceding trackpad gesture belongs to the
+                # old view and must not move the newly aligned camera later.
+                self._clear_pending_navigation()
                 self.camera.align_to_axis(target.axis)
                 self._drag_owner = "gizmo"
                 self.set_status(
@@ -3157,6 +3768,10 @@ class MeshMapApp(mglw.WindowConfig):
         self._drag_owner = "camera"
 
     def on_mouse_release_event(self, x: int, y: int, button: int) -> None:
+        self._trace_action("mouse_release", x=x, y=y, button=button)
+        if self._drag_owner == "activation":
+            self._drag_owner = None
+            return
         if self._drag_owner == "sidebar":
             # ImGui never saw the press, so it must not see the release either.
             self._drag_owner = None
@@ -3193,29 +3808,38 @@ class MeshMapApp(mglw.WindowConfig):
             uv, face = hit
             world_hit = self.world_surface_hit_at(mouse)
             for candidate in range(len(self.decals) - 1, -1, -1):
-                params = self.decals[candidate]
-                if params.projector_center is not None and world_hit is not None:
-                    offset = world_hit[0] - np.asarray(params.projector_center)
-                    local_x = float(np.dot(offset, params.projector_right))
-                    local_y = float(np.dot(offset, params.projector_up))
-                    width, height = params.projector_size
-                    if abs(local_x) <= width * 0.5 and abs(local_y) <= height * 0.5:
+                source = self.decals[candidate]
+                for params in reversed(self.decal_instances(source)):
+                    if params.projector_center is not None and world_hit is not None:
+                        offset = world_hit[0] - np.asarray(params.projector_center)
+                        local_x = float(np.dot(offset, params.projector_right))
+                        local_y = float(np.dot(offset, params.projector_up))
+                        width, height = params.projector_size
+                        if (abs(local_x) <= width * 0.5
+                                and abs(local_y) <= height * 0.5):
+                            index = candidate
+                            break
+                        continue
+                    point = uv
+                    if params.surface_face >= 0:
+                        point = self._surface_uv_on_wrap(params.surface_face, face, uv)
+                        if point is None:
+                            continue
+                    if decal_contains(params, *point):
                         index = candidate
                         break
-                    continue
-                point = uv
-                if params.surface_face >= 0:
-                    point = self._surface_uv_on_wrap(params.surface_face, face, uv)
-                    if point is None:
-                        continue
-                if decal_contains(params, *point):
-                    index = candidate
+                if index is not None:
                     break
         self.select_decal(index)
-        if index is None:
-            self.set_status("No decal there")
+        if index is None and hit is not None:
+            self.select_scene_mesh(0)
+            name = Path(self.mesh_info.path).name if self.mesh_info else "mesh"
+            self.set_status(f"Selected {name}")
+        elif index is None:
+            self.select_scene_mesh(None)
+            self.set_status("Nothing selected")
         else:
-            self.set_status(f"Selected {Path(self.decals[index].path).name}")
+            self.set_status(f"Selected {self.decals[index].display_name()}")
         return index
 
     def begin_decal_drag(self, path: str | Path) -> None:
@@ -3312,6 +3936,7 @@ class MeshMapApp(mglw.WindowConfig):
             ),
             "intensity": float(params.intensity),
             "flip_green": 1.0 if params.flip_green else 0.0,
+            "falloff": float(params.falloff),
             "color": self.decal_texture_color(params),
         }
 
@@ -3351,6 +3976,53 @@ class MeshMapApp(mglw.WindowConfig):
         params.projector_up = tuple(projector["up"])
         params.projector_forward = tuple(projector["forward"])
         params.projector_size = tuple(projector["size"])
+
+    def sync_decal_inspector_projector(
+        self, params: DecalParams, previous: tuple[float, ...]
+    ) -> None:
+        """Apply inspector placement fields to the committed GPU projector.
+
+        Keyboard transforms already manipulate this basis directly. Inspector
+        sliders must do the same or their numeric values change while the
+        high-resolution direct projector keeps drawing the old transform.
+        """
+        if params.projector_center is None:
+            return
+        old_u, old_v, old_scale, old_x, old_y, old_rotation = previous
+
+        if (params.scale, params.scale_x, params.scale_y) != (
+            old_scale, old_x, old_y
+        ):
+            base = max(
+                (self.mesh_info.scale if self.mesh_info else 1.0) * params.scale,
+                1e-6,
+            )
+            params.projector_size = (
+                base * max(params.scale_x, 1e-6),
+                base * max(params.scale_y, 1e-6)
+                / max(params.image_aspect, 1e-6),
+            )
+
+        if params.rotation != old_rotation:
+            angle = math.radians(float(params.rotation) - float(old_rotation))
+            cosine, sine = math.cos(angle), math.sin(angle)
+            right = np.asarray(params.projector_right, dtype=np.float64)
+            up = np.asarray(params.projector_up, dtype=np.float64)
+            params.projector_right = tuple(right * cosine + up * sine)
+            params.projector_up = tuple(up * cosine - right * sine)
+
+        if (params.center_u, params.center_v) != (old_u, old_v) \
+                and self._pick_geometry is not None:
+            vertices, faces, uvs = self._pick_geometry
+            point = surface_at_uv(
+                vertices, faces, uvs, params.center_u, params.center_v
+            )
+            if point is not None:
+                params.projector_center = tuple(float(value) for value in point)
+                face = face_at_uv(faces, uvs, params.center_u, params.center_v)
+                if face is not None:
+                    params.surface_face = int(face)
+                    params.surface_aspect = self.measure_uv_aspect(face)
 
     def _update_dragged_decal_preview(self) -> bool:
         """Move the view-aligned GPU projector to the cursor's surface hit."""
@@ -3460,6 +4132,7 @@ class MeshMapApp(mglw.WindowConfig):
         self._clear_dragged_decal_preview()
         if hit is None:
             self.set_status("Dropped nowhere - drag a decal onto the model")
+            self._finish_decal_pointer_interaction(clear_navigation=True)
             return False
         uv, face = hit
         if str(path) not in self.decal_images:
@@ -3471,10 +4144,12 @@ class MeshMapApp(mglw.WindowConfig):
             if index is not None and projector is not None:
                 self._commit_live_projector(self.decals[index], projector)
                 self.mark_normal_dirty()
+        self._finish_decal_pointer_interaction(clear_navigation=True)
         return True
 
     def on_mouse_drag_event(self, x: int, y: int, dx: int, dy: int) -> None:
         self._mouse = (float(x), float(y))
+        self._trace_action("mouse_drag", x=x, y=y, dx=dx, dy=dy)
 
         if self.dragging_decal is not None:
             self._update_dragged_decal_preview()
@@ -3490,6 +4165,8 @@ class MeshMapApp(mglw.WindowConfig):
         self.gui.mouse_drag_event(x, y, dx, dy)
         if self._drag_owner != "camera":
             return
+        if not self.mouse_over_viewport():
+            return
 
         # Clamp, never discard: dropping the event stalls the view for a frame,
         # which is exactly what a fast flick feels like it should not do.
@@ -3497,6 +4174,12 @@ class MeshMapApp(mglw.WindowConfig):
         dy = float(np.clip(dy, -_MAX_DRAG_STEP, _MAX_DRAG_STEP))
 
         states = self.wnd.mouse_states
+        # A click is allowed a few pixels of ordinary hand jitter so selection
+        # remains reliable. Do not feed those same pixels into orbit/pan/zoom:
+        # in an orthographic axis view even a tiny right-button-style delta
+        # reads as the camera jumping when the decal is selected on release.
+        if self._was_a_click():
+            return
         panning = states.middle or (states.left and self.wnd.modifiers.shift)
         if panning:
             self.camera.pan(dx, dy)
@@ -3506,14 +4189,20 @@ class MeshMapApp(mglw.WindowConfig):
             self.camera.zoom_state(-dy * 0.25)
 
     def on_mouse_scroll_event(self, x_offset: float, y_offset: float) -> None:
+        self._trace_action("scroll", x_offset=x_offset, y_offset=y_offset)
         if self._decal_transform_mode is not None:
             # Modal decal transforms use ordinary one-finger pointer motion.
             # Do not orbit the camera underneath one if a second finger happens
             # to touch the pad before the transform is confirmed.
             return
-        self.gui.mouse_scroll_event(x_offset, y_offset)
         over_viewport = getattr(self, "mouse_over_viewport", lambda: False)()
-        if imgui.get_io().want_capture_mouse and not over_viewport:
+        # The sidebar follows direct-content trackpad scrolling: dragging two
+        # fingers down moves the panel contents up. Keep the raw deltas for the
+        # viewport, whose orbit direction is a separate navigation contract.
+        self.gui.mouse_scroll_event(
+            x_offset, y_offset if over_viewport else -y_offset
+        )
+        if not over_viewport:
             return
 
         # Blender-style trackpad navigation: translating two fingers orbits,
@@ -3549,11 +4238,22 @@ class MeshMapApp(mglw.WindowConfig):
         scroll zoom, so a gesture that lands several events in one frame is
         applied once, at the sum.
         """
-        over_viewport = getattr(self, "mouse_over_viewport", lambda: False)()
-        if imgui.get_io().want_capture_mouse and not over_viewport:
-            return
+        # A native magnification gesture is unambiguously zoom, unlike a
+        # two-finger scroll which may belong to a sidebar. Do not consult
+        # ImGui's want_capture_mouse here: it can remain latched after a click
+        # that changes scene selection, making pinch appear dead until another
+        # widget happens to clear the capture flag. Web-style pinch works
+        # regardless of which pane the stationary pointer is over.
 
+        raw_magnification = float(magnification)
         magnification = float(np.clip(magnification, -_MAX_PINCH_STEP, _MAX_PINCH_STEP))
+        trace = getattr(self, "_trace_action", None)
+        if trace is not None:
+            trace(
+                "pinch", raw_magnification=raw_magnification,
+                magnification=magnification,
+                pinch_installed=bool(getattr(self, "pinch_zoom", False)),
+            )
         # scroll_speed applies here for the same reason it applies to scroll:
         # this is a trackpad gesture, and the wheel's speed rarely suits it.
         self._queue_scroll(
@@ -3578,6 +4278,16 @@ class MeshMapApp(mglw.WindowConfig):
         self._scroll_arrived += (
             abs(orbit[0]) + abs(orbit[1]) + abs(pan[0]) + abs(pan[1]) + abs(zoom)
         )
+
+    def _clear_pending_navigation(self) -> None:
+        """Discard the inertial tail when a discrete view command takes over."""
+        self._pending_orbit[:] = [0.0, 0.0]
+        self._pending_pan[:] = [0.0, 0.0]
+        self._pending_zoom = 0.0
+        self._scroll_arrived = 0.0
+        self._scroll_rate = 0.0
+        self._scroll_idle = 0
+        self._scroll_gaps = 0
 
     def _track_arrival_rate(self) -> None:
         """Update :attr:`_scroll_rate`: input per frame, averaged over arrivals.
@@ -3670,6 +4380,8 @@ class MeshMapApp(mglw.WindowConfig):
         if pending < 0.05:
             share = 1.0
 
+        radius_before = float(self.camera.radius)
+
         if self._pending_orbit[0] or self._pending_orbit[1]:
             self.camera.rot_state(
                 self._pending_orbit[0] * share, self._pending_orbit[1] * share
@@ -3683,6 +4395,12 @@ class MeshMapApp(mglw.WindowConfig):
         if self._pending_zoom:
             self.camera.zoom_state(self._pending_zoom * share)
             self._pending_zoom *= 1.0 - share
+        trace = getattr(self, "_trace_action", None)
+        if trace is not None:
+            trace(
+                "navigation_applied", share=share, pending_magnitude=pending,
+                radius_before=radius_before, radius_after=float(self.camera.radius),
+            )
 
     def _orbit_deltas(self, dx: float, dy: float) -> tuple[float, float]:
         """Apply the invert-axis preferences to an orbit delta."""
@@ -3744,7 +4462,7 @@ class MeshMapApp(mglw.WindowConfig):
         controller = self.controller
         normal = self.read_normal_map()
         color = self.read_color_map()
-        material = self.compositor.read_material() if color is not None else None
+        material = self.compositor.read_channels() if color is not None else None
         occlusion = controller.occlusion_map
 
         if not self.exportable():

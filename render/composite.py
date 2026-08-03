@@ -43,7 +43,20 @@ THUMBNAIL_SIZE = 96
 _TARGET_DTYPE = "f2"
 
 #: What the shader's u_kind means. 2 is a texture that is only a colour.
-_KINDS = {"edge_wear": 0, "noise": 1}
+_KINDS = {
+    "edge_wear": 0,
+    "noise": 1,
+    "grunge": 3,
+    "scratches": 4,
+    "brushed_metal": 5,
+    "cells": 6,
+    "clouds": 7,
+    "directional_streaks": 8,
+    "gradient": 9,
+    "brick": 10,
+    "wood_grain": 11,
+    "marble": 12,
+}
 _FLAT = 2
 
 
@@ -54,12 +67,14 @@ class _Target:
 
     color: moderngl.Texture
     material: moderngl.Texture
+    ambient_occlusion: moderngl.Texture
     fbo: moderngl.Framebuffer
 
     def release(self) -> None:
         self.fbo.release()
         self.color.release()
         self.material.release()
+        self.ambient_occlusion.release()
 
 
 class _Pool:
@@ -89,9 +104,13 @@ class _Pool:
     def acquire(self) -> _Target:
         if self._free:
             return self._free.pop()
-        color, material = self._texture(3), self._texture(4)
-        target = _Target(color, material,
-                         self.ctx.framebuffer(color_attachments=[color, material]))
+        color, material, ambient_occlusion = (
+            self._texture(3), self._texture(4), self._texture(1)
+        )
+        target = _Target(
+            color, material, ambient_occlusion,
+            self.ctx.framebuffer(color_attachments=[color, material, ambient_occlusion]),
+        )
         self._all.append(target)
         return target
 
@@ -126,6 +145,8 @@ class LayerCompositor:
         self.program["u_whiteMaterial"].value = 3
         self.program["u_black"].value = 4
         self.program["u_blackMaterial"].value = 5
+        self.program["u_whiteAO"].value = 6
+        self.program["u_blackAO"].value = 7
         self._vao = ctx.vertex_array(self.program, [])
 
         self.blit = ctx.program(
@@ -165,6 +186,11 @@ class LayerCompositor:
         return None if self._result is None else self._result.material
 
     @property
+    def ambient_occlusion_texture(self) -> Optional[moderngl.Texture]:
+        """The material-authored AO channel, separate from the mesh AO bake."""
+        return None if self._result is None else self._result.ambient_occlusion
+
+    @property
     def resolution(self) -> int:
         return self._resolution
 
@@ -198,6 +224,16 @@ class LayerCompositor:
         ).reshape(self._resolution, self._resolution, 4).copy()
         material[..., 3] *= MAX_EMISSION
         return material
+
+    def read_channels(self) -> Optional[np.ndarray]:
+        """All scalar channels: metallic, roughness, opacity, AO, emission."""
+        material = self.read_material()
+        if material is None:
+            return None
+        ao = np.frombuffer(
+            self._result.fbo.read(attachment=2, components=1, dtype="f4"), dtype="f4"
+        ).reshape(self._resolution, self._resolution, 1).copy()
+        return np.concatenate((material[..., :3], ao, material[..., 3:4]), axis=2)
 
     # -- rendering --------------------------------------------------------
 
@@ -282,7 +318,9 @@ class LayerCompositor:
             program["u_blackColor"].value = tuple(float(c) for c in node.color)
             program["u_whiteSurface"].value = surface
             program["u_blackSurface"].value = surface
-            for unit in (2, 3, 4, 5):
+            program["u_whiteAOValue"].value = float(node.ambient_occlusion)
+            program["u_blackAOValue"].value = float(node.ambient_occlusion)
+            for unit in (2, 3, 4, 5, 6, 7):
                 self._blank.use(unit)
             return
 
@@ -294,12 +332,16 @@ class LayerCompositor:
             program[name].value = value
         for name, value in node.noise.as_uniforms().items():
             program[name].value = value
+        for name, value in node.noise.generator_uniforms().items():
+            program[name].value = value
 
         for slot_name, rendered, units, names in (
-            ("white", white, (2, 3), ("u_whiteColor", "u_whiteSurface", "u_whiteIsMap")),
-            ("black", black, (4, 5), ("u_blackColor", "u_blackSurface", "u_blackIsMap")),
+            ("white", white, (2, 3, 6),
+             ("u_whiteColor", "u_whiteSurface", "u_whiteAOValue", "u_whiteIsMap")),
+            ("black", black, (4, 5, 7),
+             ("u_blackColor", "u_blackSurface", "u_blackAOValue", "u_blackIsMap")),
         ):
-            colour_uniform, surface_uniform, flag_uniform = names
+            colour_uniform, surface_uniform, ao_uniform, flag_uniform = names
             slot = node.slot(slot_name)
             if rendered is None:
                 assert isinstance(slot, ColorSlot)
@@ -308,12 +350,14 @@ class LayerCompositor:
                 program[surface_uniform].value = tuple(
                     float(c) for c in slot.packed_material()
                 )
+                program[ao_uniform].value = float(slot.ambient_occlusion)
                 for unit in units:
                     self._blank.use(unit)
             else:
                 program[flag_uniform].value = 1
                 rendered.color.use(units[0])
                 rendered.material.use(units[1])
+                rendered.ambient_occlusion.use(units[2])
 
     # -- thumbnails -------------------------------------------------------
 

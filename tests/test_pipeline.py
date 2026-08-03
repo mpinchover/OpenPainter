@@ -95,6 +95,17 @@ def test_a_material_of_the_wrong_shape_is_refused(tmp_path):
         export_maps(tmp_path, material=np.zeros((4, 4, 3), np.float32))
 
 
+def test_material_ao_is_multiplied_by_the_mesh_bake_on_export(tmp_path):
+    from PIL import Image
+
+    material = np.ones((4, 4, 5), np.float32)
+    material[..., 3] = 0.5
+    mesh_ao = np.full((4, 4), 0.5, np.float32)
+    export_maps(tmp_path, material=material, occlusion=mesh_ao, maps={"ao"})
+    exported = np.asarray(Image.open(tmp_path / "ao.png"), dtype=np.float32) / 255.0
+    assert exported.mean() == pytest.approx(0.25, abs=0.01)
+
+
 def test_the_starter_cube_is_a_sharp_unwrapped_cube():
     """What the app opens on. It has to go down the same path an imported mesh
     does -- bake into its own UVs, take a decal -- rather than be a special

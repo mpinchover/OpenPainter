@@ -35,9 +35,135 @@ from core.decal import (  # noqa: E402
 from core.params import MAX_FALLOFF  # noqa: E402
 from core.picking import face_at_uv  # noqa: E402
 from core.export import export_maps, save_normal_map  # noqa: E402
-from core.params import DecalParams  # noqa: E402
+from core.params import DecalArrayModifier, DecalParams  # noqa: E402
 
 FLAT = np.array([0.5, 0.5, 1.0], dtype=np.float32)
+
+
+def _projected_array(**changes) -> DecalParams:
+    values = dict(
+        path="array.png",
+        projector_center=(0.0, 0.0, 0.0),
+        projector_right=(1.0, 0.0, 0.0),
+        projector_up=(0.0, 1.0, 0.0),
+        projector_forward=(0.0, 0.0, 1.0),
+        projector_size=(1.0, 1.0),
+    )
+    values.update(changes)
+    return DecalParams(**values)
+
+
+def test_axes_array_is_transient_and_offsets_in_selected_local_axes():
+    from render.viewport import MeshMapApp
+
+    source = _projected_array(
+        modifiers=[DecalArrayModifier(
+            count=2, offset_x=0.5, offset_y=-0.5,
+        )],
+    )
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+
+    assert instances[0] is source
+    assert [instance.projector_center for instance in instances] == [
+        (0.0, 0.0, 0.0), (0.5, -0.5, 0.0), (1.0, -1.0, 0.0)
+    ]
+    assert not instances[1].modifiers
+
+
+def test_radial_array_distributes_copies_around_local_axis():
+    from render.viewport import MeshMapApp
+
+    source = _projected_array(
+        modifiers=[DecalArrayModifier(
+            mode="radial", count=4, radius=2.0,
+            radial_axis="z",
+        )],
+    )
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+    centers = np.asarray([instance.projector_center for instance in instances])
+    pivot = np.asarray(source.projector_center)
+
+    assert np.linalg.norm(centers - pivot, axis=1) == pytest.approx([2.0] * 5)
+    angles = np.unwrap(np.arctan2(centers[:, 1], centers[:, 0]))
+    assert np.diff(angles) == pytest.approx([2.0 * np.pi / 5.0] * 4)
+    assert centers[0] == pytest.approx((2.0, 0.0, 0.0))
+    assert source.projector_center == (0.0, 0.0, 0.0), (
+        "the editable source transform remains the circle center"
+    )
+    for instance in instances:
+        inward = pivot - np.asarray(instance.projector_center)
+        inward /= np.linalg.norm(inward)
+        assert np.asarray(instance.projector_up) == pytest.approx(inward)
+    assert instances[0].projector_up != source.projector_up, (
+        "the rendered original must face inward instead of keeping its static basis"
+    )
+
+    # Equal angular positions at one radius also mean equal straight-line
+    # distances between neighbours, including the closing edge to the source.
+    closed = np.vstack((centers, centers[0]))
+    gaps = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+    assert gaps == pytest.approx([gaps[0]] * 5)
+
+
+def test_radial_array_default_radius_is_point_one():
+    assert DecalArrayModifier().radius == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize("mode", ["move", "scale", "rotate"])
+def test_live_radial_transform_evaluates_ring_without_bare_center_decal(mode):
+    """G/S/R uses the live transform as the ring pivot, not a rendered copy."""
+    from render.viewport import MeshMapApp
+
+    app = object.__new__(MeshMapApp)
+    app._decal_transform_mode = mode
+    app._live_decal_projector = {
+        "center": (3.0, 4.0, 0.0),
+        "right": (0.0, 1.0, 0.0),
+        "up": (-1.0, 0.0, 0.0),
+        "forward": (0.0, 0.0, 1.0),
+        "size": (2.0, 3.0),
+    }
+    source = _projected_array(modifiers=[
+        DecalArrayModifier(mode="radial", count=3, radius=0.5)
+    ])
+
+    live = app.live_decal_source(source)
+    instances = app.decal_instances(live)
+    centers = np.asarray([instance.projector_center for instance in instances])
+
+    assert len(instances) == 4
+    assert np.linalg.norm(centers - (3.0, 4.0, 0.0), axis=1) == pytest.approx(
+        [0.5] * 4
+    )
+    assert not np.any(np.all(np.isclose(centers, (3.0, 4.0, 0.0)), axis=1))
+    assert all(instance.projector_size == (2.0, 3.0) for instance in instances)
+
+
+def test_array_stack_feeds_each_result_into_the_next_modifier():
+    from render.viewport import MeshMapApp
+
+    source = _projected_array(modifiers=[
+        DecalArrayModifier(count=100, offset_x=0.1),
+        DecalArrayModifier(count=2, offset_x=-0.1),
+    ])
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+
+    assert len(instances) == 303, "101 results, each expanded to three by modifier two"
+
+
+def test_second_array_operates_on_copies_from_the_first_array():
+    from render.viewport import MeshMapApp
+
+    source = _projected_array(modifiers=[
+        DecalArrayModifier(count=1, offset_x=1.0),
+        DecalArrayModifier(count=1, offset_x=0.0, offset_y=2.0),
+    ])
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+
+    assert {instance.projector_center for instance in instances} == {
+        (0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+        (0.0, 2.0, 0.0), (1.0, 2.0, 0.0),
+    }
 
 
 def write_normal_map(path: Path, size=(32, 32), tilt=(0.0, 0.0)) -> Path:
@@ -792,6 +918,22 @@ def test_placing_moves_the_decal_to_the_cursor_and_drops_it(placeable):
         pytest.approx(expected), "and leaves it where it was dropped"
 
 
+def test_pinch_zoom_is_ready_immediately_after_placing_selected_decal(placeable):
+    placeable._pending_zoom = -4.0
+    placeable._scroll_arrived = 4.0
+    placeable._drag_owner = "decal"
+    placeable.begin_decal_placement()
+    placeable.end_decal_placement(keep=True)
+
+    assert placeable.selected_decal is not None
+    assert placeable._drag_owner is None
+    assert placeable._pending_zoom == 0.0
+    before = placeable.camera.radius
+    placeable.on_pinch_zoom(0.2)
+    placeable._drain_scroll()
+    assert placeable.camera.radius < before
+
+
 def test_the_placing_click_does_not_also_orbit_the_view(placeable):
     """A stroke that drops a decal must not be read as a camera drag as well."""
     before = np.array(placeable.camera.eye.to_list())
@@ -803,6 +945,22 @@ def test_the_placing_click_does_not_also_orbit_the_view(placeable):
 
     placeable.on_mouse_drag_event(x + 120, y + 90, 120, 90)
     assert np.allclose(np.array(placeable.camera.eye.to_list()), before)
+
+
+def test_click_jitter_while_selecting_does_not_move_camera(placeable):
+    """Selection's click tolerance must also be a camera dead zone."""
+    x, y = viewport_point(placeable, 0.5, 0.5)
+    placeable._drag_owner = "camera"
+    placeable._press_at = (float(x), float(y))
+    placeable.wnd.mouse_states.right = True
+    before_radius = placeable.camera.radius
+
+    try:
+        placeable.on_mouse_drag_event(x + 2, y + 2, 2, 2)
+    finally:
+        placeable.wnd.mouse_states.right = False
+
+    assert placeable.camera.radius == pytest.approx(before_radius)
 
 
 def test_cancelling_puts_the_decal_back(placeable):
@@ -891,6 +1049,19 @@ def test_placing_switches_a_disabled_decal_back_on(placeable):
     assert placeable.selected_decal.enabled
 
 
+def test_decal_tree_name_is_editable_without_renaming_its_image(placeable):
+    decal = placeable.selected_decal
+    source_path = decal.path
+    placeable.begin_decal_rename(placeable.decal_index)
+    assert placeable.decal_renaming_opened
+
+    decal.name = "  Riveted Vent  "
+    placeable.end_decal_rename()
+
+    assert decal.display_name() == "Riveted Vent"
+    assert decal.path == source_path
+
+
 def test_clearing_the_decal_ends_any_placement(placeable):
     placeable.begin_decal_placement()
     placeable.clear_decals()
@@ -913,6 +1084,81 @@ def test_g_follows_surface_hits_from_one_finger_pointer_motion(placeable):
     assert (decal.center_u, decal.center_v) == pytest.approx((0.22, 0.81))
     placeable.end_decal_transform(keep=False)
     assert (decal.center_u, decal.center_v) == pytest.approx(origin)
+
+
+def test_g_keeps_moving_on_the_decal_plane_when_pointer_is_off_mesh(placeable):
+    decal = placeable.selected_decal
+    original = np.asarray(decal.projector_center, dtype=np.float64)
+    plane_points = iter([
+        np.asarray((1.0, 1.0, 0.0)),
+        np.asarray((1.4, 0.8, 0.0)),
+    ])
+    placeable._cursor_plane_point = lambda *args: next(plane_points)
+
+    assert placeable.begin_decal_transform("move")
+    placeable.surface_hit_at = lambda mouse: None
+    placeable.world_surface_hit_at = lambda mouse: None
+    assert placeable.transform_decal_with_pointer(20.0, -10.0)
+
+    assert placeable._live_decal_projector["center"] == pytest.approx(
+        original + (0.4, -0.2, 0.0)
+    )
+
+
+def test_g_does_not_jump_when_pointer_reenters_the_mesh(placeable):
+    """A surface hit must preserve the relative grab established off-mesh."""
+    original = np.asarray(placeable.selected_decal.projector_center, dtype=np.float64)
+    plane_points = iter([
+        np.asarray((1.0, 1.0, 0.0)),
+        np.asarray((1.4, 0.8, 0.0)),
+    ])
+    placeable._cursor_plane_point = lambda *args: next(plane_points)
+    placeable.world_surface_hit_at = lambda mouse: None
+
+    assert placeable.begin_decal_transform("move")
+    placeable.surface_hit_at = lambda mouse: None
+    assert placeable.transform_decal_with_pointer(20.0, -10.0)
+    moved = original + (0.4, -0.2, 0.0)
+    assert placeable._live_decal_projector["center"] == pytest.approx(moved)
+
+    # The cursor has just crossed onto the same plane, but nowhere near the
+    # decal. Its first hit establishes an offset instead of teleporting it.
+    placeable.surface_hit_at = lambda mouse: ((0.8, 0.8), 0)
+    placeable.world_surface_hit_at = lambda mouse: (np.asarray((4.0, 3.0, 0.0)), 0)
+    assert placeable.transform_decal_with_pointer(2.0, 0.0)
+    assert placeable._live_decal_projector["center"] == pytest.approx(moved)
+
+    # Further surface travel is relative to that grab offset.
+    placeable.world_surface_hit_at = lambda mouse: (np.asarray((4.2, 3.1, 0.0)), 0)
+    assert placeable.transform_decal_with_pointer(2.0, 1.0)
+    assert placeable._live_decal_projector["center"] == pytest.approx(
+        moved + (0.2, 0.1, 0.0)
+    )
+
+
+def test_finishing_decal_transform_releases_gesture_owner(placeable):
+    assert placeable.begin_decal_transform("move")
+    placeable._drag_owner = "decal_transform"
+    placeable.end_decal_transform(keep=True)
+
+    assert placeable._drag_owner is None
+
+
+def test_inspector_scale_and_rotation_update_the_committed_projector(placeable):
+    decal = placeable.selected_decal
+    previous = (
+        decal.center_u, decal.center_v,
+        decal.scale, decal.scale_x, decal.scale_y, decal.rotation,
+    )
+    old_size = np.asarray(decal.projector_size)
+    old_right = np.asarray(decal.projector_right)
+
+    decal.scale *= 1.5
+    decal.rotation += 30.0
+    placeable.sync_decal_inspector_projector(decal, previous)
+
+    assert np.asarray(decal.projector_size) == pytest.approx(old_size * 1.5)
+    assert not np.allclose(decal.projector_right, old_right)
 
 
 def test_g_then_x_moves_only_across_u(placeable):
@@ -1018,6 +1264,29 @@ def test_escape_restores_a_keyboard_transform(placeable):
     assert (decal.center_u, decal.center_v) == pytest.approx(origin)
 
 
+def test_sidebar_shortcut_does_not_start_a_decal_transform(placeable):
+    keys = placeable.wnd.keys
+    placeable._mouse = (10.0, 100.0)
+    assert not placeable.mouse_over_viewport()
+
+    placeable.on_key_event(keys.S, keys.ACTION_PRESS, placeable.wnd.modifiers)
+
+    assert placeable._decal_transform_mode is None
+
+
+def test_transform_started_in_viewport_continues_across_sidebar(placeable):
+    keys = placeable.wnd.keys
+    decal = placeable.selected_decal
+    before = decal.scale
+    placeable._mouse = viewport_point(placeable, 0.5, 0.5)
+
+    placeable.on_key_event(keys.S, keys.ACTION_PRESS, placeable.wnd.modifiers)
+    assert placeable._decal_transform_mode == "scale"
+    placeable.on_mouse_position_event(10, 100, 20, -20)
+
+    assert decal.scale > before
+
+
 def test_x_requests_confirmation_before_deleting_selected_decal(placeable):
     keys = placeable.wnd.keys
     count = len(placeable.decals)
@@ -1026,6 +1295,102 @@ def test_x_requests_confirmation_before_deleting_selected_decal(placeable):
 
     assert placeable._delete_decal_index == placeable.decal_index
     assert len(placeable.decals) == count, "the shortcut itself must not delete"
+
+
+@pytest.mark.parametrize(
+    ("mode", "field", "value"),
+    (("move", "center_u", 0.73), ("scale", "scale", 0.81),
+     ("rotate", "rotation", 47.0)),
+)
+def test_completed_decal_transforms_use_app_undo_and_redo(
+    placeable, mode, field, value
+):
+    decal = placeable.selected_decal
+    original = getattr(decal, field)
+
+    assert placeable.begin_decal_transform(mode)
+    setattr(decal, field, value)
+    placeable.end_decal_transform(keep=True)
+
+    assert getattr(placeable.selected_decal, field) == pytest.approx(value)
+    assert placeable.undo_action()
+    assert getattr(placeable.selected_decal, field) == pytest.approx(original)
+    assert placeable.redo_action()
+    assert getattr(placeable.selected_decal, field) == pytest.approx(value)
+
+
+def test_confirming_relative_g_keeps_radial_ring_at_live_preview(placeable):
+    decal = placeable.selected_decal
+    decal.modifiers = [DecalArrayModifier(mode="radial", count=5, radius=0.1)]
+    x, y = viewport_point(placeable, 0.62, 0.54)
+    surface = placeable.world_surface_hit_at((x, y))
+    expected_uv = placeable.surface_uv_at((x, y))
+    assert surface is not None and expected_uv is not None
+
+    assert placeable.begin_decal_transform("move")
+    placeable._live_decal_projector["center"] = tuple(surface[0])
+    # Relative G can leave the cursor somewhere other than the projector
+    # centre. Confirmation must commit the visible centre, not this cursor UV.
+    placeable._decal_transform_last_hit = ((0.02, 0.97), int(surface[1]))
+    live = placeable.live_decal_source(decal)
+    before = np.asarray([
+        instance.projector_center for instance in placeable.decal_instances(live)
+    ])
+
+    placeable.end_decal_transform(keep=True)
+    after = np.asarray([
+        instance.projector_center for instance in placeable.decal_instances(decal)
+    ])
+
+    assert (decal.center_u, decal.center_v) == pytest.approx(expected_uv, abs=1e-5)
+    assert after == pytest.approx(before)
+
+
+def test_duplicate_enters_move_and_is_one_undoable_action(placeable):
+    original = placeable.selected_decal
+    original_count = len(placeable.decals)
+
+    assert placeable.duplicate_selected_decal()
+    assert len(placeable.decals) == original_count + 1
+    assert placeable._decal_transform_mode == "move"
+    assert placeable.selected_decal is not original
+    assert placeable.selected_decal == original
+
+    placeable.selected_decal.center_u = 0.72
+    placeable.end_decal_transform(keep=True)
+    assert placeable.undo_action()
+    assert len(placeable.decals) == original_count
+    assert placeable.redo_action()
+    assert len(placeable.decals) == original_count + 1
+    assert placeable.selected_decal.center_u == pytest.approx(0.72)
+
+
+def test_app_history_keeps_the_last_one_hundred_actions(placeable):
+    """The stack must retain 100 distinct steps, not one coalesced snapshot."""
+    original = placeable.checker_scale
+    for value in range(1, 106):
+        before = placeable._app_snapshot()
+        placeable.checker_scale = float(value)
+        placeable._record_app_undo(before)
+
+    assert len(placeable._app_undo) == 100
+    for _ in range(100):
+        assert placeable.undo_action()
+    assert placeable.checker_scale == pytest.approx(5.0)
+    assert not placeable.undo_action()
+
+    for _ in range(100):
+        assert placeable.redo_action()
+    assert placeable.checker_scale == pytest.approx(105.0)
+    assert not placeable.redo_action()
+
+
+def test_cancelling_duplicate_removes_the_unplaced_copy(placeable):
+    original_count = len(placeable.decals)
+    assert placeable.duplicate_selected_decal()
+    placeable.end_decal_transform(keep=False)
+    assert len(placeable.decals) == original_count
+    assert placeable._decal_transform_mode is None
 
 
 # --------------------------------------------------------------------------

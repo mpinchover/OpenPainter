@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import platform
 import sys
 import time
 from pathlib import Path
@@ -14,6 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import moderngl_window as mglw  # noqa: E402
 
+from core.macos_app import apply_macos_application_name  # noqa: E402
+from core.action_log import log_action, start_action_log  # noqa: E402
+from core.metadata import METADATA  # noqa: E402
 from core.params import RESOLUTIONS, BevelParams  # noqa: E402
 from render.viewport import MeshMapApp  # noqa: E402
 
@@ -157,6 +161,13 @@ def run_selftest(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    start_action_log(
+        Path(__file__).resolve().parent / "debug-log.txt",
+        title=METADATA.title,
+        platform=platform.platform(),
+        python=sys.version,
+        argv=list(sys.argv if argv is None else argv),
+    )
     args = parse_args(argv)
 
     if args.mesh and not Path(args.mesh).expanduser().exists():
@@ -165,6 +176,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.selftest:
         return run_selftest(args)
+
+    # A source checkout runs inside Python.app on macOS.  Set Cocoa's native
+    # process/bundle identity before Pyglet creates the application menu so the
+    # OS presents metadata.json's title rather than "Python".
+    apply_macos_application_name(METADATA.title)
 
     MeshMapApp.initial_mesh = args.mesh
     MeshMapApp.initial_z_up = args.z_up
@@ -180,7 +196,12 @@ def main(argv: list[str] | None = None) -> int:
     # back through. Clearing sys.argv is what actually keeps it off our
     # already-consumed arguments.
     sys.argv = sys.argv[:1]
-    mglw.run_window_config(MeshMapApp)
+    try:
+        mglw.run_window_config(MeshMapApp)
+    except Exception as exc:
+        log_action("exception", type=type(exc).__name__, message=str(exc))
+        raise
+    log_action("shutdown")
     return 0
 
 

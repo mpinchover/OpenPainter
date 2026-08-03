@@ -9,6 +9,7 @@ out vec4 out_color;
 uniform sampler2D u_map;
 uniform sampler2D u_normalMap;
 uniform sampler2D u_material;   // metallic, roughness, alpha, emission
+uniform sampler2D u_materialAO;
 uniform sampler2D u_liveDecal;
 uniform float u_useLiveDecal;
 uniform vec3 u_projectorCenter;
@@ -18,6 +19,7 @@ uniform vec3 u_projectorForward;
 uniform vec2 u_projectorSize;
 uniform float u_projectorIntensity;
 uniform float u_projectorFlipGreen;
+uniform float u_projectorFalloff;
 uniform float u_liveProjectorUseColor;
 uniform vec3 u_liveProjectorColor;
 
@@ -31,6 +33,7 @@ uniform vec3 u_viewProjectorForwards[MAX_VIEW_PROJECTORS];
 uniform vec2 u_viewProjectorSizes[MAX_VIEW_PROJECTORS];
 uniform float u_viewProjectorIntensities[MAX_VIEW_PROJECTORS];
 uniform float u_viewProjectorFlipGreens[MAX_VIEW_PROJECTORS];
+uniform float u_viewProjectorFalloffs[MAX_VIEW_PROJECTORS];
 uniform float u_viewProjectorUseColors[MAX_VIEW_PROJECTORS];
 uniform vec3 u_viewProjectorColors[MAX_VIEW_PROJECTORS];
 
@@ -52,6 +55,12 @@ uniform float u_worldStrength;
 uniform float u_hdrScale;       // the headroom this target is divided down by
 
 const float PI = 3.14159265359;
+
+float projector_fade(vec2 uv, float falloff) {
+    if (falloff <= 0.0) return 1.0;
+    float edge = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
+    return 1.0 - smoothstep(1.0 - 2.0 * falloff, 1.0 - falloff, edge);
+}
 
 // Per-pixel tangent frame, from the derivatives of position and UV across the
 // triangle (Mikkelsen's cotangent frame). The mesh carries no tangent
@@ -108,8 +117,7 @@ vec3 apply_live_decal(vec3 normal, inout vec3 base_color) {
     tangent = normalize(tangent);
     vec3 bitangent = normalize(cross(normal, tangent));
     vec3 projected = normalize(normal + tangent * slope.x + bitangent * slope.y);
-    float edge = min(min(decal_uv.x, decal_uv.y), min(1.0 - decal_uv.x, 1.0 - decal_uv.y));
-    float weight = decal.a * smoothstep(0.0, 0.025, edge);
+    float weight = decal.a * projector_fade(decal_uv, u_projectorFalloff);
     if (u_liveProjectorUseColor > 0.5) {
         base_color = mix(base_color, u_liveProjectorColor, weight);
     }
@@ -139,8 +147,9 @@ vec3 apply_view_projector(vec3 normal, int index, inout vec3 base_color) {
     tangent = normalize(tangent);
     vec3 bitangent = normalize(cross(normal, tangent));
     vec3 projected = normalize(normal + tangent * slope.x + bitangent * slope.y);
-    float edge = min(min(decal_uv.x, decal_uv.y), min(1.0 - decal_uv.x, 1.0 - decal_uv.y));
-    float weight = decal.a * smoothstep(0.0, 0.025, edge);
+    float weight = decal.a * projector_fade(
+        decal_uv, u_viewProjectorFalloffs[index]
+    );
     if (u_viewProjectorUseColors[index] > 0.5) {
         base_color = mix(base_color, u_viewProjectorColors[index], weight);
     }
@@ -241,12 +250,14 @@ void main() {
     float metallic = 0.0;
     float roughness = 0.5;
     float emission = 0.0;
+    float material_ao = 1.0;
     if (u_useMaterial > 0.5) {
         vec4 surface = texture(u_material, v_uv);
         metallic = clamp(surface.r, 0.0, 1.0);
         roughness = clamp(surface.g, 0.03, 1.0);
         alpha = clamp(surface.b, 0.0, 1.0);
         emission = max(surface.a, 0.0) * u_emissionScale;
+        material_ao = clamp(texture(u_materialAO, v_uv).r, 0.0, 1.0);
     }
 
     // A metal has no diffuse of its own: its colour is what it reflects.
@@ -277,6 +288,7 @@ void main() {
     vec3 env_fresnel = fresnel_schlick_roughness(n_dot_v, f0, roughness);
     vec3 ambient = diffuse_share * base * world_light(normal)
                  + env_fresnel * world_light(gathered);
+    ambient *= material_ao;
 
     // Divided down into the target's headroom, not clipped at 1. An emissive
     // surface brighter than white stays brighter than white all the way to the

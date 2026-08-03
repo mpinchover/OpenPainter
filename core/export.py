@@ -155,14 +155,25 @@ def export_maps(
                 save_rgb_map(output_dir / f"{prefix}{name}.png", array, bits=bits)
             )
 
+    material_ao = None
     if material is not None:
         written.extend(
             _write_material(output_dir, material, wanted, bits=bits, prefix=prefix)
         )
+        material_array = np.asarray(material)
+        if material_array.ndim == 3 and material_array.shape[2] == 5:
+            material_ao = material_array[..., 3]
 
-    if occlusion is not None and OCCLUSION_NAME in wanted:
+    combined_ao = None
+    if occlusion is not None and material_ao is not None:
+        combined_ao = np.asarray(occlusion) * material_ao
+    elif occlusion is not None:
+        combined_ao = occlusion
+    elif material_ao is not None:
+        combined_ao = material_ao
+    if combined_ao is not None and OCCLUSION_NAME in wanted:
         written.append(
-            save_map(output_dir / f"{prefix}{OCCLUSION_NAME}.png", occlusion, bits=bits)
+            save_map(output_dir / f"{prefix}{OCCLUSION_NAME}.png", combined_ao, bits=bits)
         )
     return written
 
@@ -175,7 +186,7 @@ def _write_material(
     bits: int,
     prefix: str,
 ) -> list[Path]:
-    """Metallic and roughness, one map each.
+    """Write every material-owned scalar channel except AO.
 
     ``material`` is (h, w, 4): metallic, roughness, alpha, emission, in the
     order :meth:`core.layers.ColorSlot.material` packs them. Only the first two
@@ -183,11 +194,13 @@ def _write_material(
     not for the export, which is a standard PBR set and stops at that.
     """
     material = np.asarray(material, dtype=np.float32)
-    if material.ndim != 3 or material.shape[2] != 4:
-        raise ValueError(f"a material needs shape (h, w, 4), got {material.shape}")
+    if material.ndim != 3 or material.shape[2] not in (4, 5):
+        raise ValueError(f"a material needs shape (h, w, 4 or 5), got {material.shape}")
+
+    channels = ((METALLIC_NAME, 0), (ROUGHNESS_NAME, 1))
 
     return [
         save_map(output_dir / f"{prefix}{name}.png", material[..., index], bits=bits)
-        for index, name in enumerate((METALLIC_NAME, ROUGHNESS_NAME))
+        for name, index in channels
         if name in wanted
     ]

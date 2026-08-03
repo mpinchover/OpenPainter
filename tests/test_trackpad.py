@@ -129,11 +129,13 @@ def test_pinch_follows_the_trackpad_speed_preference():
     assert fast < slow, "a higher trackpad speed must zoom further in"
 
 
-def test_pinch_is_ignored_while_the_panel_has_the_mouse():
+def test_stale_panel_mouse_capture_cannot_disable_native_pinch():
     app = FakeApp()
     imgui.get_io().want_capture_mouse = True
-    assert app.pinch(0.5) == pytest.approx(app.camera.radius)
-    assert app._pending_zoom == 0.0
+    before = app.camera.radius
+
+    assert app.pinch(0.5) < before
+    assert app._pending_zoom == pytest.approx(0.0, abs=1e-6)
 
 
 def test_a_teleport_sized_event_is_clamped_not_obeyed():
@@ -158,6 +160,28 @@ def test_install_declines_without_a_cocoa_window():
         pass
 
     assert trackpad.install_pinch_zoom(NotACocoaWindow(), lambda _: None) is False
+
+
+def test_native_view_pointer_survives_wrapper_replacement():
+    """A new Python wrapper for the same NSView must retain its callback."""
+
+    class Pointer:
+        value = 123456
+
+    class FirstWrapper:
+        ptr = Pointer()
+
+    class ReplacementWrapper:
+        ptr = Pointer()
+
+    delivered: list[float] = []
+    trackpad._handlers[123456] = delivered.append
+    try:
+        assert trackpad._dispatch_pinch(ReplacementWrapper(), 0.25)
+    finally:
+        del trackpad._handlers[123456]
+
+    assert delivered == [0.25]
 
 
 @macos_only
@@ -197,17 +221,12 @@ def test_a_gesture_event_reaches_the_registered_handler(pyglet_view):
     # tracking area it never got.
     view.retain()
 
-    class FakeWindow:
-        pass
-
-    window = FakeWindow()
-    view._window = window  # what pyglet's initialiser leaves on the view
-
     delivered: list[float] = []
-    trackpad._handlers[id(window)] = delivered.append
+    view_key = trackpad._pointer_key(view)
+    trackpad._handlers[view_key] = delivered.append
     try:
         view.magnifyWithEvent_(event)
     finally:
-        del trackpad._handlers[id(window)]
+        del trackpad._handlers[view_key]
 
     assert delivered == [0.25]

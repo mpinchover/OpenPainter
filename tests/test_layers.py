@@ -102,7 +102,7 @@ def test_switching_between_two_mask_kinds_keeps_the_branches():
 
 def test_an_unknown_kind_is_refused():
     with pytest.raises(KeyError):
-        convert_slot(ColorSlot(RED), "marble")
+        convert_slot(ColorSlot(RED), "terrazzo")
 
 
 def test_paths_address_every_slot():
@@ -241,6 +241,27 @@ def test_only_edge_wear_needs_the_bake():
     assert not MaskLayer(kind="noise").needs_bake
 
 
+def test_every_requested_procedural_generator_is_available():
+    requested = {
+        "noise", "grunge", "scratches", "brushed_metal", "cells", "clouds",
+        "directional_streaks", "gradient", "brick", "wood_grain", "marble",
+    }
+    assert requested <= set(MASK_KINDS)
+    for kind in requested:
+        converted = convert_slot(ColorSlot(RED), kind)
+        assert isinstance(converted, MaskLayer) and converted.kind == kind
+
+
+def test_a_colour_leaf_carries_every_requested_material_channel():
+    material = ColorSlot(
+        RED, metallic=0.8, roughness=0.2, alpha=0.6,
+        ambient_occlusion=0.4, emission=3.0,
+    )
+    assert material.color == RED
+    assert material.channels() == (0.8, 0.2, 0.6, 0.4, 3.0)
+    assert texture_key(material) != texture_key(replace(material, ambient_occlusion=1.0))
+
+
 def test_noise_params_reach_the_shader_by_name():
     uniforms = NoiseMaskParams(scale=3.0).as_uniforms()
     assert uniforms["u_noiseScale"] == 3.0
@@ -248,6 +269,22 @@ def test_noise_params_reach_the_shader_by_name():
         "u_noiseScale", "u_noiseDetail", "u_noiseRoughness", "u_noiseLacunarity",
         "u_noiseDistortion", "u_noiseBias", "u_noiseContrast",
     }
+
+
+def test_generator_specific_values_are_render_state():
+    """Every control shown for a specialised generator must invalidate it."""
+    import copy
+
+    base = MaskLayer(kind="scratches")
+    for field in (
+        "scratch_width", "scratch_length", "scratch_irregularity",
+        "brush_density", "brush_waviness", "brush_variation",
+        "cell_jitter", "cell_edge", "streak_length", "streak_width",
+        "mortar_thickness", "brick_aspect", "vein_width",
+    ):
+        changed = copy.deepcopy(base)
+        setattr(changed.noise, field, getattr(changed.noise, field) + 0.01)
+        assert texture_key(changed) != texture_key(base), field
 
 
 # --------------------------------------------------------------------------

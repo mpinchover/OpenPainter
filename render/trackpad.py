@@ -26,11 +26,36 @@ import sys
 import traceback
 from typing import Callable, Optional
 
-#: Registered callbacks, by ``id`` of the pyglet window owning the view. The
-#: selector is added to the view *class*, so one handler serves every window and
-#: has to look up which one it was actually called for.
+from core.action_log import log_action
+
+#: Registered callbacks by the native ``NSView *`` address.  Do not key these
+#: by the Python ``CocoaWindow`` wrapper: pyglet can replace/reconstruct its
+#: ObjCInstance wrappers while the actual AppKit view remains the same.
 _handlers: dict[int, Callable[[float], None]] = {}
 _installed = False
+
+
+def _pointer_key(value: object) -> int:
+    """Return the stable native address behind a ctypes/ObjC wrapper."""
+    pointer = getattr(value, "ptr", value)
+    raw = getattr(pointer, "value", pointer)
+    return int(raw)
+
+
+def _dispatch_pinch(view: object, magnification: float) -> bool:
+    """Deliver one native event without depending on pyglet wrapper identity."""
+    key = _pointer_key(view)
+    handler = _handlers.get(key)
+    log_action(
+        "native_magnify",
+        view_pointer=key,
+        handler_found=handler is not None,
+        magnification=float(magnification),
+    )
+    if handler is None:
+        return False
+    handler(float(magnification))
+    return True
 
 
 def install_pinch_zoom(window, on_pinch: Callable[[float], None]) -> bool:
@@ -47,7 +72,12 @@ def install_pinch_zoom(window, on_pinch: Callable[[float], None]) -> bool:
     native = _cocoa_window(window)
     if native is None or not _install_selector():
         return False
-    _handlers[id(native)] = on_pinch
+    view = getattr(native, "_nsview", None)
+    if view is None:
+        return False
+    key = _pointer_key(view)
+    _handlers[key] = on_pinch
+    log_action("pinch_handler_armed", view_pointer=key)
     return True
 
 
@@ -68,24 +98,27 @@ def _cocoa_window(window) -> Optional[object]:
 def _install_selector() -> bool:
     """Add ``magnifyWithEvent:`` to pyglet's view class. Idempotent."""
     global _installed
-    if _installed:
-        return True
     try:
         from pyglet.libs.darwin import cocoapy
         from pyglet.window.cocoa.pyglet_view import PygletView_Implementation
     except Exception:
         return False
 
+    selector = cocoapy.get_selector("magnifyWithEvent:")
+    view_class = cocoapy.ObjCClass("PygletView")
+    if _installed:
+        # Do not trust the Python flag alone.  The Cocoa class can be rebuilt
+        # during backend/window lifecycle changes, which previously left the
+        # application believing a selector was installed when it was not.
+        if view_class.instancesRespondToSelector_(selector):
+            return True
+        _installed = False
+
     def magnify(objc_self, objc_cmd, nsevent) -> None:
         """``- (void)magnifyWithEvent:(NSEvent *)event``, encoded ``v@:@``."""
         try:
-            view = cocoapy.ObjCInstance(objc_self)
-            # The view keeps the CocoaWindow it belongs to on itself, and
-            # ObjCInstance is cached per pointer, so this is the same wrapper
-            # object pyglet set the attribute on.
-            handler = _handlers.get(id(view._window))
-            if handler is not None:
-                handler(float(cocoapy.ObjCInstance(nsevent).magnification()))
+            magnitude = float(cocoapy.ObjCInstance(nsevent).magnification())
+            _dispatch_pinch(objc_self, magnitude)
         except Exception:
             # An exception must never unwind into Objective-C: there is no
             # Python frame to catch it and the process dies mid-gesture.
