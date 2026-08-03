@@ -423,9 +423,9 @@ def _clamp_sidebar(value: float) -> float:
     return float(np.clip(value, SIDEBAR_MIN, SIDEBAR_MAX))
 
 
-#: Neither pane of the Texture tab may be dragged below this share of the tab.
-#: A pane too short to show a row of its own is a pane that has been closed by
-#: accident, and the splitter has no other way back.
+#: Neither side of a sidebar divider may be dragged below this share. A pane
+#: too short to show a row of its own has effectively been closed by accident,
+#: and the splitter would otherwise have no practical way back.
 MIN_SPLIT = 0.15
 
 
@@ -911,8 +911,17 @@ class MeshMapApp(mglw.WindowConfig):
         except (TypeError, ValueError):
             pass
 
-        #: How much of the Texture tab the inspector gets, the tree taking the
-        #: rest. Dragged with the splitter between them, and remembered.
+        #: Share of the sidebar reserved for the persistent scene explorer.
+        #: One third by default, draggable and remembered between launches.
+        self.explorer_split = 1.0 / 3.0
+        try:
+            stored_explorer_split = self._prefs.get("explorer_split")
+            if stored_explorer_split is not None:
+                self.explorer_split = _clamp_split(float(stored_explorer_split))
+        except (TypeError, ValueError):
+            pass
+
+        #: Legacy per-view split positions retained in saved project history.
         self.texture_split = 0.5
         #: Where the Decal tab's inspector ends and its shelf begins.
         self.decal_split = 0.5
@@ -1147,6 +1156,10 @@ class MeshMapApp(mglw.WindowConfig):
         """Where the Decal tab's divider sits, as a share of the room."""
         self.decal_split = _clamp_split(value)
 
+    def set_explorer_split(self, value: float) -> None:
+        """Where the persistent Explorer ends and the active tool begins."""
+        self.explorer_split = _clamp_split(value)
+
     def set_mesh_split(self, value: float) -> None:
         """Where the Mesh tab's divider sits, as a share of the room."""
         self.mesh_split = _clamp_split(value)
@@ -1198,6 +1211,7 @@ class MeshMapApp(mglw.WindowConfig):
         """Persist the interface and navigation settings."""
         self._prefs["ui_scale"] = round(self.ui_scale, 3)
         self._prefs["sidebar_width"] = round(self.sidebar_width, 1)
+        self._prefs["explorer_split"] = round(self.explorer_split, 3)
         self._prefs["texture_split"] = round(self.texture_split, 3)
         self._prefs["decal_split"] = round(self.decal_split, 3)
         self._prefs["mesh_split"] = round(self.mesh_split, 3)
@@ -1709,6 +1723,7 @@ class MeshMapApp(mglw.WindowConfig):
             "world": copy.deepcopy(self.world),
             "ui_scale": self.ui_scale,
             "sidebar_width": self.sidebar_width,
+            "explorer_split": self.explorer_split,
             "texture_split": self.texture_split,
             "decal_split": self.decal_split,
             "mesh_split": self.mesh_split,
@@ -1793,6 +1808,7 @@ class MeshMapApp(mglw.WindowConfig):
         self.world = copy.deepcopy(snapshot["world"])
         self.ui_scale = snapshot["ui_scale"]
         self.sidebar_width = snapshot["sidebar_width"]
+        self.explorer_split = snapshot["explorer_split"]
         self.texture_split = snapshot["texture_split"]
         self.decal_split = snapshot["decal_split"]
         self.mesh_split = snapshot["mesh_split"]

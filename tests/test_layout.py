@@ -365,6 +365,7 @@ def test_the_texture_panes_start_even_and_stay_usable(starter_app):
 
     assert starter_app.texture_split == pytest.approx(0.5)
     assert starter_app.mesh_split == pytest.approx(0.5)
+    assert starter_app.explorer_split == pytest.approx(1.0 / 3.0)
 
     starter_app.set_texture_split(0.9)
     assert starter_app.texture_split == pytest.approx(1.0 - MIN_SPLIT)
@@ -375,6 +376,10 @@ def test_the_texture_panes_start_even_and_stay_usable(starter_app):
     assert starter_app.texture_split == pytest.approx(0.7)
     starter_app.set_mesh_split(0.75)
     assert starter_app.mesh_split == pytest.approx(0.75)
+    starter_app.set_explorer_split(0.42)
+    assert starter_app.explorer_split == pytest.approx(0.42)
+    starter_app.set_explorer_split(0.99)
+    assert starter_app.explorer_split == pytest.approx(1.0 - MIN_SPLIT)
 
 
 def test_the_layout_is_remembered_between_runs(starter_app, isolated_settings):
@@ -384,12 +389,14 @@ def test_the_layout_is_remembered_between_runs(starter_app, isolated_settings):
 
     starter_app.set_texture_split(0.32)
     starter_app.set_mesh_split(0.43)
+    starter_app.set_explorer_split(0.37)
     starter_app.set_sidebar_width(512.0)
     starter_app.save_prefs()
 
     stored = json.loads((isolated_settings / "prefs.json").read_text())
     assert stored["texture_split"] == pytest.approx(0.32)
     assert stored["mesh_split"] == pytest.approx(0.43)
+    assert stored["explorer_split"] == pytest.approx(0.37)
     assert stored["sidebar_width"] == pytest.approx(512.0)
 
     from render.viewport import _load_prefs
@@ -407,6 +414,83 @@ def test_console_is_always_on_and_deduplicated(starter_app):
 
     starter_app.clear_console()
     assert starter_app.console_messages == []
+
+
+def test_scene_explorer_nests_materials_and_decals_under_the_mesh(monkeypatch):
+    """The persistent upper pane mirrors what is actually in the viewport."""
+    from types import SimpleNamespace
+
+    from core.layers import ColorSlot
+    from core.params import DecalParams
+    from ui import panel
+
+    labels = []
+
+    def tree_node(label, _flags=0):
+        labels.append(label.split("##", 1)[0])
+        return True
+
+    monkeypatch.setattr(panel.imgui, "tree_node_ex", tree_node)
+    monkeypatch.setattr(panel.imgui, "tree_pop", lambda: None)
+    monkeypatch.setattr(panel.imgui, "is_item_clicked", lambda: False)
+    monkeypatch.setattr(panel.imgui, "is_item_toggled_open", lambda: False)
+    monkeypatch.setattr(panel.imgui, "push_id", lambda _value: None)
+    monkeypatch.setattr(panel.imgui, "pop_id", lambda: None)
+    monkeypatch.setattr(panel.imgui, "same_line", lambda *args: None)
+    monkeypatch.setattr(panel.imgui, "text_colored", lambda *args: None)
+    monkeypatch.setattr(panel, "_draw_decal_visibility_icon", lambda _enabled: False)
+    monkeypatch.setattr(panel, "_tooltip", lambda _text: None)
+
+    app = SimpleNamespace(
+        mesh=object(), mesh_info=object(), mesh_name="Chamfered Cube",
+        mesh_selected_index=-1, mesh_renaming=False,
+        textures=[ColorSlot(name="Steel"), ColorSlot(name="Red paint")],
+        mesh_material_index=0,
+        decals=[DecalParams(path="vent.png", name="Vent", texture_index=1)],
+        decal_index=-1, decal_renaming_index=-1, sidebar_view=0,
+    )
+    panel._draw_scene_explorer(app)
+
+    assert labels == [
+        "Chamfered Cube",
+        "Materials", "Steel",
+        "Decals (1)", "Vent", "Material: Red paint",
+    ]
+
+
+def test_material_view_has_tree_and_layer_inspector_tabs(monkeypatch):
+    """Both material tasks get the whole lower pane rather than half of it."""
+    from types import SimpleNamespace
+
+    from core.layers import ColorSlot
+    from ui import panel
+
+    tabs = []
+    drawn = []
+    material = ColorSlot(name="Steel")
+    app = SimpleNamespace(texture=material, textures=[material])
+
+    monkeypatch.setattr(panel, "_draw_texture_picker", lambda _app: None)
+    monkeypatch.setattr(panel, "_draw_texture_warnings", lambda _app: None)
+    monkeypatch.setattr(panel, "_begin_panel", lambda name, _size: drawn.append(name))
+    monkeypatch.setattr(panel, "_end_panel", lambda: None)
+    monkeypatch.setattr(panel, "_draw_texture_tree", lambda _app: drawn.append("tree"))
+    monkeypatch.setattr(panel, "_draw_slot_params", lambda _app: drawn.append("inspector"))
+    monkeypatch.setattr(panel.imgui, "text_colored", lambda *args: None)
+    monkeypatch.setattr(panel.imgui, "begin_tab_bar", lambda _name: True)
+
+    def begin_tab(label, *_args):
+        tabs.append(label)
+        return True, None
+
+    monkeypatch.setattr(panel.imgui, "begin_tab_item", begin_tab)
+    monkeypatch.setattr(panel.imgui, "end_tab_item", lambda: None)
+    monkeypatch.setattr(panel.imgui, "end_tab_bar", lambda: None)
+
+    panel._draw_texture_tab(app)
+
+    assert tabs == ["Material tree", "Inspector"]
+    assert drawn == ["texture_tree", "tree", "texture_inspector", "inspector"]
 
 
 def test_a_rename_cannot_get_stuck(starter_app):

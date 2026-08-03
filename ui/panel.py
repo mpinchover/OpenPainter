@@ -524,8 +524,6 @@ def _draw_parameters(app: "MeshMapApp") -> None:
     )
     imgui.begin("Parameters", None, _CHROME_FLAGS | imgui.WindowFlags_.no_title_bar)
 
-    rail_width = SIDEBAR_ICON_RAIL * scale
-    button_size = 34 * scale
     labels = ("Bake", "Material", "Decal", "Mesh", "Library", "Console", "Settings")
     drawers = (
         _draw_bake_tab,
@@ -538,6 +536,22 @@ def _draw_parameters(app: "MeshMapApp") -> None:
     )
     app.sidebar_view = max(0, min(int(getattr(app, "sidebar_view", 0)), len(labels) - 1))
 
+    # The scene is the stable context for every tool. It starts at one third of
+    # the sidebar and the divider below it can be dragged to give either the
+    # hierarchy or the active tool more room.
+    splitter = 8.0 * scale
+    available = max(imgui.get_content_region_avail().y - splitter, 2.0)
+    explorer_height = available * app.explorer_split
+    _begin_panel("scene_explorer", imgui.ImVec2(0, explorer_height))
+    _draw_scene_explorer(app)
+    _end_panel()
+    _draw_splitter(
+        app, splitter, available, "explorer", app.set_explorer_split
+    )
+
+    rail_width = SIDEBAR_ICON_RAIL * scale
+    button_size = 34 * scale
+    imgui.begin_child("##sidebar_tools", imgui.ImVec2(0, 0))
     imgui.push_style_var(
         imgui.StyleVar_.window_padding, imgui.ImVec2(3.0 * scale, 4.0 * scale)
     )
@@ -565,8 +579,156 @@ def _draw_parameters(app: "MeshMapApp") -> None:
     drawers[app.sidebar_view](app)
     imgui.end_child()
     imgui.pop_style_var()
+    imgui.end_child()
     imgui.end()
     imgui.pop_style_var()
+
+
+def _draw_scene_explorer(app: "MeshMapApp") -> None:
+    """Persistent hierarchy of everything currently rendered in the viewport.
+
+    The renderer currently owns one mesh, but the hierarchy is deliberately
+    expressed as mesh -> materials / decals so adding more renderable meshes
+    does not require another sidebar redesign. Modifier-generated decal copies
+    stay represented by their source decal, matching their non-object status.
+    """
+    if app.mesh is None or app.mesh_info is None:
+        _muted_wrapped("No meshes in the viewport.")
+        return
+
+    node_flags = (
+        imgui.TreeNodeFlags_.default_open
+        | imgui.TreeNodeFlags_.open_on_arrow
+        | imgui.TreeNodeFlags_.span_avail_width
+    )
+    selected_flags = (
+        imgui.TreeNodeFlags_.selected if app.mesh_selected_index == 0 else 0
+    )
+    mesh_open = imgui.tree_node_ex(
+        f"{app.mesh_name}##explorer_mesh_0", node_flags | selected_flags
+    )
+    if imgui.is_item_clicked() and not imgui.is_item_toggled_open():
+        app.select_scene_mesh(0)
+        app.sidebar_view = 3
+        if imgui.is_mouse_double_clicked(0):
+            app.begin_mesh_rename()
+
+    if not mesh_open:
+        return
+
+    if app.mesh_renaming:
+        _draw_explorer_mesh_rename(app)
+
+    material_open = imgui.tree_node_ex(
+        "Materials##explorer_materials", node_flags
+    )
+    if material_open:
+        material_index = app.mesh_material_index
+        if 0 <= material_index < len(app.textures):
+            material = app.textures[material_index]
+            flags = (
+                imgui.TreeNodeFlags_.leaf
+                | imgui.TreeNodeFlags_.no_tree_push_on_open
+                | imgui.TreeNodeFlags_.span_avail_width
+            )
+            if app.sidebar_view == 1 and app.texture_index == material_index:
+                flags |= imgui.TreeNodeFlags_.selected
+            imgui.tree_node_ex(
+                f"{describe(material)}##explorer_mesh_material", flags
+            )
+            if imgui.is_item_clicked():
+                app.select_decal(None)
+                app.select_texture(material_index)
+                app.sidebar_view = 1
+        else:
+            imgui.text_colored(MUTED_COLOR, "No material assigned")
+        imgui.tree_pop()
+
+    decals_open = imgui.tree_node_ex(
+        f"Decals ({len(app.decals)})##explorer_decals", node_flags
+    )
+    if decals_open:
+        if not app.decals:
+            imgui.text_colored(MUTED_COLOR, "No decals")
+        for index, decal in enumerate(app.decals):
+            _draw_explorer_decal(app, index, decal, node_flags)
+        imgui.tree_pop()
+
+    imgui.tree_pop()
+
+
+def _draw_explorer_mesh_rename(app: "MeshMapApp") -> None:
+    """Edit the mesh name without removing its hierarchy from the explorer."""
+    just_opened = app.mesh_renaming_opened
+    if just_opened:
+        imgui.set_keyboard_focus_here()
+        app.mesh_renaming_opened = False
+    imgui.set_next_item_width(-1)
+    entered, app.mesh_name = imgui.input_text(
+        "##explorer_mesh_rename", app.mesh_name,
+        imgui.InputTextFlags_.enter_returns_true
+        | imgui.InputTextFlags_.auto_select_all,
+    )
+    if entered or imgui.is_item_deactivated_after_edit():
+        app.end_mesh_rename()
+    elif not just_opened and not imgui.is_item_active():
+        app.end_mesh_rename()
+
+
+def _draw_explorer_decal(app: "MeshMapApp", index: int, decal, node_flags: int) -> None:
+    """One decal object and its single assigned-material child."""
+    imgui.push_id(f"explorer_decal_{index}")
+    if _draw_decal_visibility_icon(decal.enabled):
+        decal.enabled = not decal.enabled
+        app.mark_normal_dirty()
+    _tooltip("Show or hide this decal.")
+    imgui.same_line()
+
+    flags = node_flags
+    if index == app.decal_index:
+        flags |= imgui.TreeNodeFlags_.selected
+    decal_open = imgui.tree_node_ex(f"{decal.display_name()}##node", flags)
+    if imgui.is_item_clicked() and not imgui.is_item_toggled_open():
+        app.select_decal(index)
+        app.sidebar_view = 2
+        if imgui.is_mouse_double_clicked(0):
+            app.begin_decal_rename(index)
+
+    if decal_open:
+        if app.decal_renaming_index == index:
+            _draw_explorer_decal_rename(app, decal)
+
+        material_index = decal.texture_index
+        material_name = (
+            describe(app.textures[material_index])
+            if 0 <= material_index < len(app.textures) else "None"
+        )
+        material_flags = (
+            imgui.TreeNodeFlags_.leaf
+            | imgui.TreeNodeFlags_.no_tree_push_on_open
+            | imgui.TreeNodeFlags_.span_avail_width
+        )
+        imgui.tree_node_ex(f"Material: {material_name}##material", material_flags)
+        imgui.tree_pop()
+    imgui.pop_id()
+
+
+def _draw_explorer_decal_rename(app: "MeshMapApp", decal) -> None:
+    """Inline rename field kept beneath an open decal row."""
+    just_opened = app.decal_renaming_opened
+    if just_opened:
+        imgui.set_keyboard_focus_here()
+        app.decal_renaming_opened = False
+    imgui.set_next_item_width(-1)
+    entered, decal.name = imgui.input_text(
+        "##explorer_decal_rename", decal.name,
+        imgui.InputTextFlags_.enter_returns_true
+        | imgui.InputTextFlags_.auto_select_all,
+    )
+    if entered or imgui.is_item_deactivated_after_edit():
+        app.end_decal_rename()
+    elif not just_opened and not imgui.is_item_active():
+        app.end_decal_rename()
 
 
 def _draw_bake_tab(app: "MeshMapApp") -> None:
@@ -763,28 +925,24 @@ def _draw_texture_tab(app: "MeshMapApp") -> None:
 
     _draw_texture_warnings(app)
 
-    # Two panes, each with its own scrollbar and its own header, splitting the
-    # room evenly until the divider between them is dragged. Fixed shares
-    # rather than "whatever the contents need": the inspector's height changes
-    # with what is selected, and a tree that jumped about as it did would be a
-    # tree you could not keep your place in.
-    scale = app.ui_pixel_scale
-    splitter = 8.0 * scale
-    header = imgui.get_frame_height_with_spacing()
-    usable = max(imgui.get_content_region_avail().y - header - splitter,
-                 4 * header)
-    inspector_height = usable * app.texture_split
+    # The persistent Explorer already consumes the upper half of the sidebar.
+    # Use tabs here so both material structures get all of the lower tool pane
+    # instead of dividing that remaining room into two cramped quarters.
+    if imgui.begin_tab_bar("##material_tabs"):
+        tree_open, _ = imgui.begin_tab_item("Material tree")
+        if tree_open:
+            _begin_panel("texture_tree", imgui.ImVec2(0, 0))
+            _draw_texture_tree(app)
+            _end_panel()
+            imgui.end_tab_item()
 
-    _begin_panel("texture_inspector", imgui.ImVec2(0, inspector_height))
-    _draw_slot_params(app)
-    _end_panel()
-
-    _draw_splitter(app, splitter, usable)
-
-    _begin_panel("texture_tree", imgui.ImVec2(0, 0))
-    _section_heading("Material tree")
-    _draw_texture_tree(app)
-    _end_panel()
+        inspector_open, _ = imgui.begin_tab_item("Inspector")
+        if inspector_open:
+            _begin_panel("texture_inspector", imgui.ImVec2(0, 0))
+            _draw_slot_params(app)
+            _end_panel()
+            imgui.end_tab_item()
+        imgui.end_tab_bar()
 
 
 def _draw_splitter(
@@ -1394,49 +1552,16 @@ def _draw_rename_field(app: "MeshMapApp", slot) -> None:
 
 
 def _draw_decal_tab(app: "MeshMapApp") -> None:
-    """The selected decal's controls and every decal currently on the mesh.
-
-    The two panes share selection with the viewport: clicking a row below makes
-    that decal the inspector's subject and gives it the viewport outline.
-    """
-    scale = app.ui_pixel_scale
-
-    splitter = 8.0 * scale
-    header = imgui.get_frame_height_with_spacing()
-    usable = max(imgui.get_content_region_avail().y - header - splitter,
-                 4 * header)
-    inspector_height = usable * app.decal_split
-
-    _begin_panel("decal_inspector", imgui.ImVec2(0, inspector_height))
+    """Details for the decal selected in the persistent Explorer or viewport."""
+    _begin_panel("decal_inspector", imgui.ImVec2(0, 0))
     _draw_decal_inspector(app)
-    _end_panel()
-
-    _draw_splitter(app, splitter, usable, "decal", app.set_decal_split)
-
-    _begin_panel("decals_in_use", imgui.ImVec2(0, 0))
-    _section_heading(f"In use  ({len(app.decals)})")
-    _draw_decals_in_use(app)
     _end_panel()
 
 
 def _draw_mesh_tab(app: "MeshMapApp") -> None:
-    """Selected mesh inspector above a persistent scene tree."""
-    scale = app.ui_pixel_scale
-    splitter = 8.0 * scale
-    header = imgui.get_frame_height_with_spacing()
-    usable = max(imgui.get_content_region_avail().y - header - splitter,
-                 4 * header)
-    inspector_height = usable * app.mesh_split
-
-    _begin_panel("mesh_inspector", imgui.ImVec2(0, inspector_height))
+    """Details for the mesh selected in the persistent Explorer or viewport."""
+    _begin_panel("mesh_inspector", imgui.ImVec2(0, 0))
     _draw_mesh_inspector(app)
-    _end_panel()
-
-    _draw_splitter(app, splitter, usable, "mesh", app.set_mesh_split)
-
-    _begin_panel("mesh_tree", imgui.ImVec2(0, 0))
-    _section_heading("Mesh tree")
-    _draw_mesh_tree(app)
     _end_panel()
 
 
@@ -1449,7 +1574,7 @@ def _draw_mesh_inspector(app: "MeshMapApp") -> None:
     info = app.mesh_info
     name = app.mesh_name
     if app.mesh_selected_index != 0:
-        _muted_wrapped("Select a mesh in the tree below to inspect it and assign its material.")
+        _muted_wrapped("Select a mesh in the Explorer above to inspect it and assign its material.")
         return
 
     imgui.text(name)
@@ -1477,87 +1602,6 @@ def _draw_mesh_inspector(app: "MeshMapApp") -> None:
 
     if imgui.button("Frame selected"):
         app.camera.frame(app.mesh.bounds.mean(axis=0), info.scale)
-
-
-def _draw_mesh_tree(app: "MeshMapApp") -> None:
-    """All scene meshes, sharing selection with the viewport and inspector."""
-    if app.mesh is None or app.mesh_info is None:
-        _muted_wrapped("No meshes in the scene.")
-        return
-
-    if app.mesh_renaming:
-        just_opened = app.mesh_renaming_opened
-        if just_opened:
-            imgui.set_keyboard_focus_here()
-            app.mesh_renaming_opened = False
-        imgui.set_next_item_width(-1)
-        entered, app.mesh_name = imgui.input_text(
-            "##mesh_rename", app.mesh_name,
-            imgui.InputTextFlags_.enter_returns_true
-            | imgui.InputTextFlags_.auto_select_all,
-        )
-        if entered or imgui.is_item_deactivated_after_edit():
-            app.end_mesh_rename()
-        elif not just_opened and not imgui.is_item_active():
-            app.end_mesh_rename()
-        return
-
-    clicked, _ = imgui.selectable(
-        app.mesh_name,
-        app.mesh_selected_index == 0,
-        imgui.SelectableFlags_.allow_double_click,
-    )
-    if clicked:
-        app.select_scene_mesh(0)
-        if imgui.is_mouse_double_clicked(0):
-            app.begin_mesh_rename()
-    _tooltip("Select this mesh. Double-click to rename it.")
-
-
-def _draw_decals_in_use(app: "MeshMapApp") -> None:
-    """Selectable scene list backed by the viewport's decal selection."""
-    if not app.decals:
-        _muted_wrapped("No decals on the mesh. Drag one onto it from the Library view.")
-        return
-
-    for index, decal in enumerate(app.decals):
-        imgui.push_id(f"decal_in_use_{index}")
-        if _draw_decal_visibility_icon(decal.enabled):
-            decal.enabled = not decal.enabled
-            app.mark_normal_dirty()
-        _tooltip("Show or hide this decal.")
-        imgui.same_line()
-
-        if app.decal_renaming_index == index:
-            just_opened = app.decal_renaming_opened
-            if just_opened:
-                imgui.set_keyboard_focus_here()
-                app.decal_renaming_opened = False
-            imgui.set_next_item_width(-1)
-            entered, decal.name = imgui.input_text(
-                "##decal_rename", decal.name,
-                imgui.InputTextFlags_.enter_returns_true
-                | imgui.InputTextFlags_.auto_select_all,
-            )
-            if entered or imgui.is_item_deactivated_after_edit():
-                app.end_decal_rename()
-            elif not just_opened and not imgui.is_item_active():
-                app.end_decal_rename()
-            imgui.pop_id()
-            continue
-
-        name = decal.display_name()
-        clicked, _ = imgui.selectable(
-            name,
-            index == app.decal_index,
-            imgui.SelectableFlags_.allow_double_click,
-        )
-        if clicked:
-            app.select_decal(index)
-            if imgui.is_mouse_double_clicked(0):
-                app.begin_decal_rename(index)
-        _tooltip("Select this decal. Double-click to rename it.")
-        imgui.pop_id()
 
 
 def _draw_decal_visibility_icon(enabled: bool) -> bool:
@@ -1808,7 +1852,7 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
 
     if decal is None:
         _muted_wrapped(
-            "Nothing selected. Choose a decal from the list below, click one "
+            "Nothing selected. Choose a decal from the Explorer above, click one "
             "on the model, or drag a new one from the Library view."
         )
         if app.decals:
