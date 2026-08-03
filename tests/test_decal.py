@@ -1483,16 +1483,16 @@ def test_a_stretched_layout_is_measured():
     assert uv_aspect(*_sheet(short)) == pytest.approx(0.5)
 
 
-def test_the_starter_cubes_own_layout_is_the_one_that_squashed_a_decal():
-    """The 3x2 box unwrap gives each face a 1/3 x 1/2 cell of a square atlas, so
-    a round decal came out 1.5 times too wide. This is that number."""
+def test_the_starter_chamfers_atlas_has_a_usable_surface_scale():
+    """The packed startup atlas must retain a finite world-to-UV scale."""
     from core.mesh_io import default_mesh
 
     mesh, _ = default_mesh()
     aspect = uv_aspect(
         np.asarray(mesh.vertices), np.asarray(mesh.faces), np.asarray(mesh.visual.uv)
     )
-    assert aspect == pytest.approx(1.5)
+    assert np.isfinite(aspect)
+    assert 0.5 < aspect < 2.0
 
 
 def test_one_face_can_be_asked_about_on_its_own():

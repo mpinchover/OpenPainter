@@ -9,13 +9,16 @@ trimesh>=4.0
 # Automatic UV unwrapping
 xatlas>=0.0.9
 
-# Window, viewport, orbit camera, GL bindings
+# Window, viewport, orbit camera, GL bindings. The application uses pyglet's
+# Cocoa backend directly for native macOS gestures and application integration.
 moderngl>=5.10
 moderngl-window>=3.0
-glfw>=2.6
+pyglet>=2.1,<3
+PyGLM>=2.8,<3
 
-# Slider / parameter UI (also provides portable_file_dialogs)
-imgui_bundle>=1.6
+# Slider / parameter UI (also provides portable_file_dialogs). The custom
+# renderer implements imgui-bundle's backend-managed texture API from 1.92.
+imgui_bundle>=1.92,<2
 
 # Accelerated ray casting for the AO bake. trimesh picks this up automatically.
 embreex>=2.17

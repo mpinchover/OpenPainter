@@ -1269,21 +1269,11 @@ class MeshMapApp(mglw.WindowConfig):
         )
 
     def open_default_mesh(self) -> None:
-        """Start on a plain cube rather than an empty viewport.
-
-        Something to bake and paint on the moment the window opens, without
-        importing anything -- and box-unwrapped, so it takes the same path a
-        mesh out of Blender does rather than a special case.
-        """
+        """Start on the bake-ready chamfered cube rather than an empty view."""
         mesh, info = default_mesh()
         self._show_mesh(mesh, info)
-        # Sharp edges have no width for the curvature bake to put a gradient
-        # in, so edge wear finds nothing on this cube until the Bevel panel
-        # gives it something -- worth saying, since the alternative is a mask
-        # that silently does nothing.
         self.set_status(
-            f"Starter cube ({info.extents[0]:g} m, sharp). Bake to work on it; "
-            f"turn on Bevel for edge wear to have an edge to find. "
+            f"Chamfered cube ({info.extents[0]:g} m). Bake to work on it. "
             f"Drop a mesh on the window to swap it out."
         )
 

@@ -6,9 +6,11 @@ Two shapes, chosen to make the bakes falsifiable:
                   curvature should read uniformly positive along the edges and
                   zero on the faces, and AO should show soft darkening in the
                   fillets. Nothing should read concave.
-``sample``        An L-bracket. Sharp convex outer edges, one reflex interior
-                  corner. Curvature must go clearly negative in that corner and
-                  AO must be measurably darker there than on an open face.
+``chamfered_cube`` A cube with broad, single-plane edge chamfers and flat
+                   triangular corner cuts. There are no rounded bevel segments.
+``sample``         An L-bracket. Sharp convex outer edges, one reflex interior
+                   corner. Curvature must go clearly negative in that corner and
+                   AO must be measurably darker there than on an open face.
 
 Run with:  python tools/make_sample.py
 """
@@ -28,6 +30,10 @@ ASSETS = ROOT / "assets"
 
 sys.path.insert(0, str(ROOT))
 
+from core.bevel import bevel  # noqa: E402
+from core.params import BevelParams, UnwrapParams  # noqa: E402
+from core.uv_unwrap import unwrap  # noqa: E402
+
 
 def rounded_cube(power: float = 6.0, subdivisions: int = 5) -> trimesh.Trimesh:
     """Project a sphere onto the unit p-norm ball: a cube with rounded edges.
@@ -45,6 +51,35 @@ def rounded_cube(power: float = 6.0, subdivisions: int = 5) -> trimesh.Trimesh:
     )
     trimesh.repair.fix_normals(mesh)
     return mesh
+
+
+def chamfered_cube(size: float = 2.0, chamfer: float = 0.25) -> trimesh.Trimesh:
+    """A cube with a significant, entirely planar chamfer.
+
+    One segment is deliberate: each original edge is replaced by one broad
+    plane rather than a rounded bevel profile.  The eight corners become flat
+    triangles, leaving 26 distinct planes in total.
+    """
+    cube = trimesh.creation.box(extents=(size, size, size))
+    mesh = bevel(
+        cube,
+        BevelParams(enabled=True, amount=chamfer, segments=1),
+    )
+    trimesh.repair.fix_normals(mesh)
+
+    # Unlike the diagnostic assets, this is also the application's startup
+    # mesh, so ship it ready to bake into its own UVs.
+    atlas = unwrap(
+        mesh,
+        UnwrapParams(use_source_uvs=False, padding=8),
+        resolution=1024,
+    )
+    return trimesh.Trimesh(
+        vertices=atlas.vertices,
+        faces=atlas.faces,
+        process=False,
+        visual=trimesh.visual.TextureVisuals(uv=atlas.uvs),
+    )
 
 
 def l_bracket(
@@ -133,6 +168,7 @@ def write(mesh: trimesh.Trimesh, stem: str) -> None:
 
 def main() -> int:
     write(rounded_cube(), "beveled_cube")
+    write(chamfered_cube(), "chamfered_cube")
     write(l_bracket(), "sample")
     return 0
 

@@ -188,11 +188,14 @@ def test_native_view_pointer_survives_wrapper_replacement():
 def test_pyglet_view_gains_the_gesture_selector(pyglet_view):
     from pyglet.libs.darwin import cocoapy
 
-    assert trackpad._install_selector()
+    assert trackpad._install_selectors()
     view_class = cocoapy.ObjCClass("PygletView")
     assert view_class.instancesRespondToSelector_(
         cocoapy.get_selector("magnifyWithEvent:")
     ), "AppKit only sends the gesture to a view that answers for it"
+    assert view_class.instancesRespondToSelector_(
+        cocoapy.get_selector("meshMapMagnify:")
+    ), "the explicit native recognizer needs a target action"
 
 
 @macos_only
@@ -205,7 +208,7 @@ def test_a_gesture_event_reaches_the_registered_handler(pyglet_view):
     """
     from pyglet.libs.darwin import cocoapy
 
-    assert trackpad._install_selector()
+    assert trackpad._install_selectors()
 
     fake_event_class = cocoapy.ObjCSubclass("NSObject", "MeshMapTestMagnifyEvent")
 
@@ -228,5 +231,28 @@ def test_a_gesture_event_reaches_the_registered_handler(pyglet_view):
         view.magnifyWithEvent_(event)
     finally:
         del trackpad._handlers[view_key]
+
+    assert delivered == [0.25]
+
+
+@macos_only
+def test_native_gesture_recognizer_reaches_the_registered_handler(pyglet_view):
+    from pyglet.libs.darwin import cocoapy
+
+    assert trackpad._install_selectors()
+    view = cocoapy.ObjCClass("PygletView").alloc().init()
+    view.retain()
+    key = trackpad._pointer_key(view)
+    delivered: list[float] = []
+    trackpad._handlers[key] = delivered.append
+    try:
+        assert trackpad._install_recognizer(view)
+        recognizer = trackpad._recognizers[key]
+        recognizer.setMagnification_(0.25)
+        view.meshMapMagnify_(recognizer)
+        assert float(recognizer.magnification()) == pytest.approx(0.0)
+    finally:
+        trackpad._handlers.pop(key, None)
+        trackpad._recognizers.pop(key, None)
 
     assert delivered == [0.25]

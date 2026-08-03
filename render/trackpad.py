@@ -32,6 +32,7 @@ from core.action_log import log_action
 #: by the Python ``CocoaWindow`` wrapper: pyglet can replace/reconstruct its
 #: ObjCInstance wrappers while the actual AppKit view remains the same.
 _handlers: dict[int, Callable[[float], None]] = {}
+_recognizers: dict[int, object] = {}
 _installed = False
 
 
@@ -70,14 +71,19 @@ def install_pinch_zoom(window, on_pinch: Callable[[float], None]) -> bool:
     has no ``magnifyWithEvent:`` to be missing -- and is not an error.
     """
     native = _cocoa_window(window)
-    if native is None or not _install_selector():
+    if native is None or not _install_selectors():
         return False
     view = getattr(native, "_nsview", None)
     if view is None:
         return False
     key = _pointer_key(view)
     _handlers[key] = on_pinch
-    log_action("pinch_handler_armed", view_pointer=key)
+    recognizer_attached = _install_recognizer(view)
+    log_action(
+        "pinch_handler_armed",
+        view_pointer=key,
+        recognizer_attached=recognizer_attached,
+    )
     return True
 
 
@@ -95,8 +101,8 @@ def _cocoa_window(window) -> Optional[object]:
     return native if isinstance(native, CocoaWindow) else None
 
 
-def _install_selector() -> bool:
-    """Add ``magnifyWithEvent:`` to pyglet's view class. Idempotent."""
+def _install_selectors() -> bool:
+    """Add direct-event and gesture-recognizer callbacks to PygletView."""
     global _installed
     try:
         from pyglet.libs.darwin import cocoapy
@@ -104,19 +110,28 @@ def _install_selector() -> bool:
     except Exception:
         return False
 
-    selector = cocoapy.get_selector("magnifyWithEvent:")
+    event_selector = cocoapy.get_selector("magnifyWithEvent:")
+    action_selector = cocoapy.get_selector("meshMapMagnify:")
     view_class = cocoapy.ObjCClass("PygletView")
     if _installed:
         # Do not trust the Python flag alone.  The Cocoa class can be rebuilt
         # during backend/window lifecycle changes, which previously left the
         # application believing a selector was installed when it was not.
-        if view_class.instancesRespondToSelector_(selector):
+        if (
+            view_class.instancesRespondToSelector_(event_selector)
+            and view_class.instancesRespondToSelector_(action_selector)
+        ):
             return True
         _installed = False
 
     def magnify(objc_self, objc_cmd, nsevent) -> None:
         """``- (void)magnifyWithEvent:(NSEvent *)event``, encoded ``v@:@``."""
         try:
+            # An attached recognizer receives this same native gesture and is
+            # the authoritative path. Avoid applying one pinch twice if AppKit
+            # also forwards the underlying event to the responder method.
+            if _pointer_key(objc_self) in _recognizers:
+                return
             magnitude = float(cocoapy.ObjCInstance(nsevent).magnification())
             _dispatch_pinch(objc_self, magnitude)
         except Exception:
@@ -124,8 +139,53 @@ def _install_selector() -> bool:
             # Python frame to catch it and the process dies mid-gesture.
             traceback.print_exc()
 
+    def mesh_map_magnify(objc_self, objc_cmd, sender) -> None:
+        """Action invoked by the explicit NSMagnificationGestureRecognizer."""
+        try:
+            recognizer = cocoapy.ObjCInstance(sender)
+            magnitude = float(recognizer.magnification())
+            # NSMagnificationGestureRecognizer reports the total since the
+            # gesture began. Reset it after every action so the application
+            # receives the incremental values its zoom queue expects.
+            recognizer.setMagnification_(0.0)
+            _dispatch_pinch(objc_self, magnitude)
+        except Exception:
+            traceback.print_exc()
+
     PygletView_Implementation.PygletView.add_method(
         magnify, b"magnifyWithEvent:", b"v@:@"
     )
+    PygletView_Implementation.PygletView.add_method(
+        mesh_map_magnify, b"meshMapMagnify:", b"v@:@"
+    )
     _installed = True
     return True
+
+
+# Backward-compatible private name used by older tests and local tooling.
+_install_selector = _install_selectors
+
+
+def _install_recognizer(view: object) -> bool:
+    """Attach a native pinch recognizer to one concrete Pyglet NSView."""
+    key = _pointer_key(view)
+    if key in _recognizers:
+        return True
+    try:
+        from pyglet.libs.darwin import cocoapy
+
+        recognizer = (
+            cocoapy.ObjCClass("NSMagnificationGestureRecognizer")
+            .alloc()
+            .initWithTarget_action_(
+                view, cocoapy.get_selector("meshMapMagnify:")
+            )
+        )
+        view.addGestureRecognizer_(recognizer)
+        # NSView retains it; keeping the wrapper as well prevents cocoapy from
+        # losing the Python-side object while the native recognizer is active.
+        _recognizers[key] = recognizer
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False

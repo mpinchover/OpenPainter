@@ -148,7 +148,7 @@ def test_the_app_opens_on_the_starter_cube(starter_app):
     """No mesh argument, no empty viewport -- something to work on straight
     away, without importing anything."""
     assert starter_app.mesh is not None
-    assert starter_app.mesh_info.path == "Cube"
+    assert starter_app.mesh_info.path == "Chamfered Cube"
     assert starter_app.mesh_info.has_uvs, "so the bake goes into its own UVs"
     assert not starter_app.controller.bevel_params.enabled, "sharp, as asked"
     assert "cube" in starter_app.status.lower()

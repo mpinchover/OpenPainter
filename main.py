@@ -28,7 +28,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "mesh",
         nargs="?",
         help="Mesh to load on startup (.fbx, .obj, .glb, ...). Without one the "
-             "app opens on a starter cube; files can also be dropped onto the "
+             "app opens on a chamfered cube; files can also be dropped onto the "
              "window.",
     )
     parser.add_argument(
@@ -101,7 +101,7 @@ def run_selftest(args: argparse.Namespace) -> int:
 
     This exercises the same code path the window does -- bake controller,
     shaping pass, preview shader, ImGui -- without needing a display. With no
-    mesh argument it runs on the same starter cube the window opens on.
+    mesh argument it runs on the same chamfered cube the window opens on.
     """
     from PIL import Image
 

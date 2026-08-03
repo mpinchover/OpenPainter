@@ -106,15 +106,13 @@ def test_material_ao_is_multiplied_by_the_mesh_bake_on_export(tmp_path):
     assert exported.mean() == pytest.approx(0.25, abs=0.01)
 
 
-def test_the_starter_cube_is_a_sharp_unwrapped_cube():
-    """What the app opens on. It has to go down the same path an imported mesh
-    does -- bake into its own UVs, take a decal -- rather than be a special
-    case, and it has to be sharp: the Bevel panel is what puts a bevel on."""
+def test_the_starter_cube_is_a_chamfered_unwrapped_cube():
+    """The startup asset is closed, planar-chamfered, and bake-ready."""
     mesh, info = default_mesh()
 
     assert info.backend == "built-in" and info.notes == []
-    assert info.faces == 12 and info.watertight, "a closed box"
-    assert info.extents == pytest.approx((0.5, 0.5, 0.5))
+    assert info.faces == 44 and info.watertight, "a closed chamfered box"
+    assert info.extents == pytest.approx((2.0, 2.0, 2.0))
 
     assert info.has_uvs
     uvs = source_uvs(mesh)
@@ -122,24 +120,20 @@ def test_the_starter_cube_is_a_sharp_unwrapped_cube():
     assert uvs.min() >= 0.0 and uvs.max() <= 1.0, "inside the atlas"
     assert info.uv_density > 0.0
 
-    # Every face is flat and meets its neighbours at a right angle: no bevel.
-    angles = mesh.face_adjacency_angles
-    assert np.allclose(angles[angles > 1e-6], np.pi / 2, atol=1e-6)
+    # Six cube planes, twelve broad edge cuts, and eight corner triangles.
+    planes = np.unique(np.round(mesh.face_normals, 6), axis=0)
+    assert len(planes) == 26
 
 
-def test_the_starter_cubes_faces_each_get_their_own_uv_cell():
-    """Box-unwrapped, so a decal placed on one face stays on that face."""
+def test_the_starter_chamfer_has_a_non_degenerate_uv_atlas():
     mesh, _ = default_mesh()
     uvs = source_uvs(mesh)
 
-    # Two triangles per side of the cube, and both land in the same cell of
-    # the 3x2 grid the unwrap lays out.
-    cells = [
-        (int(u * 3), int(v * 2))
-        for u, v in (uvs[face].mean(axis=0) for face in mesh.faces)
-    ]
-    assert len(set(cells)) == 6, f"one cell per side, got {sorted(set(cells))}"
-    assert all(cells.count(cell) == 2 for cell in cells)
+    triangles = uvs[mesh.faces]
+    first = triangles[:, 1] - triangles[:, 0]
+    second = triangles[:, 2] - triangles[:, 0]
+    twice_area = np.abs(first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0])
+    assert np.all(twice_area > 1e-8), "every surface triangle occupies UV space"
 
 
 def test_fbx_import_matches_obj(bracket):
