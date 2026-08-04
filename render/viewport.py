@@ -1792,6 +1792,37 @@ class MeshMapApp(mglw.WindowConfig):
         live.projector_up = tuple(projector["up"])
         live.projector_forward = tuple(projector["forward"])
         live.projector_size = tuple(projector["size"])
+        # An edit-space R/S drag only folds its delta into edit_spin/edit_
+        # scale_reference at commit (see end_decal_transform) -- mid-drag,
+        # source's own fields are still whatever the last commit left them.
+        # decal_instances reads only those, never the live projector, to
+        # decide how much to un-spin or un-scale the array by, so without
+        # this the preview would briefly look like an Object-space edit --
+        # the whole stack pivoting or growing together -- until release
+        # folds the delta in and it snaps to spinning/growing in place.
+        anchor = getattr(self, "_decal_transform_anchor", None)
+        if getattr(self, "decal_transform_space", "object") == "edit" and anchor is not None:
+            if self._decal_transform_mode == "rotate":
+                anchor_rotation = anchor[6]
+                live.edit_spin = float(source.edit_spin) + (
+                    float(source.rotation) - float(anchor_rotation)
+                )
+            elif self._decal_transform_mode == "scale":
+                anchor_scale = anchor[3]
+                if source.scale != anchor_scale:
+                    # Preserve whatever ratio was already in effect before
+                    # this drag started (e.g. from an earlier Object-space
+                    # scale that legitimately spread the array out) instead
+                    # of resetting it to 1 -- forcing ratio 1 unconditionally
+                    # made the array jump the instant an Edit-space drag
+                    # began, snapping any existing spread back to authored
+                    # positions in one step rather than holding it steady.
+                    anchor_ratio = float(anchor_scale) / max(
+                        float(source.edit_scale_reference), 1e-6
+                    )
+                    live.edit_scale_reference = float(source.scale) / max(
+                        anchor_ratio, 1e-6
+                    )
         return live
 
     def any_decal_active(self) -> bool:
@@ -2591,8 +2622,16 @@ class MeshMapApp(mglw.WindowConfig):
                 # Same bookkeeping as the inspector's Scale field (see
                 # sync_decal_inspector_projector): this S-drag changed only
                 # this decal's own footprint, not the array's, so hold the
-                # reference at the new scale.
-                params.edit_scale_reference = float(params.scale)
+                # ratio this decal already had -- not force it to 1, which
+                # would discard whatever spread an earlier Object-space
+                # scale had legitimately given the array.
+                anchor_scale = self._decal_transform_anchor[3]
+                anchor_ratio = float(anchor_scale) / max(
+                    float(params.edit_scale_reference), 1e-6
+                )
+                params.edit_scale_reference = float(params.scale) / max(
+                    anchor_ratio, 1e-6
+                )
         if keep:
             self._record_decal_undo(before)
         self.set_status("Decal transform applied" if keep else "Decal transform cancelled")
@@ -4678,12 +4717,19 @@ class MeshMapApp(mglw.WindowConfig):
                 / max(params.image_aspect, 1e-6),
             )
             # Edit space: this decal's own footprint just changed, not the
-            # array's -- move the reference to match so decal_instances'
-            # scale/reference ratio stays at 1. See DecalParams.edit_scale_
-            # reference; scale_x/scale_y are deliberately excluded, the same
-            # way decal_instances never reads them for this.
+            # array's -- move the reference to hold the ratio this decal
+            # already had, not force it to 1 (which would discard whatever
+            # spread an earlier Object-space scale had legitimately given
+            # the array). See DecalParams.edit_scale_reference; scale_x/
+            # scale_y are deliberately excluded, the same way decal_instances
+            # never reads them for this.
             if params.scale != old_scale and self.decal_transform_space == "edit":
-                params.edit_scale_reference = float(params.scale)
+                old_ratio = float(old_scale) / max(
+                    float(params.edit_scale_reference), 1e-6
+                )
+                params.edit_scale_reference = float(params.scale) / max(
+                    old_ratio, 1e-6
+                )
 
         if params.rotation != old_rotation:
             delta_degrees = float(params.rotation) - float(old_rotation)

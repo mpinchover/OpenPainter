@@ -305,6 +305,99 @@ def test_toggling_transform_space_alone_moves_nothing():
         assert left.projector_forward == pytest.approx(right.projector_forward)
 
 
+def test_live_edit_space_rotation_spins_each_copy_without_moving_it_mid_drag():
+    """edit_spin only gets folded in at commit (end_decal_transform) -- mid-
+    R-drag, source.edit_spin is still whatever the last commit left it, even
+    though source.rotation and the live projector basis already show the
+    in-progress turn. live_decal_source has to make up that difference for
+    the live preview, or decal_instances -- which only ever reads edit_spin,
+    never the live rotation directly -- has nothing telling it to stop
+    pivoting the whole array, and the preview looks like an Object-space
+    edit until the mouse is released."""
+    from render.viewport import MeshMapApp
+
+    app = object.__new__(MeshMapApp)
+    app.decal_transform_space = "edit"
+    app._decal_transform_mode = "rotate"
+    source = _projected_array(modifiers=[DecalArrayModifier(count=1, offset_x=1.0)])
+    app._decal_transform_anchor = (
+        0.0, 0.0, 0, source.scale, source.scale_x, source.scale_y, source.rotation,
+        source.projector_center, source.projector_right, source.projector_up,
+        source.projector_forward, source.projector_size,
+    )
+    position_before = MeshMapApp.decal_instances(
+        object.__new__(MeshMapApp), source
+    )[1].projector_center
+
+    # A 45-degree drag in progress: rotation and the live projector basis
+    # already reflect it, the way transform_decal_with_pointer leaves them
+    # mid-drag -- edit_spin does not, that only happens at commit.
+    source.rotation = 45.0
+    _spin_source_basis(source, 45.0)
+    app._live_decal_projector = {
+        "center": source.projector_center,
+        "right": source.projector_right,
+        "up": source.projector_up,
+        "forward": source.projector_forward,
+        "size": source.projector_size,
+    }
+
+    live = app.live_decal_source(source)
+    instances = app.decal_instances(live)
+
+    assert instances[1].projector_center == pytest.approx(position_before), (
+        "an edit-space rotation must not pivot the array, even mid-drag "
+        "before the mouse is released"
+    )
+
+
+def test_live_edit_space_scale_holds_the_arrays_existing_spread_mid_drag():
+    """An earlier Object-space scale can legitimately leave the array spread
+    out (ratio != 1). Starting an Edit-space S-drag on top of that must hold
+    that spread steady, not snap it back to ratio 1 the instant the drag
+    begins -- forcing edit_scale_reference to equal the live scale, rather
+    than preserving whatever ratio was already in effect, is what made the
+    array visibly jump as soon as an Edit-space scale started."""
+    from render.viewport import MeshMapApp
+
+    app = object.__new__(MeshMapApp)
+    app.decal_transform_space = "edit"
+    app._decal_transform_mode = "scale"
+    source = _projected_array(
+        scale=2.0,
+        edit_scale_reference=0.5,  # an earlier Object-space edit: ratio 4
+        modifiers=[DecalArrayModifier(count=1, offset_x=1.0)],
+    )
+    position_before = MeshMapApp.decal_instances(
+        object.__new__(MeshMapApp), source
+    )[1].projector_center
+    assert position_before == pytest.approx((4.0, 0.0, 0.0))
+
+    app._decal_transform_anchor = (
+        0.0, 0.0, 0, source.scale, source.scale_x, source.scale_y, source.rotation,
+        source.projector_center, source.projector_right, source.projector_up,
+        source.projector_forward, source.projector_size,
+    )
+    # Mid-drag: the decal is being grown further, the way
+    # transform_decal_with_pointer leaves params.scale.
+    source.scale = 3.0
+    app._live_decal_projector = {
+        "center": source.projector_center,
+        "right": source.projector_right,
+        "up": source.projector_up,
+        "forward": source.projector_forward,
+        "size": source.projector_size,
+    }
+
+    live = app.live_decal_source(source)
+    instances = app.decal_instances(live)
+
+    assert instances[1].projector_center == pytest.approx(position_before), (
+        "the array's existing 4x spread must hold steady while this "
+        "decal's own footprint keeps growing, not collapse back to ratio 1"
+    )
+
+
 def test_mirror_reflects_center_and_axes_across_a_world_plane():
     """With no mesh, the plane passes through the world origin."""
     from render.viewport import MeshMapApp
@@ -1445,6 +1538,33 @@ def test_inspector_rotation_in_object_space_leaves_edit_spin_alone(placeable):
     placeable.sync_decal_inspector_projector(decal, previous)
 
     assert decal.edit_spin == pytest.approx(0.0)
+
+
+def test_the_rotation_field_does_not_clamp_a_dragged_angle_past_180(placeable):
+    """decal.rotation wraps into [0, 360) -- see transform_decal_with_pointer's
+    ``% 360.0`` -- not [-180, 180]. A narrower range on this inspector field
+    used to fire its own trailing clamp the instant a viewport R-drag pushed
+    the live angle past 180, silently overwriting it back down to 180 and
+    reporting that as a genuine edit. Redrawn every frame during a drag, that
+    corrupted the live rotation and, in Edit space, padded edit_spin by a
+    bogus delta on every single frame the drag stayed past 180 -- worse the
+    longer the drag continued, which is what made a purely individual
+    rotation eventually look like the whole array pivoting together."""
+    from ui import panel
+
+    decal = placeable.selected_decal
+    decal.rotation = 270.0
+
+    imgui.new_frame()
+    imgui.begin("Parameters")
+    dirty = panel._draw_decal_transform(placeable, decal)
+    imgui.end()
+    imgui.end_frame()
+
+    assert decal.rotation == pytest.approx(270.0), (
+        "a live-dragged angle past 180 must not be silently clamped back down"
+    )
+    assert not dirty, "merely redrawing the field must not report a real edit"
 
 
 def test_g_then_x_moves_only_across_u(placeable):

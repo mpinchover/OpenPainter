@@ -281,18 +281,22 @@ class DecalParams:
 
     edit_scale_reference: float = 0.25
     """The ``scale`` at which this decal's Array/Radial offsets and radius are
-    exactly as authored (ratio 1). ``decal_instances`` scales them by
+    exactly as authored (ratio 1, or whatever ratio an earlier edit already
+    settled on). ``decal_instances`` scales them by
     ``scale / edit_scale_reference``, so leaving this untouched is what makes
     an Object-space scale edit -- the only kind meant to spread a modifier's
     copies apart as the decal grows -- take effect: it lets ``scale`` diverge
     from this reference. An Edit-space scale edit instead moves this
-    reference to match the new ``scale``, holding the ratio at 1 so editing
-    this one decal's own footprint never touches the array. Defaults equal to
-    ``scale``'s own default so a fresh decal starts at ratio 1, matching a
-    modifier's plain offsets before any of this existed. Deliberately not
-    read from the app's *current* Object/Edit toggle -- only from history --
-    so switching the toggle alone, with no scale edit in between, changes
-    nothing about where the copies actually are."""
+    reference by the same factor as ``scale`` changed, holding the ratio at
+    whatever it already was so editing this one decal's own footprint never
+    touches the array -- not forcing it to 1, which would snap away any
+    spread an earlier Object-space edit had legitimately given the array the
+    instant an Edit-space edit began. Defaults equal to ``scale``'s own
+    default so a fresh decal starts at ratio 1, matching a modifier's plain
+    offsets before any of this existed. Deliberately not read from the app's
+    *current* Object/Edit toggle -- only from history -- so switching the
+    toggle alone, with no scale edit in between, changes nothing about where
+    the copies actually are."""
 
     scale_x: float = 1.0
     """Additional width multiplier used by axis-constrained scaling."""

@@ -2178,8 +2178,16 @@ def _draw_decal_transform(app: "MeshMapApp", decal) -> bool:
     dirty |= changed
 
     _section_heading("Rotation")
+    # decal.rotation is stored wrapped into [0, 360) (see
+    # transform_decal_with_pointer's ``% 360.0``), not [-180, 180]. A
+    # narrower range here made this field's own trailing clamp fire the
+    # instant a viewport R-drag pushed the angle past 180 -- every frame
+    # after that clamped the live value back down and reported it as a
+    # genuine edit, corrupting the drag and, in Edit space, spuriously
+    # padding edit_spin every single frame for as long as the drag
+    # continued past that point.
     changed, decal.rotation = _decal_number(
-        app, "Angle", decal.rotation, -180.0, 180.0, 0.5,
+        app, "Angle", decal.rotation, 0.0, 360.0, 0.5,
         blank.rotation, "%.1f"
     )
     dirty |= changed
