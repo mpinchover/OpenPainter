@@ -25,6 +25,8 @@ import moderngl
 from imgui_bundle import imgui
 from moderngl_window.integrations.imgui_bundle import ModernglWindowRenderer
 
+from core.macos_app import enable_dock_reactivation
+
 
 #: What ImGui asks for, and what pyglet calls the same cursor. ImGui records a
 #: cursor per frame and expects the platform layer to apply it; moderngl-window
@@ -80,6 +82,7 @@ class ImGuiRenderer(ModernglWindowRenderer):
     def __init__(self, window):
         super().__init__(window)
         _enable_macos_first_click(window)
+        enable_dock_reactivation(window)
         self.io.backend_flags |= imgui.BackendFlags_.renderer_has_textures
         self.resize(*window.buffer_size)
         self._cursor: object = None

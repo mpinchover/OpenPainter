@@ -59,14 +59,14 @@ from core.layers import (
 )
 from core.mesh_io import SUPPORTED_SUFFIXES, MeshLoadError, default_mesh, load_mesh
 from core.metadata import METADATA
-from core.params import BevelParams, DecalParams, MeshInfo
+from core.params import BevelParams, DecalMirrorModifier, DecalParams, MeshInfo
 from core.picking import face_at_uv, ray_mesh_hit, screen_ray, surface_at_uv
 from core.pipeline import BakeController
 from core.uv_unwrap import source_uvs
 from render.composite import LayerCompositor
 from render.imgui_renderer import ImGuiRenderer
 from render.shaders import load_shader
-from render.trackpad import install_pinch_zoom
+from render.trackpad import install_pinch_zoom, native_focus_state
 from ui import decal_gizmo, gizmo, light_gizmo, panel
 from ui.panel import draw_panel
 
@@ -105,13 +105,14 @@ class PreviewMode:
     are placed in UV space and need no geometry pass behind them."""
 
 
-#: The two products, and so the two things to look at. Shaded is the mask tree:
-#: whatever the masks resolve to, lit -- a fresh tree is plain black and white,
-#: so it shows the mask itself until colours are put under it. Normals is the
-#: decal normal map, which is the other thing the app exports.
+#: The one thing the viewport ever shows: the mask tree, lit -- a fresh tree
+#: is plain black and white, so it reads as the mask itself until colours are
+#: put under it in the Material tab. There used to be a second entry here, a
+#: Normals mode for inspecting the decal normal map directly; the export
+#: still writes that map (see core.export), it is just never what the
+#: viewport itself is showing.
 PREVIEW_MODES = (
     PreviewMode("Shaded", 4, "composite"),
-    PreviewMode("Normals", 4, "normal", needs_bake=False),
 )
 
 # Full export resolution is unnecessary while a decal follows the pointer.
@@ -128,6 +129,14 @@ DECAL_MASK_RESOLUTION = 128
 #: fragment shader's sampler budget has no room to spare (16 units total, 13
 #: already spoken for by everything else preview.frag samples).
 MAX_DECAL_MASK_CELLS = 16
+
+#: World-space normals a Mirror modifier can reflect a decal across. Unlike an
+#: Array modifier's axes, these are the mesh's own X/Y/Z, not the decal's.
+_MIRROR_WORLD_AXES = {
+    "x": np.array([1.0, 0.0, 0.0]),
+    "y": np.array([0.0, 1.0, 0.0]),
+    "z": np.array([0.0, 0.0, 1.0]),
+}
 
 #: Drawn in place of any mode whose map does not exist yet -- an unbaked mesh
 #: under the Shaded view, mostly. Plain grey, so the geometry still reads.
@@ -823,6 +832,13 @@ class MeshMapApp(mglw.WindowConfig):
         self.dragging_decal_preview: Optional[DecalParams] = None
         #: True while the decal is following the cursor, waiting to be dropped.
         self.decal_placing = False
+        #: "object": Scale and Rotate move a decal's whole modifier stack as
+        #: one rigid unit -- an Array's copies grow and spread apart together,
+        #: a Mirror's plane follows. "edit": they act on this one decal alone
+        #: -- every copy grows or spins in place without moving. Movement is
+        #: identical either way; see ``decal_instances`` for how Scale and
+        #: Rotate actually differ per mode.
+        self.decal_transform_space: str = "object"
         #: Where it was before that started, to put back if the user cancels.
         self._decal_anchor: Optional[tuple[float, float]] = None
         self._decal_placement_undo: Optional[tuple[list[DecalParams], int]] = None
@@ -882,6 +898,18 @@ class MeshMapApp(mglw.WindowConfig):
         #: raising click cannot also alter scene selection.
         self._window_active = True
         self._window_activated_at = float("-inf")
+        #: See ``_native_focus_state``: AppKit's own key-window/active answer,
+        #: refreshed at most every ``_FOCUS_STATE_TTL`` and folded into every
+        #: traced input event.
+        self._focus_state_cache: dict = {}
+        self._focus_state_checked_at = float("-inf")
+        #: See ``_retry_window_focus_if_needed``: how often it re-checks
+        #: whether the window still is not really key and, if so, retries
+        #: reclaiming focus -- install_pinch_zoom's own re-arm triggers
+        #: (decal interactions, window activation) can be minutes apart if
+        #: the user is only orbiting the camera, and one reclaim attempt is
+        #: not guaranteed to land the first time either.
+        self._focus_retry_at = float("-inf")
         native_window = getattr(self.wnd, "_window", None)
         if native_window is not None and hasattr(native_window, "push_handlers"):
             native_window.push_handlers(
@@ -900,10 +928,10 @@ class MeshMapApp(mglw.WindowConfig):
         self._scroll_rate = 0.0
         self._scroll_idle = 0
         self._scroll_gaps = 0
-        #: Last known keyboard modifiers. pyglet clears them on scroll events,
-        #: so scroll reads this rather than ``wnd.modifiers``.
+        #: Last known keyboard modifiers, for the debug trace only -- pyglet
+        #: clears them on scroll events, and ImGui's own live key_shift/
+        #: key_ctrl/key_alt (see on_mouse_scroll_event) decide navigation now.
         self._modifiers = self.wnd.modifiers
-        self._shift_down = False
 
         self._prefs = _load_prefs()
         #: Collapse state for the material property dock.
@@ -1531,6 +1559,22 @@ class MeshMapApp(mglw.WindowConfig):
             float(value) for value in representative(self.textures[params.texture_index])
         )
 
+    def set_decal_transform_space(self, space: str) -> None:
+        """Switch whether Scale/Rotate act on a decal's whole modifier stack
+        as one unit ("object") or on that one decal alone ("edit")."""
+        if space not in ("object", "edit"):
+            return
+        if space == self.decal_transform_space:
+            return
+        self.decal_transform_space = space
+        self.mark_normal_dirty()
+        self.set_status(f"Decal transform space: {space.title()}")
+
+    def toggle_decal_transform_space(self) -> None:
+        self.set_decal_transform_space(
+            "edit" if self.decal_transform_space == "object" else "object"
+        )
+
     @staticmethod
     def _rotate_vector(vector: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
         """Rodrigues rotation used by radial decal-array instances."""
@@ -1545,16 +1589,57 @@ class MeshMapApp(mglw.WindowConfig):
 
         Instances deliberately never enter ``self.decals``: the source remains
         the one scene-tree item, undo subject, and inspector selection.
+
+        An Object-space scale or rotate edit treats the source and every
+        generated copy as one rigid unit: Scale grows the offsets and radius
+        along with the decal itself, so copies spread apart as they grow, and
+        Rotate pivots the whole array or ring, exactly as today's plain
+        rotation always has. An Edit-space one instead treats each copy as
+        its own thing: Scale leaves the offsets alone (only each copy's own
+        footprint grows), and Rotate spins every copy in place around its own
+        centre without moving any of them -- achieved by "un-spinning" the
+        group's placement basis by ``source.edit_spin`` before computing
+        offsets, then re-applying that same spin to each instance's own
+        orientation. Movement is identical either way: nothing here treats
+        center specially, so moving the source always carries every copy
+        with it.
+
+        Both of those read only ``source.edit_spin`` and
+        ``source.edit_scale_reference`` -- history the relevant sync methods
+        record at the moment of each edit -- never the app's *current*
+        Object/Edit toggle. Gating on the live toggle instead would mean
+        merely switching it, with no edit in between, changes what is
+        rendered: the same stored offsets would suddenly be interpreted a
+        different way, and every copy would visibly jump.
         """
         instances = [source]
         if not source.modifiers or source.projector_center is None:
             return instances
+
+        scale_factor = float(source.scale) / max(
+            float(source.edit_scale_reference), 1e-6
+        )
+        spin = math.radians(float(source.edit_spin))
 
         # Ordered modifier evaluation: every entry receives the complete
         # result of the entry above it, exactly as an object modifier stack
         # does. Two arrays of N and M therefore evaluate to (N+1)*(M+1)
         # instances, while only ``source`` remains a real scene-tree decal.
         for modifier in source.modifiers:
+            if isinstance(modifier, DecalMirrorModifier):
+                normal = _MIRROR_WORLD_AXES.get(
+                    str(modifier.axis).lower(), _MIRROR_WORLD_AXES["x"]
+                )
+                plane_point = self._mesh_mirror_center()
+                evaluated = []
+                for base in instances:
+                    evaluated.append(base)
+                    evaluated.append(
+                        self._mirrored_decal_instance(base, plane_point, normal)
+                    )
+                instances = evaluated
+                continue
+
             count = min(max(int(modifier.count), 0), 100)
             evaluated = []
             for base in instances:
@@ -1562,14 +1647,26 @@ class MeshMapApp(mglw.WindowConfig):
                 right = np.asarray(base.projector_right, dtype=np.float64)
                 up = np.asarray(base.projector_up, dtype=np.float64)
                 forward = np.asarray(base.projector_forward, dtype=np.float64)
-                local_axes = {"x": right, "y": up, "z": forward}
+                # Edit space: recover the placement basis as it stood before
+                # this decal's own individual rotation edits, so those edits
+                # cannot pivot the array/ring -- only an Object-space rotation
+                # (which never touches edit_spin) does that.
+                if spin:
+                    place_right = self._rotate_vector(right, forward, -spin)
+                    place_up = self._rotate_vector(up, forward, -spin)
+                else:
+                    place_right, place_up = right, up
+                local_axes = {"x": place_right, "y": place_up, "z": forward}
                 if modifier.mode == "radial":
                     radial_axis = str(modifier.radial_axis)
                     axis = local_axes.get(radial_axis.lstrip("-"), forward)
                     if radial_axis.startswith("-"):
                         axis = -axis
-                    radial = right if abs(float(np.dot(axis, right))) < 0.9 else up
-                    radius = max(float(modifier.radius), 1e-6)
+                    radial = (
+                        place_right if abs(float(np.dot(axis, place_right))) < 0.9
+                        else place_up
+                    )
+                    radius = max(float(modifier.radius) * scale_factor, 1e-6)
                     # The stored decal transform is the ring's pivot. Its
                     # rendered original is index zero on the circumference;
                     # generated copies fill the remaining equal-angle points.
@@ -1595,6 +1692,15 @@ class MeshMapApp(mglw.WindowConfig):
                         )
                         rotated_up = np.cross(rotated_forward, rotated_right)
                         rotated_up /= max(float(np.linalg.norm(rotated_up)), 1e-12)
+                        if spin:
+                            # Each copy's own extra spin, layered on top of
+                            # the pivot-facing orientation the ring gives it.
+                            rotated_right = self._rotate_vector(
+                                rotated_right, rotated_forward, spin
+                            )
+                            rotated_up = self._rotate_vector(
+                                rotated_up, rotated_forward, spin
+                            )
                         instance.projector_right = tuple(rotated_right)
                         instance.projector_up = tuple(rotated_up)
                         instance.projector_forward = tuple(rotated_forward)
@@ -1605,16 +1711,75 @@ class MeshMapApp(mglw.WindowConfig):
                         instance = copy.copy(base)
                         instance.modifiers = []
                         direction = (
-                            right * float(modifier.offset_x)
-                            + up * float(modifier.offset_y)
+                            place_right * float(modifier.offset_x)
+                            + place_up * float(modifier.offset_y)
                             + forward * float(modifier.offset_z)
-                        )
+                        ) * scale_factor
                         instance.projector_center = tuple(
                             center + direction * copy_index
                         )
                         evaluated.append(instance)
             instances = evaluated
         return instances
+
+    def _mesh_mirror_center(self) -> np.ndarray:
+        """Where a Mirror modifier's plane passes through.
+
+        The mesh's own bounding-box center -- the same point the camera
+        frames on load (see ``mesh.bounds.mean(axis=0)`` elsewhere) -- rather
+        than the world origin, since nothing recenters an imported mesh there.
+        """
+        mesh = getattr(self, "mesh", None)
+        if mesh is None:
+            return np.zeros(3, dtype=np.float64)
+        return np.asarray(mesh.bounds, dtype=np.float64).mean(axis=0)
+
+    @staticmethod
+    def _mirrored_decal_instance(
+        base: DecalParams, plane_point: np.ndarray, normal: np.ndarray,
+    ) -> DecalParams:
+        """One decal, reflected across a world plane.
+
+        Reflecting the center, and each basis axis as a direction, is a
+        single isometry applied four times -- it keeps the basis orthonormal,
+        the same way rotating it would, so the copy is a true mirror image
+        rather than merely a relocated one.
+
+        A reflection also inverts the frame's handedness:
+        ``cross(reflect(forward), reflect(right)) == -reflect(cross(forward,
+        right))`` for any plane, and the decal shaders always reconstruct the
+        bump's bitangent as ``cross(surface_normal, tangent)`` from ``right``
+        alone -- they never read ``up`` for that, only for sampling. Left
+        alone, the mirrored copy's bump would come out inverted on that axis
+        even though the sampled image mirrors correctly. Flipping the green
+        channel is the standard fix for a mirrored normal map, and this app
+        already carries that exact toggle for maps baked in the other Y
+        convention (``flip_green``) -- inverting it here, universally,
+        exactly cancels the handedness flip regardless of which world axis
+        was chosen or how the source decal happens to be oriented.
+        """
+        instance = copy.copy(base)
+        instance.modifiers = []
+        instance.flip_green = not base.flip_green
+
+        def reflect(vector: np.ndarray, *, as_point: bool) -> tuple[float, float, float]:
+            offset = (vector - plane_point) if as_point else vector
+            reflected = vector - 2.0 * float(np.dot(offset, normal)) * normal
+            return tuple(reflected)
+
+        instance.projector_center = reflect(
+            np.asarray(base.projector_center, dtype=np.float64), as_point=True
+        )
+        instance.projector_right = reflect(
+            np.asarray(base.projector_right, dtype=np.float64), as_point=False
+        )
+        instance.projector_up = reflect(
+            np.asarray(base.projector_up, dtype=np.float64), as_point=False
+        )
+        instance.projector_forward = reflect(
+            np.asarray(base.projector_forward, dtype=np.float64), as_point=False
+        )
+        return instance
 
     def live_decal_source(self, source: DecalParams) -> DecalParams:
         """Source placement with the current G/S/R projector applied."""
@@ -2188,8 +2353,64 @@ class MeshMapApp(mglw.WindowConfig):
             pending_orbit=tuple(getattr(self, "_pending_orbit", (0.0, 0.0))),
             pending_pan=tuple(getattr(self, "_pending_pan", (0.0, 0.0))),
             pending_zoom=float(getattr(self, "_pending_zoom", 0.0)),
+            **self._native_focus_state(),
             **details,
         )
+
+    #: How often ``_native_focus_state`` re-queries AppKit rather than reusing
+    #: its last answer. Focus does not change frame to frame, and every mouse
+    #: move is traced, so asking freshly every call would spend an ObjC round
+    #: trip on nearly every rendered frame for an answer that is almost always
+    #: identical to a moment ago.
+    _FOCUS_STATE_TTL = 0.2
+
+    def _native_focus_state(self) -> dict:
+        """AppKit's own key-window/active state, cached briefly.
+
+        Folded into every traced event so a pinch that silently never arrives
+        -- nothing calls back, so nothing would otherwise get logged at that
+        moment -- can still be checked afterwards against what the window was
+        actually doing, including whether this ever disagrees with pyglet's
+        own ``window_activate``/``window_deactivate`` belief.
+        """
+        now = time.monotonic()
+        if now - self._focus_state_checked_at >= self._FOCUS_STATE_TTL:
+            self._focus_state_cache = native_focus_state(self.wnd)
+            self._focus_state_checked_at = now
+        return self._focus_state_cache
+
+    #: Cadence for ``_retry_window_focus_if_needed``. A tighter interval than
+    #: the couple of seconds it costs to notice would just spend more ObjC
+    #: round trips retrying a reclaim that, when it is going to fail, tends
+    #: to keep failing for a while regardless of how soon it is retried.
+    _WINDOW_FOCUS_RETRY_INTERVAL = 1.0
+
+    def _retry_window_focus_if_needed(self) -> None:
+        """Keep trying to reclaim real AppKit focus, every frame's worth of
+        opportunity rather than only at startup or on the next decal
+        interaction -- install_pinch_zoom's own re-arm triggers can be
+        minutes apart if the user is only orbiting the camera, and a reclaim
+        attempt is not guaranteed to land the first time either (see
+        render.trackpad._reclaim_window_focus).
+
+        Gated on ``is_app_active`` as well as ``is_key_window``, not just the
+        latter: the broken state this exists to recover from (see
+        ``_reclaim_window_focus``'s docstring) is the app *looking* active --
+        a bold menu bar -- while its one window is never actually key, which
+        is ``is_app_active`` true and ``is_key_window`` false. The moment the
+        user deliberately switches to another application, ``is_app_active``
+        goes false too, and reclaiming here would fight that switch and steal
+        focus back every render frame -- exactly the opposite of what this is
+        for.
+        """
+        focus = self._native_focus_state()
+        if focus.get("is_key_window") is not False or not focus.get("is_app_active"):
+            return
+        now = time.monotonic()
+        if now - self._focus_retry_at < self._WINDOW_FOCUS_RETRY_INTERVAL:
+            return
+        self._focus_retry_at = now
+        install_pinch_zoom(self.wnd, self.on_pinch_zoom)
 
     def _finish_decal_pointer_interaction(self, *, clear_navigation: bool) -> None:
         """Return pointer/trackpad ownership cleanly to viewport navigation."""
@@ -2348,6 +2569,30 @@ class MeshMapApp(mglw.WindowConfig):
                 self.mark_normal_dirty()
         if keep and params is not None and self._live_decal_projector is not None:
             self._commit_live_projector(params, self._live_decal_projector)
+            if (
+                self._decal_transform_mode == "rotate"
+                and self.decal_transform_space == "edit"
+                and self._decal_transform_anchor is not None
+            ):
+                # Same bookkeeping as the inspector's Rotation field (see
+                # sync_decal_inspector_projector): remember how much of this
+                # R-drag was applied individually, so decal_instances can
+                # undo exactly that amount for this decal's modifier copies.
+                anchor_rotation = self._decal_transform_anchor[6]
+                params.edit_spin = float(params.edit_spin) + (
+                    float(params.rotation) - float(anchor_rotation)
+                )
+            elif (
+                self._decal_transform_mode == "scale"
+                and self.decal_transform_space == "edit"
+                and self._decal_transform_anchor is not None
+                and params.scale != self._decal_transform_anchor[3]
+            ):
+                # Same bookkeeping as the inspector's Scale field (see
+                # sync_decal_inspector_projector): this S-drag changed only
+                # this decal's own footprint, not the array's, so hold the
+                # reference at the new scale.
+                params.edit_scale_reference = float(params.scale)
         if keep:
             self._record_decal_undo(before)
         self.set_status("Decal transform applied" if keep else "Decal transform cancelled")
@@ -2429,6 +2674,31 @@ class MeshMapApp(mglw.WindowConfig):
                         )
                     if self._decal_transform_surface_offset is not None:
                         point = point + self._decal_transform_surface_offset
+                        # The grab offset is a rigid vector: exactly right on a
+                        # flat face, but across a bevel it can carry the
+                        # decal's true centre onto a different triangle than
+                        # the one under the cursor -- or off the surface
+                        # entirely, since a rigid offset assumes an infinite
+                        # flat plane that a bend does not actually have. Both
+                        # the tangent-plane orientation and the point itself
+                        # must come from whatever is actually nearest on the
+                        # surface, not from the cursor's own hit: using the
+                        # cursor's face left the decal oriented to a normal
+                        # sampled somewhere else entirely (skewed, detached
+                        # from the surface), and leaving `point` adrift off
+                        # the surface pushed the live preview's projector
+                        # depth outside the decal's own size, hiding it
+                        # completely until a click committed a fresh,
+                        # on-surface position.
+                        located = self._surface_location_at_world_point(point)
+                        if located is not None and self._pick_geometry is not None:
+                            located_uv, face = located
+                            vertices, faces, uvs = self._pick_geometry
+                            snapped = surface_at_uv(
+                                vertices, faces, uvs, located_uv[0], located_uv[1]
+                            )
+                            if snapped is not None:
+                                point = np.asarray(snapped, dtype=np.float64)
                     if image is not None:
                         self._set_live_decal_projector(
                             image, point, params, int(face)
@@ -3890,6 +4160,7 @@ class MeshMapApp(mglw.WindowConfig):
     # -- moderngl-window hooks --------------------------------------------
 
     def on_render(self, time: float, frame_time: float) -> None:
+        self._retry_window_focus_if_needed()
         self._drain_scroll()
         self.controller.pump()
         self._sync_bake_outputs()
@@ -3978,8 +4249,6 @@ class MeshMapApp(mglw.WindowConfig):
             alt=bool(modifiers.alt),
         )
         keys = self.wnd.keys
-        if key in (getattr(keys, "LEFT_SHIFT", None), getattr(keys, "RIGHT_SHIFT", None)):
-            self._shift_down = action != keys.ACTION_RELEASE
         if action != keys.ACTION_PRESS:
             return
 
@@ -4045,6 +4314,8 @@ class MeshMapApp(mglw.WindowConfig):
             self.wireframe = not self.wireframe
         elif key == keys.L:
             self.lighting = not self.lighting
+        elif key == getattr(keys, "TAB", None):
+            self.toggle_decal_transform_space()
         elif key == getattr(keys, "G", None):
             if self.mouse_over_viewport():
                 self.begin_decal_transform("move")
@@ -4098,10 +4369,6 @@ class MeshMapApp(mglw.WindowConfig):
     def on_mouse_press_event(self, x: int, y: int, button: int) -> None:
         self._mouse = (float(x), float(y))
         self._modifiers = self.wnd.modifiers
-        # A click carries a trustworthy modifier snapshot. Reset the cached
-        # Shift latch from it so a release event missed while a native popup or
-        # combo owned focus cannot leave subsequent two-finger gestures panning.
-        self._shift_down = bool(self._modifiers.shift)
         self._trace_action(
             "mouse_press", x=x, y=y, button=button,
             shift=bool(self._modifiers.shift), ctrl=bool(self._modifiers.ctrl),
@@ -4410,14 +4677,28 @@ class MeshMapApp(mglw.WindowConfig):
                 base * max(params.scale_y, 1e-6)
                 / max(params.image_aspect, 1e-6),
             )
+            # Edit space: this decal's own footprint just changed, not the
+            # array's -- move the reference to match so decal_instances'
+            # scale/reference ratio stays at 1. See DecalParams.edit_scale_
+            # reference; scale_x/scale_y are deliberately excluded, the same
+            # way decal_instances never reads them for this.
+            if params.scale != old_scale and self.decal_transform_space == "edit":
+                params.edit_scale_reference = float(params.scale)
 
         if params.rotation != old_rotation:
-            angle = math.radians(float(params.rotation) - float(old_rotation))
+            delta_degrees = float(params.rotation) - float(old_rotation)
+            angle = math.radians(delta_degrees)
             cosine, sine = math.cos(angle), math.sin(angle)
             right = np.asarray(params.projector_right, dtype=np.float64)
             up = np.asarray(params.projector_up, dtype=np.float64)
             params.projector_right = tuple(right * cosine + up * sine)
             params.projector_up = tuple(up * cosine - right * sine)
+            # Edit space: remember how much of this rotation was applied
+            # individually, so decal_instances can undo exactly that amount
+            # when placing this decal's modifier-generated copies -- see its
+            # docstring and DecalParams.edit_spin.
+            if self.decal_transform_space == "edit":
+                params.edit_spin = float(params.edit_spin) + delta_degrees
 
         if (params.center_u, params.center_v) != (old_u, old_v) \
                 and self._pick_geometry is not None:
@@ -4625,12 +4906,18 @@ class MeshMapApp(mglw.WindowConfig):
         step = _PIXELS_PER_SCROLL * self.navigation.scroll_speed
 
         # pyglet wipes the modifier state on every scroll event
-        # (``_handle_modifiers(0)`` in its moderngl-window backend), so read the
-        # copy kept from the last key or button event instead.
-        modifiers = self._modifiers
-        if modifiers.ctrl or modifiers.alt:
+        # (``_handle_modifiers(0)`` in its moderngl-window backend), so this
+        # cannot read ``self.wnd.modifiers`` here. ImGui's own key state is
+        # unaffected -- it only changes on real key press/release events,
+        # forwarded unconditionally through ``gui.key_event`` -- so it is
+        # what decides Shift/Ctrl/Alt now, rather than a cache of the last
+        # key or button event's snapshot. That cache could go stale after any
+        # popup or combo box ate the release that would have cleared it
+        # (Object/Edit among them), silently latching a pan.
+        io = imgui.get_io()
+        if io.key_ctrl or io.key_alt:
             self._queue_scroll(zoom=y_offset * self.navigation.scroll_speed)
-        elif self._shift_down or modifiers.shift:
+        elif io.key_shift:
             self._queue_scroll(pan=(x_offset * step, -y_offset * step))
         else:
             # Same units and sign as a left-drag, so both gestures feel alike.

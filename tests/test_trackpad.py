@@ -15,6 +15,8 @@ and delivers, and that what arrives moves the camera the way a pinch should.
 from __future__ import annotations
 
 import sys
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -162,6 +164,189 @@ def test_install_declines_without_a_cocoa_window():
     assert trackpad.install_pinch_zoom(NotACocoaWindow(), lambda _: None) is False
 
 
+def test_native_focus_state_is_empty_without_a_cocoa_window():
+    """Headless runs and every other backend must fall through quietly."""
+
+    class NotACocoaWindow:
+        pass
+
+    assert trackpad.native_focus_state(NotACocoaWindow()) == {}
+
+
+def test_native_focus_state_reports_appkits_own_answer(monkeypatch):
+    """This must reflect AppKit directly, not pyglet's activate/deactivate
+    belief -- that is the whole point of cross-checking against it."""
+
+    class FakeNSWindow:
+        def isKeyWindow(self):
+            return True
+
+    class FakeNSApp:
+        def sharedApplication(self):
+            return self
+
+        def isActive(self):
+            return False
+
+    fake_native = types.SimpleNamespace(_nswindow=FakeNSWindow())
+    monkeypatch.setattr(trackpad, "_cocoa_window", lambda window: fake_native)
+
+    cocoapy = types.ModuleType("pyglet.libs.darwin.cocoapy")
+    cocoapy.ObjCClass = lambda _name: FakeNSApp()
+    monkeypatch.setitem(sys.modules, "pyglet.libs.darwin.cocoapy", cocoapy)
+
+    assert trackpad.native_focus_state(object()) == {
+        "is_key_window": True,
+        "is_app_active": False,
+    }
+
+
+def _fake_reclaim_cocoapy(dock_apps: list):
+    """A minimal stand-in for ``pyglet.libs.darwin.cocoapy`` covering both
+    calls ``_reclaim_window_focus`` makes: the Dock-first activation and the
+    direct one. ``dock_apps`` is what ``runningApplicationsWithBundleIdentifier_``
+    returns -- empty to exercise the "no Dock process found" fallback."""
+
+    class FakeNSApp:
+        def __init__(self):
+            self.activated = False
+
+        def sharedApplication(self):
+            return self
+
+        def activateIgnoringOtherApps_(self, _value):
+            self.activated = True
+
+    class FakeRunningApps:
+        def count(self):
+            return len(dock_apps)
+
+        def objectAtIndex_(self, index):
+            return dock_apps[index]
+
+    class FakeNSRunningApplicationClass:
+        def runningApplicationsWithBundleIdentifier_(self, _bundle_id):
+            return FakeRunningApps()
+
+    fake_app = FakeNSApp()
+    classes = {
+        "NSApplication": fake_app,
+        "NSRunningApplication": FakeNSRunningApplicationClass(),
+    }
+    cocoapy = types.ModuleType("pyglet.libs.darwin.cocoapy")
+    cocoapy.ObjCClass = lambda name: classes[name]
+    cocoapy.get_NSString = lambda value: value
+    cocoapy.NSApplicationActivateIgnoringOtherApps = 1
+    return cocoapy, fake_app
+
+
+def test_reclaim_window_focus_activates_and_orders_front(monkeypatch):
+    """The self-heal for pyglet's unbundled-launch focus-stealing bug."""
+
+    class FakeNSWindow:
+        def __init__(self):
+            self.ordered_front = False
+
+        def makeKeyAndOrderFront_(self, _sender):
+            self.ordered_front = True
+
+    nswindow = FakeNSWindow()
+    cocoapy, fake_app = _fake_reclaim_cocoapy(dock_apps=[])
+    monkeypatch.setitem(sys.modules, "pyglet.libs.darwin.cocoapy", cocoapy)
+
+    assert trackpad._reclaim_window_focus(types.SimpleNamespace(_nswindow=nswindow)) is True
+    assert fake_app.activated is True
+    assert nswindow.ordered_front is True
+
+
+def test_reclaim_window_focus_activates_the_dock_process_first(monkeypatch):
+    """The two-step pyglet's own startup code uses to win the same race --
+    see the docstring on ``_reclaim_window_focus`` for why a plain
+    ``activateIgnoringOtherApps_`` alone was not enough."""
+
+    class FakeNSWindow:
+        def makeKeyAndOrderFront_(self, _sender):
+            pass
+
+    class FakeDockApp:
+        def __init__(self):
+            self.activated_with = None
+
+        def activateWithOptions_(self, options):
+            self.activated_with = options
+
+    dock_app = FakeDockApp()
+    cocoapy, fake_app = _fake_reclaim_cocoapy(dock_apps=[dock_app])
+    monkeypatch.setitem(sys.modules, "pyglet.libs.darwin.cocoapy", cocoapy)
+    monkeypatch.setattr(trackpad.time, "sleep", lambda _seconds: None)
+
+    assert trackpad._reclaim_window_focus(
+        types.SimpleNamespace(_nswindow=FakeNSWindow())
+    ) is True
+    assert dock_app.activated_with == cocoapy.NSApplicationActivateIgnoringOtherApps
+    assert fake_app.activated is True
+
+
+def test_reclaim_window_focus_declines_without_a_native_window():
+    assert trackpad._reclaim_window_focus(types.SimpleNamespace(_nswindow=None)) is False
+
+
+def test_install_reclaims_focus_when_appkit_reports_not_key(monkeypatch):
+    """A pinch never reaches a window AppKit does not consider key, so arming
+    the bridge must not stop at "the recognizer is attached" -- it has to
+    notice and fix a window that is not really focused yet."""
+
+    class FakeView:
+        value = 987654
+
+    fake_native = types.SimpleNamespace(_nsview=FakeView(), _nswindow=object())
+    monkeypatch.setattr(trackpad, "_cocoa_window", lambda window: fake_native)
+    monkeypatch.setattr(trackpad, "_install_selectors", lambda: True)
+    monkeypatch.setattr(trackpad, "_install_recognizer", lambda view: True)
+
+    focus_states = iter([
+        {"is_key_window": False, "is_app_active": False},
+        {"is_key_window": True, "is_app_active": True},
+    ])
+    monkeypatch.setattr(trackpad, "native_focus_state", lambda window: next(focus_states))
+    reclaimed = []
+    monkeypatch.setattr(
+        trackpad, "_reclaim_window_focus",
+        lambda native: reclaimed.append(native) or True,
+    )
+
+    try:
+        assert trackpad.install_pinch_zoom(object(), lambda _: None) is True
+        assert reclaimed == [fake_native]
+    finally:
+        trackpad._handlers.pop(987654, None)
+
+
+def test_install_does_not_reclaim_focus_when_already_key(monkeypatch):
+    class FakeView:
+        value = 987655
+
+    fake_native = types.SimpleNamespace(_nsview=FakeView(), _nswindow=object())
+    monkeypatch.setattr(trackpad, "_cocoa_window", lambda window: fake_native)
+    monkeypatch.setattr(trackpad, "_install_selectors", lambda: True)
+    monkeypatch.setattr(trackpad, "_install_recognizer", lambda view: True)
+    monkeypatch.setattr(
+        trackpad, "native_focus_state",
+        lambda window: {"is_key_window": True, "is_app_active": True},
+    )
+    reclaimed = []
+    monkeypatch.setattr(
+        trackpad, "_reclaim_window_focus",
+        lambda native: reclaimed.append(native) or True,
+    )
+
+    try:
+        assert trackpad.install_pinch_zoom(object(), lambda _: None) is True
+        assert reclaimed == []
+    finally:
+        trackpad._handlers.pop(987655, None)
+
+
 def test_native_view_pointer_survives_wrapper_replacement():
     """A new Python wrapper for the same NSView must retain its callback."""
 
@@ -206,6 +391,80 @@ def test_duplicate_native_paths_are_collapsed(monkeypatch):
         trackpad._last_dispatch.pop(654321, None)
 
     assert delivered == [0.25, 0.25]
+
+
+def _fake_retry_app(focus_state: dict, focus_retry_at: float = float("-inf")):
+    app = type("FakeApp", (), {})()
+    app.wnd = object()
+    app.pinch_zoom = False
+    app.on_pinch_zoom = lambda magnitude: None
+    app._focus_retry_at = focus_retry_at
+    app._WINDOW_FOCUS_RETRY_INTERVAL = MeshMapApp._WINDOW_FOCUS_RETRY_INTERVAL
+    app._native_focus_state = lambda: focus_state
+    return app
+
+
+def test_retry_window_focus_reclaims_when_not_key(monkeypatch):
+    """install_pinch_zoom's own re-arm triggers can be minutes apart if the
+    user is only orbiting the camera, so on_render must keep trying too --
+    but only for the broken state this exists to recover from: the app still
+    active (a bold menu bar) while its window is never actually key."""
+    app = _fake_retry_app({"is_key_window": False, "is_app_active": True})
+    calls = []
+    monkeypatch.setattr(
+        "render.viewport.install_pinch_zoom",
+        lambda window, handler: calls.append((window, handler)) or True,
+    )
+
+    MeshMapApp._retry_window_focus_if_needed(app)
+
+    assert calls == [(app.wnd, app.on_pinch_zoom)]
+
+
+def test_retry_window_focus_does_nothing_when_app_is_not_active(monkeypatch):
+    """The user deliberately switching to another application also makes the
+    window not-key, but must never be fought -- reclaiming here would steal
+    focus back from whatever app they switched to, every render frame."""
+    app = _fake_retry_app({"is_key_window": False, "is_app_active": False})
+    calls = []
+    monkeypatch.setattr(
+        "render.viewport.install_pinch_zoom",
+        lambda window, handler: calls.append(1) or True,
+    )
+
+    MeshMapApp._retry_window_focus_if_needed(app)
+
+    assert calls == []
+
+
+def test_retry_window_focus_is_throttled(monkeypatch):
+    """Must not hammer AppKit every single frame while stuck not-key."""
+    app = _fake_retry_app(
+        {"is_key_window": False, "is_app_active": True},
+        focus_retry_at=time.monotonic(),
+    )
+    calls = []
+    monkeypatch.setattr(
+        "render.viewport.install_pinch_zoom",
+        lambda window, handler: calls.append(1) or True,
+    )
+
+    MeshMapApp._retry_window_focus_if_needed(app)
+
+    assert calls == []
+
+
+def test_retry_window_focus_does_nothing_once_key(monkeypatch):
+    app = _fake_retry_app({"is_key_window": True, "is_app_active": True})
+    calls = []
+    monkeypatch.setattr(
+        "render.viewport.install_pinch_zoom",
+        lambda window, handler: calls.append(1) or True,
+    )
+
+    MeshMapApp._retry_window_focus_if_needed(app)
+
+    assert calls == []
 
 
 def test_window_activation_rearms_pinch_bridge(monkeypatch):

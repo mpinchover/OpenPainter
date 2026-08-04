@@ -9,6 +9,7 @@ does the work and the numpy mirror that documents it.
 
 from __future__ import annotations
 
+import math
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -35,7 +36,7 @@ from core.decal import (  # noqa: E402
 from core.params import MAX_FALLOFF  # noqa: E402
 from core.picking import face_at_uv  # noqa: E402
 from core.export import export_maps, save_normal_map  # noqa: E402
-from core.params import DecalArrayModifier, DecalParams  # noqa: E402
+from core.params import DecalArrayModifier, DecalMirrorModifier, DecalParams  # noqa: E402
 
 FLAT = np.array([0.5, 0.5, 1.0], dtype=np.float32)
 
@@ -163,6 +164,227 @@ def test_second_array_operates_on_copies_from_the_first_array():
     assert {instance.projector_center for instance in instances} == {
         (0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
         (0.0, 2.0, 0.0), (1.0, 2.0, 0.0),
+    }
+
+
+# --------------------------------------------------------------------------
+# Object vs Edit transform space
+#
+# decal_instances reads only DecalParams.edit_spin and .edit_scale_reference
+# -- history the sync methods record at the moment of an edit -- never the
+# app's *current* Object/Edit toggle. That is deliberate: gating on the live
+# toggle instead would mean switching it with no edit in between changes what
+# is rendered, and every copy visibly jumps. See test_toggling_transform_
+# space_alone_moves_nothing below, which pins exactly that.
+# --------------------------------------------------------------------------
+
+def test_scale_spreads_array_copies_when_the_reference_is_untouched():
+    """A scale edit that never updated edit_scale_reference -- what an
+    Object-space edit does -- is what is meant to spread the array apart as
+    the decal grows."""
+    from render.viewport import MeshMapApp
+
+    default_reference = DecalParams().edit_scale_reference
+    source = _projected_array(
+        scale=default_reference * 2.0,
+        modifiers=[DecalArrayModifier(count=1, offset_x=1.0)],
+    )
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+
+    assert instances[1].projector_center == pytest.approx((2.0, 0.0, 0.0))
+
+
+def test_scale_leaves_array_offsets_alone_once_the_reference_tracks_it():
+    """A scale edit that did update edit_scale_reference to match -- what an
+    Edit-space edit does -- must leave the array exactly where it was."""
+    from render.viewport import MeshMapApp
+
+    source = _projected_array(
+        scale=1.25,
+        modifiers=[DecalArrayModifier(count=1, offset_x=1.0)],
+    )
+    source.edit_scale_reference = source.scale
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+
+    assert instances[1].projector_center == pytest.approx((1.0, 0.0, 0.0))
+
+
+def test_scale_spreads_radial_radius_when_the_reference_is_untouched():
+    from render.viewport import MeshMapApp
+
+    default_reference = DecalParams().edit_scale_reference
+    source = _projected_array(
+        scale=default_reference * 3.0,
+        modifiers=[DecalArrayModifier(mode="radial", count=3, radius=2.0)],
+    )
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+    centers = np.asarray([instance.projector_center for instance in instances])
+    pivot = np.asarray(source.projector_center)
+
+    assert np.linalg.norm(centers - pivot, axis=1) == pytest.approx([6.0] * 4)
+
+
+def _spin_source_basis(source, degrees: float) -> None:
+    """What sync_decal_inspector_projector does to a decal's own basis for a
+    rotation edit -- lifted out so tests can apply it without going through
+    the full inspector-field-edit machinery."""
+    angle = math.radians(degrees)
+    right = np.asarray(source.projector_right)
+    up = np.asarray(source.projector_up)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    source.projector_right = tuple(right * cosine + up * sine)
+    source.projector_up = tuple(up * cosine - right * sine)
+
+
+def test_rotation_spins_each_copy_in_place_once_edit_spin_is_recorded():
+    """What an Edit-space rotation edit leaves behind: edit_spin tracking
+    exactly the rotation applied, which is what keeps the array from pivoting."""
+    from render.viewport import MeshMapApp
+
+    source = _projected_array(modifiers=[DecalArrayModifier(count=1, offset_x=1.0)])
+    position_before = MeshMapApp.decal_instances(
+        object.__new__(MeshMapApp), source
+    )[1].projector_center
+
+    _spin_source_basis(source, 45.0)
+    source.edit_spin = 45.0
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+
+    assert instances[1].projector_center == pytest.approx(position_before), (
+        "a recorded individual rotation must not pivot the array"
+    )
+    assert instances[1].projector_right == pytest.approx(source.projector_right), (
+        "but each copy still shows the individual spin in its own orientation"
+    )
+
+
+def test_rotation_pivots_the_whole_array_without_edit_spin():
+    """What an Object-space rotation edit leaves behind: edit_spin never
+    updated, which is unchanged from how rotation has always worked -- the
+    array's whole placement basis turns with the decal."""
+    from render.viewport import MeshMapApp
+
+    source = _projected_array(modifiers=[DecalArrayModifier(count=1, offset_x=1.0)])
+
+    _spin_source_basis(source, 90.0)
+    assert source.edit_spin == 0.0
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+
+    assert instances[1].projector_center == pytest.approx((0.0, 1.0, 0.0), abs=1e-6)
+
+
+def test_toggling_transform_space_alone_moves_nothing():
+    """The bug this whole section guards against: flipping the Object/Edit
+    dropdown by itself, with no scale or rotate edit in between, must not
+    change a single instance's position or orientation."""
+    from render.viewport import MeshMapApp
+
+    app = object.__new__(MeshMapApp)
+    source = _projected_array(
+        scale=1.5,
+        modifiers=[
+            DecalArrayModifier(count=2, offset_x=0.3),
+            DecalArrayModifier(mode="radial", count=3, radius=0.4),
+        ],
+    )
+    # A decal with some genuine editing history behind it, mixing both kinds
+    # of edit -- the case most likely to expose the two modes disagreeing.
+    source.edit_scale_reference = 0.6
+    source.edit_spin = 20.0
+
+    app.decal_transform_space = "object"
+    before = app.decal_instances(source)
+    app.decal_transform_space = "edit"
+    after = app.decal_instances(source)
+
+    assert len(before) == len(after)
+    for left, right in zip(before, after):
+        assert left.projector_center == pytest.approx(right.projector_center)
+        assert left.projector_right == pytest.approx(right.projector_right)
+        assert left.projector_up == pytest.approx(right.projector_up)
+        assert left.projector_forward == pytest.approx(right.projector_forward)
+
+
+def test_mirror_reflects_center_and_axes_across_a_world_plane():
+    """With no mesh, the plane passes through the world origin."""
+    from render.viewport import MeshMapApp
+
+    source = _projected_array(
+        projector_center=(2.0, 1.0, 0.5),
+        modifiers=[DecalMirrorModifier(axis="x")],
+    )
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+
+    assert len(instances) == 2
+    assert instances[0] is source
+    mirrored = instances[1]
+    assert not mirrored.modifiers, "the copy is transient, not another scene decal"
+    assert mirrored.projector_center == pytest.approx((-2.0, 1.0, 0.5))
+    # Reflecting the right axis is what makes the copy read as a true mirror
+    # image rather than a relocated duplicate; up and forward, both
+    # perpendicular to X, come back unchanged.
+    assert mirrored.projector_right == pytest.approx((-1.0, 0.0, 0.0))
+    assert mirrored.projector_up == pytest.approx((0.0, 1.0, 0.0))
+    assert mirrored.projector_forward == pytest.approx((0.0, 0.0, 1.0))
+
+
+def test_mirror_flips_the_green_channel_to_keep_the_bump_upright():
+    """A reflection inverts the frame's handedness, so the shader's
+    cross(normal, tangent) bitangent reconstruction comes out inverted on the
+    mirrored copy unless green is flipped to compensate -- otherwise a raised
+    bump reads as recessed (or vice versa) only on the mirrored side."""
+    from render.viewport import MeshMapApp
+
+    source = _projected_array(modifiers=[DecalMirrorModifier(axis="x")])
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+
+    assert source.flip_green is False
+    assert instances[1].flip_green is True
+
+    source.flip_green = True
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+    assert instances[1].flip_green is False, "always inverted, never just forced on"
+
+
+def test_mirror_plane_passes_through_the_meshs_own_center():
+    """Not the world origin -- nothing recenters an imported mesh there."""
+    import types
+
+    from render.viewport import MeshMapApp
+
+    app = object.__new__(MeshMapApp)
+    app.mesh = types.SimpleNamespace(
+        bounds=np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
+    )
+    source = _projected_array(
+        projector_center=(3.0, 0.0, 0.0),
+        modifiers=[DecalMirrorModifier(axis="x")],
+    )
+    instances = app.decal_instances(source)
+
+    # The mesh's center sits at x=2; 3.0 reflects across it to 1.0, not -3.0.
+    assert instances[1].projector_center == pytest.approx((1.0, 0.0, 0.0))
+
+
+def test_mirror_default_axis_is_x():
+    assert DecalMirrorModifier().axis == "x"
+
+
+def test_a_mirror_and_an_array_stack_in_either_order():
+    from render.viewport import MeshMapApp
+
+    source = _projected_array(
+        projector_center=(1.0, 0.0, 0.0),
+        modifiers=[
+            DecalArrayModifier(count=1, offset_x=1.0),
+            DecalMirrorModifier(axis="x"),
+        ],
+    )
+    instances = MeshMapApp.decal_instances(object.__new__(MeshMapApp), source)
+
+    assert len(instances) == 4, "one array copy, then both doubled by the mirror"
+    assert {instance.projector_center for instance in instances} == {
+        (1.0, 0.0, 0.0), (2.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (-2.0, 0.0, 0.0),
     }
 
 
@@ -1187,6 +1409,44 @@ def test_inspector_scale_and_rotation_update_the_committed_projector(placeable):
     assert not np.allclose(decal.projector_right, old_right)
 
 
+def test_inspector_rotation_in_edit_space_accumulates_edit_spin(placeable):
+    decal = placeable.selected_decal
+    # A committed projector, spelled out rather than relied on from the
+    # fixture: whether placement itself has committed one by this point is
+    # exactly the pre-existing gap test_inspector_scale_and_rotation_update_
+    # the_committed_projector already tracks -- unrelated to what this test
+    # is checking, so it must not ride on the same precondition.
+    decal.projector_center = (0.0, 0.0, 0.0)
+    decal.projector_right = (1.0, 0.0, 0.0)
+    decal.projector_up = (0.0, 1.0, 0.0)
+    decal.projector_forward = (0.0, 0.0, 1.0)
+    decal.projector_size = (0.1, 0.1)
+    placeable.set_decal_transform_space("edit")
+    previous = (
+        decal.center_u, decal.center_v,
+        decal.scale, decal.scale_x, decal.scale_y, decal.rotation,
+    )
+
+    decal.rotation += 40.0
+    placeable.sync_decal_inspector_projector(decal, previous)
+
+    assert decal.edit_spin == pytest.approx(40.0)
+
+
+def test_inspector_rotation_in_object_space_leaves_edit_spin_alone(placeable):
+    decal = placeable.selected_decal
+    placeable.set_decal_transform_space("object")
+    previous = (
+        decal.center_u, decal.center_v,
+        decal.scale, decal.scale_x, decal.scale_y, decal.rotation,
+    )
+
+    decal.rotation += 40.0
+    placeable.sync_decal_inspector_projector(decal, previous)
+
+    assert decal.edit_spin == pytest.approx(0.0)
+
+
 def test_g_then_x_moves_only_across_u(placeable):
     decal = placeable.selected_decal
     origin = (decal.center_u, decal.center_v)
@@ -1216,6 +1476,68 @@ def test_g_can_cross_to_a_different_mesh_face(placeable):
     assert (decal.center_u, decal.center_v) == pytest.approx((0.78, 0.66))
     assert converted == [(2, 2), (2, 9)]
     assert decal.surface_face == 2, "the chart stays stable while crossing the edge"
+
+
+def test_move_orients_the_decal_from_the_point_under_it_not_the_cursor(placeable):
+    """G's grab offset keeps the decal at the same relative spot from where
+    it was grabbed, so the cursor's own hit and the decal's true centre are
+    deliberately different points -- and can land on different triangles
+    entirely, e.g. a flat panel and the bevelled wall beside it. The
+    projector's tangent-plane orientation has to come from whatever is
+    actually under the offset-corrected centre, not from the cursor's face:
+    using the cursor's face left the decal positioned correctly but oriented
+    to a normal sampled somewhere else, rendering it skewed and detached
+    from the surface -- worse the further the cursor wandered from the grab
+    point."""
+    # A flat top (z=1, normal +Z) meeting a wall (x=1, normal +X) along a
+    # shared edge, replacing the fixture's single-quad geometry so the two
+    # faces genuinely disagree about which way is "up". Each chart gets its
+    # own well-formed, non-degenerate UV rectangle so surface_at_uv can
+    # actually reverse a UV back into a point on that chart's triangles.
+    vertices = np.array([
+        [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0],
+        [1.0, -1.0, 1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [1.0, 1.0, 1.0],
+    ])
+    faces = np.array([
+        [0, 1, 2], [0, 2, 3],  # flat top, normal +Z
+        [4, 5, 6], [4, 6, 7],  # wall, normal +X
+    ])
+    uvs = np.array([
+        [0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0],
+        [2.0, 0.0], [3.0, 0.0], [3.0, 1.0], [2.0, 1.0],
+    ])
+    placeable._pick_geometry = (vertices, faces, uvs)
+
+    decal = placeable.selected_decal
+    decal.projector_center = (0.0, 0.0, 1.0)
+    decal.projector_right = (1.0, 0.0, 0.0)
+    decal.projector_up = (0.0, 1.0, 0.0)
+    decal.projector_forward = (0.0, 0.0, 1.0)
+    decal.projector_size = (0.2, 0.2)
+
+    # A grab well off the decal's own centre (out on the wall), then a small
+    # pointer move that stays on the wall -- the offset alone is enough to
+    # carry the true centre back onto the flat top.
+    hits = iter([(1.0, 0.0, -0.5), (1.0, 0.2, -0.3)])
+    placeable.world_surface_hit_at = lambda mouse: (np.asarray(next(hits)), 2)
+    placeable.surface_hit_at = lambda mouse: ((0.5, 0.5), 2)
+
+    assert placeable.begin_decal_transform("move")
+    placeable.transform_decal_with_pointer(1.0, 0.0)
+
+    live = placeable._live_decal_projector
+    forward = np.asarray(live["forward"])
+    assert forward == pytest.approx((0.0, 0.0, 1.0), abs=1e-6), (
+        "the offset carried the centre back onto the flat top, so the "
+        "projector must still face +Z, not the wall's +X the cursor was over"
+    )
+    center = np.asarray(live["center"])
+    assert center[2] == pytest.approx(1.0, abs=1e-6), (
+        "the raw offset lands 0.2 units above the flat top -- floating that "
+        "far off the real surface pushes the live preview's projector depth "
+        "outside the decal's own size, which is what made it disappear "
+        "entirely while dragging until a click snapped it back down"
+    )
 
 
 def test_s_then_y_scales_only_the_decal_height(placeable):

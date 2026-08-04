@@ -9,6 +9,61 @@ from __future__ import annotations
 
 import sys
 
+from core.action_log import log_action
+
+_REOPEN_IMP = None
+
+
+def enable_dock_reactivation(window) -> bool:
+    """Bring the window forward when the Dock icon is clicked.
+
+    ``python main.py`` runs unbundled -- there is no Info.plist telling the
+    Dock this is a normal windowed app -- and pyglet's own
+    ``NSApplicationDelegate`` (``pyglet.app.cocoa._AppDelegate``) implements
+    no ``applicationShouldHandleReopen:hasVisibleWindows:``. Recent macOS no
+    longer falls back to useful default handling for that combination: a
+    click on the Dock icon activates the process (the menu bar goes bold)
+    but never re-shows or re-focuses the window itself.
+
+    Same technique as :mod:`render.trackpad`'s pinch fix: add the missing
+    delegate method to the already-registered class at runtime. Best-effort,
+    like the rest of this module -- this must never prevent the app from
+    starting.
+    """
+    global _REOPEN_IMP
+    if sys.platform != "darwin":
+        return False
+    try:
+        from pyglet.libs.darwin.cocoapy import ObjCClass
+        from pyglet.libs.darwin.cocoapy.runtime import add_method, get_class
+
+        native = getattr(window, "_window", None)
+        nswindow = getattr(native, "_nswindow", None)
+        if nswindow is None:
+            return False
+
+        if _REOPEN_IMP is None:
+            def application_should_handle_reopen(
+                objc_self, objc_cmd, application, has_visible_windows
+            ) -> bool:
+                log_action(
+                    "dock_reactivated",
+                    has_visible_windows=bool(has_visible_windows),
+                )
+                app = ObjCClass("NSApplication").sharedApplication()
+                app.activateIgnoringOtherApps_(True)
+                nswindow.makeKeyAndOrderFront_(None)
+                return True
+
+            _REOPEN_IMP = add_method(
+                get_class("_AppDelegate"),
+                "applicationShouldHandleReopen:hasVisibleWindows:",
+                application_should_handle_reopen, b"B@:@B",
+            )
+        return True
+    except Exception:
+        return False
+
 
 def apply_macos_application_name(title: str) -> bool:
     """Expose *title* to Cocoa instead of the Python interpreter's name.

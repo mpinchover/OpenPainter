@@ -79,6 +79,88 @@ def _dispatch_pinch(
     return True
 
 
+def native_focus_state(window) -> dict:
+    """AppKit's own opinion of whether this window is focused right now.
+
+    ``on_activate``/``on_deactivate`` (pyglet's belief, driven by
+    ``windowDidBecomeKey:``/``windowDidResignKey:``) tell the app when focus
+    changed, but there is no callback for "a gesture was attempted and
+    dropped" -- nothing fires, so there is nothing to log at the moment it
+    matters. Querying AppKit directly and folding this into the ordinary
+    input trace (see ``MeshMapApp._trace_action``) means every logged mouse
+    or keyboard event carries the ground truth alongside it, so a pinch that
+    silently went nowhere can be checked against what the window was actually
+    doing at that exact timestamp -- including whether pyglet's own belief
+    ever disagreed with AppKit's.
+    """
+    native = _cocoa_window(window)
+    if native is None:
+        return {}
+    nswindow = getattr(native, "_nswindow", None)
+    if nswindow is None:
+        return {}
+    try:
+        from pyglet.libs.darwin.cocoapy import ObjCClass
+
+        app = ObjCClass("NSApplication").sharedApplication()
+        return {
+            "is_key_window": bool(nswindow.isKeyWindow()),
+            "is_app_active": bool(app.isActive()),
+        }
+    except Exception:
+        return {}
+
+
+def _reclaim_window_focus(native) -> bool:
+    """Force this window to the front and key when AppKit disagrees it is.
+
+    pyglet's own ``applicationDidFinishLaunching_`` (``pyglet/app/cocoa.py``)
+    documents why this is needed: launched unbundled (``python main.py``,
+    no ``.app``), moving the mouse during startup can steal focus to
+    whatever is under the cursor, leaving the app looking active -- a bold
+    menu bar -- while its window is never actually key, "until reactivating
+    it." A trackpad gesture only ever reaches the key window, so this state
+    reads as pinch being silently broken.
+
+    A plain ``activateIgnoringOtherApps_`` call was measured doing nothing at
+    all here -- confirmed via ``native_focus_state`` immediately after calling
+    it -- for well over a minute, on the same macOS build pyglet's own
+    comment names, until something else (an actual click into the window)
+    finally made it key. This uses the same two-step pyglet's own startup
+    code already relies on to win that race: hand activation through the
+    Dock process first, briefly, before asking directly. Called repeatedly
+    (see ``MeshMapApp._retry_window_focus_if_needed``) rather than once,
+    since even this is not guaranteed to land on the first attempt.
+    """
+    nswindow = getattr(native, "_nswindow", None)
+    if nswindow is None:
+        return False
+    try:
+        from pyglet.libs.darwin.cocoapy import (
+            NSApplicationActivateIgnoringOtherApps,
+            ObjCClass,
+            get_NSString,
+        )
+
+        dock = ObjCClass("NSRunningApplication").runningApplicationsWithBundleIdentifier_(
+            get_NSString("com.apple.dock")
+        )
+        if dock is not None and int(dock.count()) > 0:
+            dock.objectAtIndex_(0).activateWithOptions_(
+                NSApplicationActivateIgnoringOtherApps
+            )
+            # Matches pyglet's own startup code exactly: the follow-up
+            # activation below was observed not to take without this pause.
+            time.sleep(0.01)
+
+        app = ObjCClass("NSApplication").sharedApplication()
+        app.activateIgnoringOtherApps_(True)
+        nswindow.makeKeyAndOrderFront_(None)
+        return True
+    except Exception:
+        return False
+
+
 def install_pinch_zoom(window, on_pinch: Callable[[float], None]) -> bool:
     """Route trackpad pinches on ``window`` to ``on_pinch``.
 
@@ -91,18 +173,30 @@ def install_pinch_zoom(window, on_pinch: Callable[[float], None]) -> bool:
     has no ``magnifyWithEvent:`` to be missing -- and is not an error.
     """
     native = _cocoa_window(window)
-    if native is None or not _install_selectors():
+    if native is None:
+        log_action("pinch_install_failed", reason="no_cocoa_window")
+        return False
+    if not _install_selectors():
+        log_action("pinch_install_failed", reason="selectors_unavailable")
         return False
     view = getattr(native, "_nsview", None)
     if view is None:
+        log_action("pinch_install_failed", reason="no_nsview")
         return False
     key = _pointer_key(view)
     _handlers[key] = on_pinch
     recognizer_attached = _install_recognizer(view)
+    focus = native_focus_state(window)
+    reclaimed = None
+    if focus.get("is_key_window") is False:
+        reclaimed = _reclaim_window_focus(native)
+        focus = native_focus_state(window)
     log_action(
         "pinch_handler_armed",
         view_pointer=key,
         recognizer_attached=recognizer_attached,
+        reclaimed_focus=reclaimed,
+        **focus,
     )
     return True
 
@@ -113,12 +207,23 @@ def _cocoa_window(window) -> Optional[object]:
         return None
     native = getattr(window, "_window", None)
     if native is None:
-        return None  # headless, or a backend that keeps its window elsewhere
+        # headless, or a backend that keeps its window elsewhere -- expected
+        # often enough (tests, CI) that logging it would be noise there, but
+        # worth knowing about if it happens on a real desktop session.
+        log_action("pinch_cocoa_window_missing", reason="no_window_attr")
+        return None
     try:
         from pyglet.window.cocoa import CocoaWindow
-    except Exception:
+    except Exception as exc:
+        log_action("pinch_cocoa_window_missing", reason="import_failed", error=str(exc))
         return None
-    return native if isinstance(native, CocoaWindow) else None
+    if not isinstance(native, CocoaWindow):
+        log_action(
+            "pinch_cocoa_window_missing", reason="wrong_type",
+            found_type=type(native).__name__,
+        )
+        return None
+    return native
 
 
 def _install_selectors() -> bool:
@@ -127,7 +232,8 @@ def _install_selectors() -> bool:
     try:
         from pyglet.libs.darwin import cocoapy
         from pyglet.window.cocoa.pyglet_view import PygletView_Implementation
-    except Exception:
+    except Exception as exc:
+        log_action("pinch_selectors_unavailable", error=str(exc))
         return False
 
     event_selector = cocoapy.get_selector("magnifyWithEvent:")
@@ -142,10 +248,17 @@ def _install_selectors() -> bool:
             and view_class.instancesRespondToSelector_(action_selector)
         ):
             return True
+        log_action("pinch_selectors_reinstalling")
         _installed = False
 
     def magnify(objc_self, objc_cmd, nsevent) -> None:
         """``- (void)magnifyWithEvent:(NSEvent *)event``, encoded ``v@:@``."""
+        # Logged before anything that can raise: this is the one line that
+        # proves AppKit actually called us at all. If a pinch never reaches
+        # the app, this line's absence -- not an exception below it -- is the
+        # answer, since everything past here is naturally silent if we are
+        # simply never invoked.
+        log_action("pinch_callback_entered", path="event", view_pointer=_pointer_key(objc_self))
         try:
             # The explicit recognizer is normally the path that fires, but macOS
             # can detach or silence recognizers across focus/view lifecycle
@@ -153,13 +266,18 @@ def _install_selectors() -> bool:
             # _dispatch_pinch collapses the duplicate if both paths fire.
             magnitude = float(cocoapy.ObjCInstance(nsevent).magnification())
             _dispatch_pinch(objc_self, magnitude, source="event")
-        except Exception:
+        except Exception as exc:
             # An exception must never unwind into Objective-C: there is no
             # Python frame to catch it and the process dies mid-gesture.
+            log_action("pinch_callback_error", path="event", error=str(exc))
             traceback.print_exc()
 
     def mesh_map_magnify(objc_self, objc_cmd, sender) -> None:
         """Action invoked by the explicit NSMagnificationGestureRecognizer."""
+        log_action(
+            "pinch_callback_entered", path="recognizer",
+            view_pointer=_pointer_key(objc_self),
+        )
         try:
             recognizer = cocoapy.ObjCInstance(sender)
             magnitude = float(recognizer.magnification())
@@ -168,7 +286,8 @@ def _install_selectors() -> bool:
             # receives the incremental values its zoom queue expects.
             recognizer.setMagnification_(0.0)
             _dispatch_pinch(objc_self, magnitude, source="recognizer")
-        except Exception:
+        except Exception as exc:
+            log_action("pinch_callback_error", path="recognizer", error=str(exc))
             traceback.print_exc()
 
     PygletView_Implementation.PygletView.add_method(
@@ -215,8 +334,10 @@ def _install_recognizer(view: object) -> bool:
         # NSView retains it; keeping the wrapper as well prevents cocoapy from
         # losing the Python-side object while the native recognizer is active.
         _recognizers[key] = recognizer
+        log_action("pinch_recognizer_created", view_pointer=key)
         return True
-    except Exception:
+    except Exception as exc:
+        log_action("pinch_recognizer_create_failed", view_pointer=key, error=str(exc))
         traceback.print_exc()
         return False
 
@@ -229,16 +350,26 @@ def _enable_recognizer(recognizer: object) -> None:
 
 
 def _recognizer_attached(view: object, recognizer: object) -> bool:
+    key = _pointer_key(view)
     try:
         recognizers = view.gestureRecognizers()
         if recognizers is None:
+            log_action("pinch_recognizer_check", view_pointer=key, basis="empty_list")
             return False
         recognizer_key = _pointer_key(recognizer)
         for index in range(int(recognizers.count())):
             if _pointer_key(recognizers.objectAtIndex_(index)) == recognizer_key:
+                log_action("pinch_recognizer_check", view_pointer=key, basis="found")
                 return True
+        log_action("pinch_recognizer_check", view_pointer=key, basis="not_found")
         return False
-    except Exception:
+    except Exception as exc:
         # Older pyglet/cocoapy combinations can fail to expose the array cleanly.
-        # In that case, do not risk adding duplicate native recognizers.
+        # In that case, do not risk adding duplicate native recognizers -- but
+        # log it, since this is exactly the kind of silent false-positive that
+        # would otherwise make a genuinely detached recognizer look fine.
+        log_action(
+            "pinch_recognizer_check", view_pointer=key,
+            basis="check_failed_assumed_attached", error=str(exc),
+        )
         return True

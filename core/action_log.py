@@ -16,6 +16,16 @@ _MAX_LOG_BYTES = 10 * 1024 * 1024
 _FLUSH_EVENTS = {
     "startup", "shutdown", "key", "mouse_press", "mouse_release",
     "pinch", "decal_placement_end", "decal_transform_end", "exception",
+    # The trackpad-pinch diagnostics in render/trackpad.py: these bracket a
+    # native AppKit callback that can crash the process outright if anything
+    # downstream goes wrong, so they must be on disk before that can happen
+    # rather than sitting in the write buffer.
+    "native_magnify", "pinch_install_failed", "pinch_cocoa_window_missing",
+    "pinch_selectors_unavailable", "pinch_selectors_reinstalling",
+    "pinch_recognizer_created", "pinch_recognizer_create_failed",
+    "pinch_recognizer_reattached", "pinch_recognizer_reattach_failed",
+    "pinch_recognizer_check", "pinch_callback_entered", "pinch_callback_error",
+    "dock_reactivated",
 }
 
 

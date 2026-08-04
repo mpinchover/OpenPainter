@@ -34,7 +34,12 @@ from core.layers import (
     set_slot,
     walk,
 )
-from core.params import BAKE_AXES, RESOLUTIONS, DecalArrayModifier
+from core.params import (
+    BAKE_AXES,
+    RESOLUTIONS,
+    DecalArrayModifier,
+    DecalMirrorModifier,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from render.viewport import MeshMapApp
@@ -45,8 +50,14 @@ PANEL_WIDTH = 430
 #: Width of the clickable decal preview in the Decal tab.
 DECAL_THUMBNAIL = 92
 STATUS_BAR_HEIGHT = 34
-#: The bar across the top of the window: what to look at, and how to draw it.
-NAVBAR_HEIGHT = 46
+#: Two rows across the top: the menu bar, then the viewport toolbar below it.
+#: Everything downstream (the viewport rect, the sidebar's top, the cursor
+#: ray) only needs where the 3D view starts, so NAVBAR_HEIGHT stays their
+#: combined height rather than forcing every one of those call sites to add
+#: the two together itself.
+NAVBAR_MENU_HEIGHT = 46
+NAVBAR_TOOLBAR_HEIGHT = 40
+NAVBAR_HEIGHT = NAVBAR_MENU_HEIGHT + NAVBAR_TOOLBAR_HEIGHT
 #: How far either side of the sidebar's edge counts as grabbing it, in unscaled
 #: pixels. Narrow and even: reaching further into the view means the cursor
 #: turns into a resize arrow while it is plainly over the model, which reads as
@@ -382,39 +393,96 @@ def _draw_decal_menu(app: "MeshMapApp") -> None:
 
 
 def _draw_navbar(app: "MeshMapApp") -> None:
-    """The bar across the top: what to look at, and how it is drawn.
+    """The two rows across the top: the menu bar, and the viewport toolbar.
 
-    View state, not parameters -- which is why it lives out here across the top
-    rather than inside the sidebar's tabs, where changing what you are looking
-    at would mean leaving the thing you are tuning.
+    Separate windows rather than one tall one, the same way the status bar
+    and the sidebar are their own windows -- each is its own fixed strip of
+    chrome, stacked rather than sharing layout state.
     """
-    from render.viewport import PREVIEW_MODES  # local import avoids a cycle
+    _draw_menu_bar(app)
+    _draw_toolbar(app)
 
+
+def _draw_menu_bar(app: "MeshMapApp") -> None:
+    """File and Decal menus, across the very top."""
     scale = app.ui_pixel_scale
     width = app.wnd.buffer_size[0]
-    height = NAVBAR_HEIGHT * scale
+    height = NAVBAR_MENU_HEIGHT * scale
 
     imgui.set_next_window_pos(imgui.ImVec2(0, 0))
     imgui.set_next_window_size(imgui.ImVec2(width, height))
-    imgui.begin("##navbar", None, _CHROME_FLAGS | imgui.WindowFlags_.no_decoration)
+    # No border: the menu bar and the toolbar sit flush against each other,
+    # and ImGui's default 1px window border would otherwise draw a visible
+    # seam along that shared edge.
+    imgui.push_style_var(imgui.StyleVar_.window_border_size, 0.0)
+    imgui.begin("##menu_bar", None, _CHROME_FLAGS | imgui.WindowFlags_.no_decoration)
 
     _draw_file_menu(app)
     imgui.same_line()
-
     _draw_decal_menu(app)
-    imgui.same_line()
 
-    imgui.set_next_item_width(220 * scale)
-    _, app.preview_index = imgui.combo(
-        "##preview", app.preview_index, [mode.label for mode in PREVIEW_MODES]
+    imgui.end()
+    imgui.pop_style_var()
+
+
+def _toolbar_checkbox_width(label: str) -> float:
+    """How much horizontal room one ``_toolbar_checkbox`` actually takes,
+    for right-aligning a row of them before any of them are drawn."""
+    return (
+        imgui.calc_text_size(label).x
+        + 4.0
+        + imgui.get_frame_height()
     )
+
+
+#: What the Object/Edit dropdown offers, in display order.
+_DECAL_TRANSFORM_SPACES = ("Object", "Edit")
+
+
+def _draw_toolbar(app: "MeshMapApp") -> None:
+    """Object/Edit on the left, Lighting/Wireframe/Gizmo right-aligned.
+
+    View state, not parameters -- which is why it lives out here rather than
+    inside the sidebar's tabs, where changing what you are looking at would
+    mean leaving the thing you are tuning.
+    """
+    scale = app.ui_pixel_scale
+    width = app.wnd.buffer_size[0]
+    top = NAVBAR_MENU_HEIGHT * scale
+    height = NAVBAR_TOOLBAR_HEIGHT * scale
+    margin = 12.0 * scale
+
+    imgui.set_next_window_pos(imgui.ImVec2(0, top))
+    imgui.set_next_window_size(imgui.ImVec2(width, height))
+    imgui.push_style_var(imgui.StyleVar_.window_border_size, 0.0)
+    imgui.begin("##toolbar", None, _CHROME_FLAGS | imgui.WindowFlags_.no_decoration)
+
+    imgui.set_cursor_pos_x(margin)
+    imgui.set_next_item_width(130.0 * scale)
+    space_index = 0 if app.decal_transform_space == "object" else 1
+    changed, space_index = imgui.combo(
+        "##decal_transform_space", space_index, list(_DECAL_TRANSFORM_SPACES)
+    )
+    if changed:
+        app.set_decal_transform_space(_DECAL_TRANSFORM_SPACES[space_index].lower())
     _tooltip(
-        "Shaded is the mask tree, lit: the mask itself in black and white until\n"
-        "you put colours -- or another mask -- under it in the Material tab.\n"
-        "Normals is the decal normal map. Keys 1 and 2 switch between them."
+        "Object: Scale and Rotate move a decal's whole modifier stack as one\n"
+        "rigid unit -- an Array's copies grow and spread apart together.\n"
+        "Edit: they act on this one decal alone -- every copy grows or spins\n"
+        "in place without moving. Move is identical either way.\n"
+        "Tab toggles between them."
     )
 
-    imgui.same_line()
+    orthographic = bool(app.camera.orthographic)
+    spacing = imgui.get_style().item_spacing.x
+    labels = ("Lighting", "Wireframe", "Gizmo")
+    controls_width = sum(_toolbar_checkbox_width(label) for label in labels)
+    controls_width += spacing * (len(labels) - 1)
+    if orthographic:
+        controls_width += spacing + imgui.calc_text_size("orthographic").x
+
+    imgui.same_line(max(margin, width - controls_width - margin))
+
     _, app.lighting = _toolbar_checkbox("Lighting", app.lighting)
     imgui.same_line()
     _, app.wireframe = _toolbar_checkbox("Wireframe", app.wireframe)
@@ -424,11 +492,12 @@ def _draw_navbar(app: "MeshMapApp") -> None:
         "The axis balls in the top-right corner. Click one to look straight down\n"
         "that axis in orthographic projection; orbiting returns to perspective."
     )
-    if app.camera.orthographic:
+    if orthographic:
         imgui.same_line()
         imgui.text_colored(MUTED_COLOR, "orthographic")
 
     imgui.end()
+    imgui.pop_style_var()
 
 
 # --------------------------------------------------------------------------
@@ -479,7 +548,18 @@ def _draw_sidebar_icon(kind: int, selected: bool, size: float) -> bool:
         draw.add_line(bottom, left, color, thickness)
         draw.add_line(left, top, color, thickness)
         draw.add_circle_filled(imgui.ImVec2(cx, cy), radius * 0.18, color, 10)
-    elif kind == 3:  # Mesh: a small wireframe cube.
+    elif kind == 3:  # Modifiers: repeated copies, staggered like an array.
+        step = radius * 0.5
+        box = radius * 0.62
+        for offset in (-1, 0, 1):
+            box_cx = cx + offset * step
+            box_cy = cy - offset * step * 0.6
+            draw.add_rect(
+                imgui.ImVec2(box_cx - box * 0.5, box_cy - box * 0.5),
+                imgui.ImVec2(box_cx + box * 0.5, box_cy + box * 0.5),
+                color, 2.0, thickness=thickness,
+            )
+    elif kind == 4:  # Mesh: a small wireframe cube.
         inset = radius * 0.34
         front_min = imgui.ImVec2(cx - radius, cy - radius * 0.58)
         front_max = imgui.ImVec2(cx + radius * 0.48, cy + radius)
@@ -494,7 +574,7 @@ def _draw_sidebar_icon(kind: int, selected: bool, size: float) -> bool:
             (front_max, back_max),
         ):
             draw.add_line(first, second, color, thickness)
-    elif kind == 4:  # Library: a shelf of four assets.
+    elif kind == 5:  # Library: a shelf of four assets.
         cell = radius * 0.72
         gap = radius * 0.20
         for row in (-1, 1):
@@ -506,7 +586,7 @@ def _draw_sidebar_icon(kind: int, selected: bool, size: float) -> bool:
                     imgui.ImVec2(cell_cx + cell * 0.5, cell_cy + cell * 0.5),
                     color, 1.5, thickness=thickness,
                 )
-    elif kind == 5:  # Console: a small command prompt.
+    elif kind == 6:  # Console: a small command prompt.
         draw.add_rect(
             imgui.ImVec2(cx - radius, cy - radius * 0.78),
             imgui.ImVec2(cx + radius, cy + radius * 0.78),
@@ -559,11 +639,15 @@ def _draw_parameters(app: "MeshMapApp") -> None:
     )
     imgui.begin("Parameters", None, _CHROME_FLAGS | imgui.WindowFlags_.no_title_bar)
 
-    labels = ("Bake", "Material", "Decal", "Mesh", "Library", "Console", "Settings")
+    labels = (
+        "Bake", "Material", "Decal", "Modifiers", "Mesh", "Library", "Console",
+        "Settings",
+    )
     drawers = (
         _draw_bake_tab,
         _draw_texture_tab,
         _draw_decal_tab,
+        _draw_decal_modifiers_tab,
         _draw_mesh_tab,
         _draw_decal_library_tab,
         _draw_console_tab,
@@ -644,7 +728,7 @@ def _draw_scene_explorer(app: "MeshMapApp") -> None:
     )
     if imgui.is_item_clicked() and not imgui.is_item_toggled_open():
         app.select_scene_mesh(0)
-        app.sidebar_view = 3
+        app.sidebar_view = 4  # Mesh
         if imgui.is_mouse_double_clicked(0):
             app.begin_mesh_rename()
 
@@ -1655,6 +1739,194 @@ def _draw_decal_tab(app: "MeshMapApp") -> None:
     _end_panel()
 
 
+def _draw_decal_modifiers_tab(app: "MeshMapApp") -> None:
+    """Array modifiers for whichever decal is selected, in their own pane.
+
+    Split out of the Decal tab: a stack of modifiers can run long, and mixing
+    it in with the decal's own transform and appearance controls meant
+    scrolling past one to reach the other. Reads ``app.selected_decal`` the
+    same way the Decal tab does, so picking a different decal here shows that
+    decal's own stack without any extra wiring.
+    """
+    decal = app.selected_decal
+    if decal is None:
+        _muted_wrapped(
+            "Select a decal in the Explorer or viewport to see its modifiers."
+        )
+        return
+
+    _begin_panel("decal_modifiers_inspector", imgui.ImVec2(0, 0))
+    imgui.text_colored(MUTED_COLOR, decal.display_name())
+    _draw_decal_modifiers(app, decal)
+    _end_panel()
+
+
+def _draw_decal_array_modifier(app: "MeshMapApp", modifier_index: int, modifier) -> bool:
+    """Line or Radial repetition controls for one Array modifier. Returns dirty."""
+    dirty = False
+    distance_limit = max(
+        float(app.mesh_info.scale) * 2.0 if app.mesh_info is not None else 2.0,
+        0.1,
+    )
+    modifier_defaults = DecalArrayModifier()
+    distance_speed = max(distance_limit / 500.0, 0.001)
+
+    modes = ("Line", "Radial")
+    mode_index = 1 if modifier.mode == "radial" else 0
+    changed, mode_index = _labeled_combo("Mode", mode_index, list(modes))
+    if changed:
+        modifier.mode = "radial" if mode_index == 1 else "axes"
+        dirty = True
+
+    changed, copies = _decal_number(
+        app, "Copies", float(modifier.count), 1.0, 100.0, 1.0,
+        float(modifier_defaults.count), "%.0f",
+        state_key=f"modifier:{modifier_index}:count",
+    )
+    if changed:
+        modifier.count = int(round(copies))
+        dirty = True
+    _tooltip("Generated copies; the selected decal is the first element.")
+
+    if modifier.mode == "axes":
+        for axis_name, attribute in (
+            ("X distance", "offset_x"),
+            ("Y distance", "offset_y"),
+            ("Z distance", "offset_z"),
+        ):
+            changed, value = _decal_number(
+                app, axis_name, float(getattr(modifier, attribute)),
+                -distance_limit, distance_limit, distance_speed,
+                float(getattr(modifier_defaults, attribute)), "%.3f",
+                state_key=f"modifier:{modifier_index}:{attribute}",
+            )
+            if changed:
+                setattr(modifier, attribute, float(value))
+                dirty = True
+        _tooltip(
+            "Signed world-space offset per copy along each local decal axis. "
+            "Negative values travel in the negative direction."
+        )
+        if not (modifier.offset_x or modifier.offset_y or modifier.offset_z):
+            imgui.text_colored(WARN_COLOR, "Set at least one non-zero distance.")
+    else:
+        radial_axes = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
+        radial_values = ("x", "-x", "y", "-y", "z", "-z")
+        radial_index = (
+            radial_values.index(modifier.radial_axis)
+            if modifier.radial_axis in radial_values else 4
+        )
+        changed, radial_index = _labeled_combo(
+            "Rotation axis", radial_index, list(radial_axes)
+        )
+        if changed:
+            modifier.radial_axis = radial_values[radial_index]
+            dirty = True
+        changed, modifier.radius = _decal_number(
+            app, "Radius", modifier.radius, 0.001, distance_limit,
+            distance_speed, modifier_defaults.radius, "%.3f",
+            state_key=f"modifier:{modifier_index}:radius",
+        )
+        dirty |= changed
+        _tooltip(
+            "Distance from the circle's center to every decal. The selected "
+            "decal's transform marks the center; its rendered original and "
+            "all copies are spaced evenly around the complete circle."
+        )
+    return dirty
+
+
+def _draw_decal_mirror_modifier(modifier) -> bool:
+    """A single world-axis reflection. Returns whether it changed."""
+    axis_labels = ("X", "Y", "Z")
+    axis_values = ("x", "y", "z")
+    axis_index = (
+        axis_values.index(modifier.axis) if modifier.axis in axis_values else 0
+    )
+    changed, axis_index = _labeled_combo("Mirror axis", axis_index, list(axis_labels))
+    if changed:
+        modifier.axis = axis_values[axis_index]
+    _tooltip(
+        "Reflects the decal across this world axis, through the mesh's own\n"
+        "center -- the same plane regardless of which way the source decal\n"
+        "happens to be facing."
+    )
+    return changed
+
+
+#: What "New" offers, and what it adds when chosen -- kept in one place so the
+#: popup menu and the factory it drives cannot drift apart.
+_NEW_DECAL_MODIFIERS = (
+    ("Array", "Repeated copies in a line or a circle.", DecalArrayModifier),
+    (
+        "Mirror", "One reflected copy across a world axis, through the mesh's center.",
+        DecalMirrorModifier,
+    ),
+)
+
+
+def _draw_new_decal_modifier_button(decal) -> bool:
+    """The "New" button and its type menu. Returns whether one was added."""
+    added = False
+    if imgui.button("New"):
+        imgui.open_popup("##new_decal_modifier")
+    corner = imgui.get_item_rect_min()
+    bottom = imgui.get_item_rect_max().y
+    imgui.set_next_window_pos(imgui.ImVec2(corner.x, bottom))
+
+    if imgui.begin_popup("##new_decal_modifier"):
+        for label, tooltip, factory in _NEW_DECAL_MODIFIERS:
+            if imgui.menu_item_simple(label):
+                decal.modifiers.append(factory())
+                added = True
+            _tooltip(tooltip)
+        imgui.end_popup()
+    return added
+
+
+def _draw_decal_modifiers(app: "MeshMapApp", decal) -> None:
+    """Non-destructive Array and Mirror modifiers stacked on one decal."""
+    scale = app.ui_pixel_scale
+    imgui.push_item_width(-170 * scale)
+    projector_input = (
+        decal.center_u, decal.center_v,
+        decal.scale, decal.scale_x, decal.scale_y, decal.rotation,
+    )
+
+    imgui.begin_disabled(not decal.enabled)
+    # Always the first thing in the pane, not appended after the stack, so it
+    # never wanders off as the list of modifiers grows and the pane scrolls.
+    dirty = _draw_new_decal_modifier_button(decal)
+    if not decal.modifiers:
+        _muted_wrapped("No modifiers on this decal yet.")
+
+    remove_modifier = None
+    for modifier_index, modifier in enumerate(decal.modifiers):
+        imgui.push_id(f"decal_modifier_{modifier_index}")
+        is_mirror = isinstance(modifier, DecalMirrorModifier)
+        _section_heading(f"{'Mirror' if is_mirror else 'Array'} {modifier_index + 1}")
+        if imgui.small_button("Remove"):
+            remove_modifier = modifier_index
+
+        if is_mirror:
+            dirty |= _draw_decal_mirror_modifier(modifier)
+        else:
+            dirty |= _draw_decal_array_modifier(app, modifier_index, modifier)
+        imgui.pop_id()
+
+    if remove_modifier is not None:
+        del decal.modifiers[remove_modifier]
+        dirty = True
+
+    imgui.end_disabled()
+
+    if dirty:
+        app.sync_decal_inspector_projector(decal, projector_input)
+        app.mark_normal_dirty()
+
+    imgui.pop_item_width()
+
+
 def _draw_mesh_tab(app: "MeshMapApp") -> None:
     """Details for the mesh selected in the persistent Explorer or viewport."""
     _begin_panel("mesh_inspector", imgui.ImVec2(0, 0))
@@ -2049,7 +2321,7 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
     _section_heading("Depth")
     decal_defaults = type(decal)()
     changed, decal.intensity = _decal_number(
-        app, "Height intensity", decal.intensity, 0.0, 4.0, 0.02,
+        app, "Height intensity", decal.intensity, 0.0, 10.0, 0.05,
         decal_defaults.intensity, "%.2f", state_key="appearance:intensity",
     )
     dirty |= changed
@@ -2084,93 +2356,6 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
         "Raise this until the join disappears; 0 turns it off for an image that\n"
         "needs no help."
     )
-
-    _section_heading("Modifiers")
-    remove_modifier = None
-    distance_limit = max(
-        float(app.mesh_info.scale) * 2.0 if app.mesh_info is not None else 2.0,
-        0.1,
-    )
-    modifier_defaults = DecalArrayModifier()
-    distance_speed = max(distance_limit / 500.0, 0.001)
-    for modifier_index, modifier in enumerate(decal.modifiers):
-        imgui.push_id(f"array_modifier_{modifier_index}")
-        _section_heading(f"Array {modifier_index + 1}")
-        if imgui.small_button("Remove"):
-            remove_modifier = modifier_index
-
-        modes = ("Line", "Radial")
-        mode_index = 1 if modifier.mode == "radial" else 0
-        changed, mode_index = _labeled_combo("Mode", mode_index, list(modes))
-        if changed:
-            modifier.mode = "radial" if mode_index == 1 else "axes"
-            dirty = True
-
-        changed, copies = _decal_number(
-            app, "Copies", float(modifier.count), 1.0, 100.0, 1.0,
-            float(modifier_defaults.count), "%.0f",
-            state_key=f"modifier:{modifier_index}:count",
-        )
-        if changed:
-            modifier.count = int(round(copies))
-            dirty = True
-        _tooltip("Generated copies; the selected decal is the first element.")
-
-        if modifier.mode == "axes":
-            for axis_name, attribute in (
-                ("X distance", "offset_x"),
-                ("Y distance", "offset_y"),
-                ("Z distance", "offset_z"),
-            ):
-                changed, value = _decal_number(
-                    app, axis_name, float(getattr(modifier, attribute)),
-                    -distance_limit, distance_limit, distance_speed,
-                    float(getattr(modifier_defaults, attribute)), "%.3f",
-                    state_key=f"modifier:{modifier_index}:{attribute}",
-                )
-                if changed:
-                    setattr(modifier, attribute, float(value))
-                    dirty = True
-            _tooltip(
-                "Signed world-space offset per copy along each local decal axis. "
-                "Negative values travel in the negative direction."
-            )
-            if not (modifier.offset_x or modifier.offset_y or modifier.offset_z):
-                imgui.text_colored(WARN_COLOR, "Set at least one non-zero distance.")
-        else:
-            radial_axes = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
-            radial_values = ("x", "-x", "y", "-y", "z", "-z")
-            radial_index = (
-                radial_values.index(modifier.radial_axis)
-                if modifier.radial_axis in radial_values else 4
-            )
-            changed, radial_index = _labeled_combo(
-                "Rotation axis", radial_index, list(radial_axes)
-            )
-            if changed:
-                modifier.radial_axis = radial_values[radial_index]
-                dirty = True
-            changed, modifier.radius = _decal_number(
-                app, "Radius", modifier.radius, 0.001, distance_limit,
-                distance_speed, modifier_defaults.radius, "%.3f",
-                state_key=f"modifier:{modifier_index}:radius",
-            )
-            dirty |= changed
-            _tooltip(
-                "Distance from the circle's center to every decal. The selected "
-                "decal's transform marks the center; its rendered original and "
-                "all copies are spaced evenly around the complete circle."
-            )
-        imgui.pop_id()
-
-    if remove_modifier is not None:
-        del decal.modifiers[remove_modifier]
-        dirty = True
-
-    if imgui.button("Add modifier"):
-        decal.modifiers.append(DecalArrayModifier())
-        dirty = True
-    _tooltip("Add another non-destructive Array modifier to this decal's stack.")
 
     imgui.end_disabled()
 

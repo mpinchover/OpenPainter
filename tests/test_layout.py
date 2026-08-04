@@ -733,10 +733,11 @@ def test_the_starter_cube_bakes_into_its_own_uvs(starter_app):
     assert starter_app.controller.curvature_map is not None
 
 
-def test_the_shaded_and_normals_modes_are_the_whole_list():
+def test_shaded_is_the_whole_list():
+    """The viewport-mode dropdown was removed; Shaded is the only view now."""
     from render.viewport import PREVIEW_MODES
 
-    assert [mode.label for mode in PREVIEW_MODES] == ["Shaded", "Normals"]
+    assert [mode.label for mode in PREVIEW_MODES] == ["Shaded"]
 
 
 def test_color_input_tooltip_waits_for_a_quiet_second(monkeypatch):

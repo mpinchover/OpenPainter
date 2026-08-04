@@ -222,6 +222,27 @@ class DecalArrayModifier:
 
 
 @dataclass
+class DecalMirrorModifier:
+    """Reflects a decal across a world axis, through the mesh's own center.
+
+    Unlike an Array modifier's Line/Radial axes, which are the decal's own
+    local right/up/forward, this axis is a world one -- "mirror across the
+    mesh's X" means the same plane regardless of how the source decal happens
+    to be oriented, which is what placing its reflection on the model's other
+    side actually calls for.
+    """
+
+    axis: str = "x"
+
+    def key(self) -> tuple:
+        return (str(self.axis),)
+
+
+#: Either kind of non-destructive operation a decal's modifier stack can hold.
+DecalModifier = DecalArrayModifier | DecalMirrorModifier
+
+
+@dataclass
 class DecalParams:
     """A normal-map decal stamped into the mesh's UV layout.
 
@@ -258,6 +279,21 @@ class DecalParams:
     """Fraction of the atlas width the decal spans. Its height follows from the
     image's own aspect ratio, so a wide vent stays wide."""
 
+    edit_scale_reference: float = 0.25
+    """The ``scale`` at which this decal's Array/Radial offsets and radius are
+    exactly as authored (ratio 1). ``decal_instances`` scales them by
+    ``scale / edit_scale_reference``, so leaving this untouched is what makes
+    an Object-space scale edit -- the only kind meant to spread a modifier's
+    copies apart as the decal grows -- take effect: it lets ``scale`` diverge
+    from this reference. An Edit-space scale edit instead moves this
+    reference to match the new ``scale``, holding the ratio at 1 so editing
+    this one decal's own footprint never touches the array. Defaults equal to
+    ``scale``'s own default so a fresh decal starts at ratio 1, matching a
+    modifier's plain offsets before any of this existed. Deliberately not
+    read from the app's *current* Object/Edit toggle -- only from history --
+    so switching the toggle alone, with no scale edit in between, changes
+    nothing about where the copies actually are."""
+
     scale_x: float = 1.0
     """Additional width multiplier used by axis-constrained scaling."""
 
@@ -279,6 +315,19 @@ class DecalParams:
 
     rotation: float = 0.0
     """Degrees, counter-clockwise in UV space."""
+
+    edit_spin: float = 0.0
+    """Degrees of ``rotation`` applied while in Edit transform space, tracked
+    separately so it can be subtracted back out. A modifier's array/ring
+    placement is computed from this decal's own right/up/forward; in Object
+    space that basis is used as-is, so rotating pivots the whole array. In
+    Edit space, ``decal_instances`` first "un-spins" the placement basis by
+    this amount before computing offsets, then re-applies it to each
+    instance's own orientation -- the array's layout stays put and every copy
+    turns in place instead. Object-space rotation never touches this field,
+    which is what lets the two modes be switched between freely: undo exactly
+    the rotation that happened while editing individually, regardless of how
+    much rotation happened as a whole object in between."""
 
     falloff: float = 0.06
     """How much of the decal's edge is dropped, as a fraction of its half-width.
@@ -313,7 +362,7 @@ class DecalParams:
     texture_index: int = -1
     """Optional index of a Texture-tab material used to colour this decal."""
 
-    modifiers: list[DecalArrayModifier] = field(default_factory=list)
+    modifiers: list[DecalModifier] = field(default_factory=list)
     """Ordered generators evaluated without creating scene-tree decals."""
 
     def loaded(self) -> bool:
@@ -333,11 +382,13 @@ class DecalParams:
             round(self.center_v, 6),
             self.surface_face,
             round(self.scale, 6),
+            round(self.edit_scale_reference, 6),
             round(self.scale_x, 6),
             round(self.scale_y, 6),
             round(self.image_aspect, 6),
             round(self.surface_aspect, 6),
             round(self.rotation, 4),
+            round(self.edit_spin, 4),
             round(self.falloff, 6),
             round(self.intensity, 6),
             self.flip_green,
