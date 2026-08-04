@@ -142,6 +142,115 @@ def test_add_text_creates_selected_placeable_white_decal(app):
     assert decal.path in app.decal_textures
 
 
+def test_editing_text_frees_the_string_it_replaced(app):
+    """Retyping a text decal must not leak a texture per string ever typed."""
+    index = app.add_text_decal()
+    decal = app.decals[index]
+    first_path = decal.path
+
+    assert app.update_text_decal(decal, "Second")
+    assert first_path not in app.decal_images, "nothing else points at the old text"
+    assert first_path not in app.decal_textures
+
+
+def test_editing_text_keeps_a_string_still_used_elsewhere(app):
+    """Two decals sharing text share a texture; dropping one must not take it
+    out from under the other."""
+    import copy
+
+    index = app.add_text_decal()
+    original = app.decals[index]
+    shared_path = original.path
+    app.decals.append(copy.deepcopy(original))
+
+    assert app.update_text_decal(original, "Different now")
+    assert shared_path in app.decal_images, "the duplicate still needs it"
+    assert shared_path in app.decal_textures
+
+
+# --------------------------------------------------------------------------
+# a mask material assigned to a decal, read as a wear/tear opacity stencil
+# --------------------------------------------------------------------------
+
+def test_a_mask_material_on_a_decal_gets_an_atlas_cell(app):
+    from core.layers import convert_slot
+
+    index = app.add_text_decal()
+    decal = app.decals[index]
+    app.textures[decal.texture_index] = convert_slot(
+        app.textures[decal.texture_index], "noise"
+    )
+
+    app.on_render(0.0, 1 / 60.0)
+
+    assert decal.texture_index in app.decal_mask_compositors
+    assert app.decal_mask_cell(decal) >= 0.0
+
+
+def test_a_flat_colour_material_on_a_decal_gets_no_mask_cell(app):
+    """The common case -- a plain tint -- must cost nothing extra."""
+    index = app.add_text_decal()
+    decal = app.decals[index]
+
+    app.on_render(0.0, 1 / 60.0)
+
+    assert decal.texture_index not in app.decal_mask_compositors
+    assert app.decal_mask_cell(decal) == -1.0
+
+
+def test_editing_a_decal_mask_material_rebakes_its_cell(app):
+    from core.layers import convert_slot
+
+    index = app.add_text_decal()
+    decal = app.decals[index]
+    app.textures[decal.texture_index] = convert_slot(
+        app.textures[decal.texture_index], "noise"
+    )
+    app.on_render(0.0, 1 / 60.0)
+    key_before = app._decal_mask_keys[decal.texture_index]
+
+    app.textures[decal.texture_index].threshold = 0.8
+    app.on_render(0.0, 1 / 60.0)
+
+    assert app._decal_mask_keys[decal.texture_index] != key_before
+
+
+def test_removing_the_last_decal_using_a_mask_frees_its_compositor(app):
+    from core.layers import convert_slot
+
+    index = app.add_text_decal()
+    decal = app.decals[index]
+    app.textures[decal.texture_index] = convert_slot(
+        app.textures[decal.texture_index], "noise"
+    )
+    app.on_render(0.0, 1 / 60.0)
+    assert decal.texture_index in app.decal_mask_compositors
+
+    app.remove_decal(index)
+    app.on_render(0.0, 1 / 60.0)
+
+    assert decal.texture_index not in app.decal_mask_compositors
+
+
+def test_two_decals_sharing_a_mask_material_share_one_atlas_cell(app):
+    """One noisy material used by several decals bakes once, not once each."""
+    import copy
+    from core.layers import convert_slot
+
+    index = app.add_text_decal()
+    first = app.decals[index]
+    app.textures[first.texture_index] = convert_slot(
+        app.textures[first.texture_index], "noise"
+    )
+    second = copy.deepcopy(first)
+    app.decals.append(second)
+
+    app.on_render(0.0, 1 / 60.0)
+
+    assert len(app.decal_mask_compositors) == 1
+    assert app.decal_mask_cell(first) == app.decal_mask_cell(second)
+
+
 def test_library_thumbnails_are_small_and_persisted(tmp_path):
     source = write_decal(tmp_path / "large.png", size=(600, 300))
     cache = tmp_path / "cache"

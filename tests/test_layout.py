@@ -53,8 +53,8 @@ def test_the_view_starts_where_the_chrome_ends(app):
     )
 
 
-def test_material_view_reserves_a_right_inspector(app):
-    """The inspector is docked beside the viewport rather than laid over it."""
+def test_material_view_floats_the_right_inspector_over_the_viewport(app):
+    """Opening it must not resize or re-centre the 3D view underneath it."""
     window_width = app.wnd.buffer_size[0]
     app.set_right_inspector_collapsed(False)
     app.sidebar_view = 1
@@ -62,7 +62,7 @@ def test_material_view_reserves_a_right_inspector(app):
     x, _, view_width, _ = app.viewport_rect
     inspector_width = app.right_inspector_pixels
     assert inspector_width > 0
-    assert x + view_width + inspector_width == window_width
+    assert x + view_width == window_width, "viewport still runs to the right edge"
 
     app.sidebar_view = 0
     assert app.right_inspector_pixels == 0
@@ -87,13 +87,15 @@ def test_decal_inspector_never_reserves_a_right_sidebar(app):
     assert app.right_inspector_pixels == 0
 
 
-def test_right_inspector_can_collapse_without_reserving_viewport_space(app):
+def test_collapsing_the_right_inspector_does_not_move_the_viewport(app):
     app.sidebar_view = 1
     app.set_right_inspector_collapsed(False)
     assert app.right_inspector_pixels > 0
+    expanded_rect = app.viewport_rect
 
     app.set_right_inspector_collapsed(True)
     assert app.right_inspector_pixels == 0
+    assert app.viewport_rect == expanded_rect
     assert app.viewport_rect[0] + app.viewport_rect[2] == app.wnd.buffer_size[0]
 
 

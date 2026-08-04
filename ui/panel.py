@@ -12,6 +12,7 @@ is the EdgeWear001 node group.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -78,6 +79,10 @@ SECTION_HEADER_BG = imgui.ImVec4(0.135, 0.150, 0.175, 1.0)
 _input_tooltip_item: int | None = None
 _input_tooltip_since = 0.0
 _INPUT_TOOLTIP_DELAY = 1.0
+#: How long a text decal waits after the last keystroke before regenerating.
+#: Long enough that a fast typist does not mint a GPU texture per letter,
+#: short enough to read as live rather than as a field you have to confirm.
+_TEXT_DECAL_LIVE_DELAY = 0.35
 _filled_slider_edit_item: int | None = None
 _filled_slider_edit_opened = False
 _generator_scrub_edit_item: int | None = None
@@ -1980,10 +1985,22 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
             imgui.InputTextFlags_.enter_returns_true
             | imgui.InputTextFlags_.auto_select_all,
         )
-        app.decal_text_edit_value = draft[:128]
-        if submitted or imgui.is_item_deactivated_after_edit():
+        draft = draft[:128]
+        if draft != app.decal_text_edit_value:
+            app.decal_text_edit_value = draft
+            app.decal_text_edit_changed_at = time.monotonic()
+        pending = (
+            app.decal_text_edit_changed_at is not None
+            and app.decal_text_edit_value != decal.text
+        )
+        settled = (
+            pending
+            and time.monotonic() - app.decal_text_edit_changed_at >= _TEXT_DECAL_LIVE_DELAY
+        )
+        if submitted or imgui.is_item_deactivated_after_edit() or settled:
             app.update_text_decal(decal, app.decal_text_edit_value)
-        _tooltip("Edit the text, then press Enter or click away to regenerate it.")
+            app.decal_text_edit_changed_at = None
+        _tooltip("Edit the text -- it updates on the model as you type.")
 
     dirty |= _draw_decal_transform(app, decal)
 

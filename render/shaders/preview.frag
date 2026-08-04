@@ -35,6 +35,15 @@ uniform float u_viewProjectorIntensities[MAX_VIEW_PROJECTORS];
 uniform float u_viewProjectorFlipGreens[MAX_VIEW_PROJECTORS];
 uniform float u_viewProjectorFalloffs[MAX_VIEW_PROJECTORS];
 uniform float u_viewProjectorUseColors[MAX_VIEW_PROJECTORS];
+
+// A decal's assigned mask material (Noise, Grunge, ...) bakes into one cell
+// of this shared atlas rather than its own sampler -- see
+// MeshMapApp._sync_decal_masks. A cell below 0 means "no mask", i.e. the
+// decal's tint (if any) is a flat colour exactly as it always was.
+const float DECAL_MASK_ATLAS_CELLS = 16.0;
+uniform sampler2D u_decalMaskAtlas;
+uniform float u_liveProjectorMaskCell;
+uniform float u_viewProjectorMaskCells[MAX_VIEW_PROJECTORS];
 uniform vec3 u_viewProjectorColors[MAX_VIEW_PROJECTORS];
 
 // 0 = sample u_map as greyscale
@@ -60,6 +69,18 @@ float projector_fade(vec2 uv, float falloff) {
     if (falloff <= 0.0) return 1.0;
     float edge = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
     return 1.0 - smoothstep(1.0 - 2.0 * falloff, 1.0 - falloff, edge);
+}
+
+// How much of a decal's tint survives at this point: 1 with no mask assigned,
+// otherwise the sampled mask's luminance -- white reads as paint intact,
+// black as worn through to bare mesh. Only the tint is touched; the decal's
+// own bump stays at full strength, which reads as worn paint over an intact
+// groove rather than the whole mark vanishing.
+float decal_mask_coverage(vec2 decal_uv, float cell) {
+    if (cell < 0.0) return 1.0;
+    vec2 atlas_uv = vec2((decal_uv.x + cell) / DECAL_MASK_ATLAS_CELLS, decal_uv.y);
+    vec3 mask_sample = texture(u_decalMaskAtlas, atlas_uv).rgb;
+    return dot(mask_sample, vec3(0.299, 0.587, 0.114));
 }
 
 // Per-pixel tangent frame, from the derivatives of position and UV across the
@@ -119,7 +140,8 @@ vec3 apply_live_decal(vec3 normal, inout vec3 base_color) {
     vec3 projected = normalize(normal + tangent * slope.x + bitangent * slope.y);
     float weight = decal.a * projector_fade(decal_uv, u_projectorFalloff);
     if (u_liveProjectorUseColor > 0.5) {
-        base_color = mix(base_color, u_liveProjectorColor, weight);
+        float color_weight = weight * decal_mask_coverage(decal_uv, u_liveProjectorMaskCell);
+        base_color = mix(base_color, u_liveProjectorColor, color_weight);
     }
     return normalize(mix(normal, projected, weight));
 }
@@ -151,7 +173,10 @@ vec3 apply_view_projector(vec3 normal, int index, inout vec3 base_color) {
         decal_uv, u_viewProjectorFalloffs[index]
     );
     if (u_viewProjectorUseColors[index] > 0.5) {
-        base_color = mix(base_color, u_viewProjectorColors[index], weight);
+        float color_weight = weight * decal_mask_coverage(
+            decal_uv, u_viewProjectorMaskCells[index]
+        );
+        base_color = mix(base_color, u_viewProjectorColors[index], color_weight);
     }
     return normalize(mix(normal, projected, weight));
 }

@@ -918,6 +918,32 @@ def test_placing_moves_the_decal_to_the_cursor_and_drops_it(placeable):
         pytest.approx(expected), "and leaves it where it was dropped"
 
 
+def test_placing_a_decal_sets_a_projector_that_a_later_resize_leaves_alone(placeable):
+    """A plain click-to-drop must already carry the same camera-tangent
+    projector a G/S/R transform would give it. Left unset, the decal renders
+    off the mesh's raw UV axes until the first resize silently reorients it --
+    which is why a rotated placement looked "fixed" by scaling."""
+    placeable.begin_decal_placement()
+    x, y = viewport_point(placeable, 0.5, 0.5)
+    placeable.on_mouse_position_event(x, y, 0, 0)
+    placeable.on_mouse_press_event(x, y, placeable.wnd.mouse.left)
+
+    params = placeable.selected_decal
+    assert params.projector_center is not None, "dropped without a live projector"
+    right_before, up_before, forward_before = (
+        params.projector_right, params.projector_up, params.projector_forward
+    )
+    assert np.dot(right_before, up_before) == pytest.approx(0.0, abs=1e-5)
+    assert np.dot(right_before, forward_before) == pytest.approx(0.0, abs=1e-5)
+
+    assert placeable.begin_decal_transform("scale")
+    placeable.end_decal_transform(keep=True)
+
+    assert params.projector_right == pytest.approx(right_before)
+    assert params.projector_up == pytest.approx(up_before)
+    assert params.projector_forward == pytest.approx(forward_before)
+
+
 def test_pinch_zoom_is_ready_immediately_after_placing_selected_decal(placeable):
     placeable._pending_zoom = -4.0
     placeable._scroll_arrived = 4.0

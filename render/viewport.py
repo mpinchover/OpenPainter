@@ -119,6 +119,16 @@ PREVIEW_MODES = (
 DECAL_INTERACTIVE_RESOLUTION = 2048
 MAX_VIEW_PROJECTORS = 8
 
+#: Resolution a decal's assigned mask material is baked at for its wear/tear
+#: opacity mask. A decal covers a small fraction of the view, so this stays
+#: far below the mesh's own bake resolution.
+DECAL_MASK_RESOLUTION = 128
+#: How many distinct mask materials can be live as decal masks at once. Their
+#: bakes share one atlas texture rather than one GL sampler unit each -- the
+#: fragment shader's sampler budget has no room to spare (16 units total, 13
+#: already spoken for by everything else preview.frag samples).
+MAX_DECAL_MASK_CELLS = 16
+
 #: Drawn in place of any mode whose map does not exist yet -- an unbaked mesh
 #: under the Shaded view, mostly. Plain grey, so the geometry still reads.
 FLAT_MODE = PreviewMode("Shaded", 3, None)
@@ -775,10 +785,14 @@ class MeshMapApp(mglw.WindowConfig):
         self.decal_transform_edit_opened = False
         self.decal_transform_pressed_field: Optional[str] = None
         self.decal_transform_field_dragged = False
-        #: Draft text is committed when its inspector field loses focus or the
-        #: user presses Enter, avoiding a new GPU texture for every keystroke.
+        #: Draft text regenerates the decal a short pause after the last
+        #: keystroke (or immediately on Enter/losing focus), rather than on
+        #: every keystroke -- each distinct string mints a new GPU texture,
+        #: and typing a whole sentence one letter at a time should not upload
+        #: one per letter.
         self.decal_text_edit_index: int = -1
         self.decal_text_edit_value: str = ""
+        self.decal_text_edit_changed_at: Optional[float] = None
         #: Images and their GL textures, cached by path. Several placements of
         #: one picture share both.
         self.decal_images: dict[str, DecalImage] = {}
@@ -1010,6 +1024,11 @@ class MeshMapApp(mglw.WindowConfig):
         self.preview_program["u_viewProjectorTextures"].value = tuple(
             range(4, 4 + MAX_VIEW_PROJECTORS)
         )
+        # One shared unit rather than one per decal: a fragment shader has 16
+        # sampler units total on the hardware this was checked against, and
+        # 13 are already spoken for above. Every decal mask lives in its own
+        # cell of this one atlas instead -- see ``_sync_decal_masks``.
+        self.preview_program["u_decalMaskAtlas"].value = 13
         self.preview_program["u_emissionScale"].value = MAX_EMISSION
         self.decal_program["u_decal"].value = 0
         self.decal_wrap_program["u_decal"].value = 0
@@ -1031,6 +1050,59 @@ class MeshMapApp(mglw.WindowConfig):
         self.compositor = LayerCompositor(self.ctx)
         self.mesh_compositor = LayerCompositor(self.ctx, make_thumbnails=False)
         self._registered_thumbnails: set = set()
+
+        # A decal whose assigned Texture-tab material is a mask (Noise,
+        # Grunge, ...) reads that mask as an opacity stencil rather than a
+        # flat tint -- worn paint, not a solid colour. Each mask material in
+        # use gets its own small compositor so the pooled targets one holds
+        # are never shared (and so silently overwritten) by another. Baked
+        # over an identity 0..1 square rather than the mesh's own bake: the
+        # wear pattern belongs to the decal, not to wherever it sits.
+        self.decal_mask_compositors: dict[int, LayerCompositor] = {}
+        self._decal_mask_keys: dict[int, tuple] = {}
+        identity_size = 8
+        axis = np.linspace(0.0, 1.0, identity_size, dtype=np.float32)
+        u_grid, v_grid = np.meshgrid(axis, axis)
+        identity_position = np.stack(
+            [u_grid, v_grid, np.zeros_like(u_grid)], axis=-1
+        )
+        self._decal_mask_position = self.ctx.texture(
+            (identity_size, identity_size), 3, data=identity_position.tobytes(),
+            dtype="f4",
+        )
+        self._decal_mask_position.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._decal_mask_position.repeat_x = False
+        self._decal_mask_position.repeat_y = False
+        # Only the edge-wear mask kind reads curvature, and a decal mask has
+        # no bake of its own to read -- a flat value is a harmless no-op for
+        # every other kind.
+        self._decal_mask_curvature = self.ctx.texture(
+            (1, 1), 1, data=np.array([0.5], dtype=np.float32).tobytes(), dtype="f4",
+        )
+        # Every mask's bake lands in its own cell of one strip texture, so the
+        # shader only ever needs the one sampler unit above regardless of how
+        # many decals (or distinct mask materials) are in play at once.
+        self._decal_mask_atlas = self.ctx.texture(
+            (DECAL_MASK_RESOLUTION * MAX_DECAL_MASK_CELLS, DECAL_MASK_RESOLUTION), 3,
+        )
+        self._decal_mask_atlas.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._decal_mask_atlas.repeat_x = False
+        self._decal_mask_atlas.repeat_y = False
+        self._decal_mask_atlas_fbo = self.ctx.framebuffer(
+            color_attachments=[self._decal_mask_atlas]
+        )
+        self._decal_mask_blit_program = self.ctx.program(
+            vertex_shader=load_shader("fullscreen.vert"),
+            fragment_shader=load_shader("blit.frag"),
+        )
+        self._decal_mask_blit_program["u_tex"].value = 0
+        self._decal_mask_blit_program["u_rgb"].value = 1
+        self._decal_mask_blit_vao = self.ctx.vertex_array(
+            self._decal_mask_blit_program, []
+        )
+        #: Which atlas cell (if any) currently holds each material index's
+        #: bake, rebuilt every frame in ``_sync_decal_masks``.
+        self._decal_mask_cells: dict[int, int] = {}
 
         self.bright_vao = self.ctx.vertex_array(self.bright_program, [])
         self.blur_vao = self.ctx.vertex_array(self.blur_program, [])
@@ -1246,9 +1318,9 @@ class MeshMapApp(mglw.WindowConfig):
         """Width of the active right inspector, or zero while collapsed.
 
         On narrow windows it takes at most 45% of the room left after the main
-        sidebar, so opening properties can never squeeze the 3D view completely
-        out of existence. The collapsed restore tab overlays the right edge and
-        therefore reserves no viewport space.
+        sidebar, so it can never cover the 3D view completely. This floats
+        over the viewport rather than shrinking it -- see ``viewport_rect``
+        -- so this width feeds only the inspector window's own placement.
         """
         if self.right_inspector_kind is None or self.right_inspector_collapsed:
             return 0
@@ -1422,6 +1494,7 @@ class MeshMapApp(mglw.WindowConfig):
             self.end_decal_transform(keep=False)
         self.decal_index = -1 if index is None else int(index)
         self.decal_text_edit_index = -1
+        self.decal_text_edit_changed_at = None
         if not (0 <= self.decal_index < len(self.decals)):
             self.decal_index = -1
         else:
@@ -1641,12 +1714,14 @@ class MeshMapApp(mglw.WindowConfig):
         if text == params.text:
             return False
 
+        old_path = params.path
         image = make_text_decal(text)
         self.decal_images.setdefault(image.path, image)
         self._upload_decal(image)
         params.text = text
         params.path = image.path
         params.image_aspect = image.aspect
+        self._release_unused_decal_image(old_path)
 
         base = max(
             (self.mesh_info.scale if self.mesh_info else 1.0) * params.scale,
@@ -2471,6 +2546,11 @@ class MeshMapApp(mglw.WindowConfig):
             self.mark_normal_dirty()
             self.set_status("Placement cancelled")
         elif params is not None:
+            if self._live_decal_projector is not None:
+                # Persist the same camera-tangent frame the drag previewed,
+                # so the drop does not fall back to the mesh's raw UV axes --
+                # which can be rotated a quarter turn from what was on screen.
+                self._commit_live_projector(params, self._live_decal_projector)
             if self._decal_placement_undo is not None:
                 self._record_decal_undo(self._decal_placement_undo)
             self.set_status(
@@ -2479,7 +2559,9 @@ class MeshMapApp(mglw.WindowConfig):
             )
         self._decal_anchor = None
         self._decal_placement_undo = None
+        self._live_decal_projector = None
         self._finish_decal_pointer_interaction(clear_navigation=True)
+        self.mark_normal_dirty()
 
     def follow_cursor_with_decal(self) -> bool:
         """Move the decal to the surface under the cursor. False if it missed.
@@ -2487,16 +2569,27 @@ class MeshMapApp(mglw.WindowConfig):
         A miss leaves the decal where it was rather than snapping it somewhere
         arbitrary -- dragging off the silhouette and back should not lose the
         placement you were lining up.
+
+        Also keeps a camera-tangent live projector in step with the surface
+        hit, the same way a G/S/R transform does: without it the preview and
+        the eventual drop render through the mesh's raw UV axes instead of
+        the orientation being shown on screen.
         """
         hit = self.surface_hit_at(self._mouse)
         if hit is None:
             return False
-        uv, _ = hit
+        uv, face = hit
         params = self.selected_decal
         if params is None:
             return False
         params.center_u, params.center_v = uv
-        params.surface_face = int(hit[1])
+        params.surface_face = int(face)
+        if self._pick_geometry is not None:
+            vertices, faces, uvs = self._pick_geometry
+            point = surface_at_uv(vertices, faces, uvs, uv[0], uv[1])
+            image = self.decal_images.get(params.path)
+            if point is not None and image is not None:
+                self._set_live_decal_projector(image, point, params, int(face))
         self.mark_normal_dirty()
         return True
 
@@ -2652,6 +2745,30 @@ class MeshMapApp(mglw.WindowConfig):
         self._aspect_centres = centres
         self._aspect_token = self._vao_token
 
+    def _release_unused_decal_image(self, path: str) -> None:
+        """Free a generated text decal's cached image and texture once nothing
+        on the mesh points at it any more.
+
+        Editing a text decal's content mints a new content-hashed path rather
+        than mutating the old one in place (see :func:`make_text_decal`), so
+        without this a long editing session would leak one GPU texture per
+        distinct string ever typed. Imported images keep their file path as
+        their identity and are never pruned this way -- only generated text
+        decals use the ``text-decal:`` prefix.
+        """
+        if not path.startswith("text-decal:"):
+            return
+        if any(decal.path == path for decal in self.decals):
+            return
+        self.decal_images.pop(path, None)
+        texture = self.decal_textures.pop(path, None)
+        if texture is not None:
+            try:
+                self.gui.remove_texture(texture)
+            except KeyError:
+                pass
+            texture.release()
+
     def _release_decal_textures(self) -> None:
         for texture in (*self.decal_textures.values(), *self.decal_thumbnail_textures.values()):
             try:
@@ -2709,6 +2826,72 @@ class MeshMapApp(mglw.WindowConfig):
         self.gui.register_texture(texture)
         self.decal_textures[image.path] = texture
 
+    def _sync_decal_masks(self) -> None:
+        """Bake each mask material assigned to a decal into its atlas cell.
+
+        Keyed by material index rather than by decal, so several decals
+        sharing one material share one bake. A ``ColorSlot`` assignment needs
+        none of this and keeps working exactly as it did before -- this only
+        applies to a mask (Noise, Grunge, ...), which reads as an opacity
+        stencil rather than a flat tint. See ``decal_mask_cell``.
+        """
+        active: dict[int, MaskLayer] = {}
+        for params in self.decals:
+            if not params.active():
+                continue
+            if not 0 <= params.texture_index < len(self.textures):
+                continue
+            material = self.textures[params.texture_index]
+            if isinstance(material, MaskLayer):
+                active[params.texture_index] = material
+
+        for texture_index in list(self.decal_mask_compositors):
+            if texture_index not in active:
+                self.decal_mask_compositors.pop(texture_index).release()
+                self._decal_mask_keys.pop(texture_index, None)
+
+        self._decal_mask_cells = {}
+        for cell, (texture_index, material) in enumerate(active.items()):
+            if cell >= MAX_DECAL_MASK_CELLS:
+                break  # more distinct mask materials live than the atlas holds
+            compositor = self.decal_mask_compositors.get(texture_index)
+            if compositor is None:
+                compositor = LayerCompositor(self.ctx, make_thumbnails=False)
+                self.decal_mask_compositors[texture_index] = compositor
+            key = texture_key(material)
+            if self._decal_mask_keys.get(texture_index) != key:
+                compositor.render(
+                    material, DECAL_MASK_RESOLUTION,
+                    self._decal_mask_curvature, self._decal_mask_position,
+                )
+                self._decal_mask_keys[texture_index] = key
+            self._blit_decal_mask_cell(compositor.texture, cell)
+            self._decal_mask_cells[texture_index] = cell
+
+    def _blit_decal_mask_cell(self, source: moderngl.Texture, cell: int) -> None:
+        self._decal_mask_atlas_fbo.use()
+        self.ctx.viewport = (
+            cell * DECAL_MASK_RESOLUTION, 0,
+            DECAL_MASK_RESOLUTION, DECAL_MASK_RESOLUTION,
+        )
+        self.ctx.disable(moderngl.DEPTH_TEST | moderngl.CULL_FACE | moderngl.BLEND)
+        source.use(0)
+        self._decal_mask_blit_vao.render(moderngl.TRIANGLES, vertices=3)
+
+    def decal_mask_cell(self, params: DecalParams) -> float:
+        """Which atlas cell holds this decal's wear mask, or -1 for none.
+
+        Looked up fresh from ``params.texture_index`` rather than cached on
+        the decal or its live projector: which cell a material occupies can
+        shift frame to frame as other decals' materials come and go, so a
+        cached index would drift out of step with the atlas silently.
+        """
+        if not 0 <= params.texture_index < len(self.textures):
+            return -1.0
+        if not isinstance(self.textures[params.texture_index], MaskLayer):
+            return -1.0
+        return float(self._decal_mask_cells.get(params.texture_index, -1))
+
     def _sync_decal(self) -> None:
         """Keep the normal map in step with the decal and the export resolution.
 
@@ -2754,13 +2937,16 @@ class MeshMapApp(mglw.WindowConfig):
         self.ctx.blend_func = moderngl.ONE, moderngl.ONE
         placements = []
         for index, source in enumerate(self.decals):
-            evaluated = (
-                self.live_decal_source(source)
-                if self._decal_transform_mode is not None and index == self.decal_index
-                else source
+            # A G/S/R transform and an in-progress placement both drive this
+            # decal through the live projector rather than its committed
+            # fields, and both must be excluded here the same way.
+            live_edit = (
+                (self._decal_transform_mode is not None or self.decal_placing)
+                and index == self.decal_index
             )
+            evaluated = self.live_decal_source(source) if live_edit else source
             instances = self.decal_instances(evaluated)
-            if self._decal_transform_mode is not None and index == self.decal_index:
+            if live_edit:
                 # With no modifiers, the editable source is the sharp live
                 # projector below. A modifier stack must evaluate *all* of its
                 # output instead: radial mode uses the live source transform
@@ -3426,10 +3612,16 @@ class MeshMapApp(mglw.WindowConfig):
     def viewport_rect(self) -> tuple[int, int, int, int]:
         """Where the 3D view sits, in GL terms: ``(x, y, width, height)``.
 
-        The window is a navigation bar across the top, a sidebar down the left,
-        an optional material inspector on the right, and a status bar
-        along the bottom; what is left over is the model's.
-        GL measures y from the bottom, so the status bar is the offset.
+        The window is a navigation bar across the top, a sidebar down the
+        left, and a status bar along the bottom; what is left over is the
+        model's. GL measures y from the bottom, so the status bar is the
+        offset.
+
+        The optional material inspector on the right is not subtracted here:
+        it floats over the view rather than shrinking it, the same way its
+        collapsed restore tab always has. Reserving space for it would move
+        this rect's centre every time it opened or closed, making the model
+        appear to jump for a panel that never touched the render.
 
         The sidebar is capped at half the window: a panel wider than the thing
         it is describing is not a layout worth honouring.
@@ -3437,13 +3629,12 @@ class MeshMapApp(mglw.WindowConfig):
         width, height = self.wnd.buffer_size
         scale = self.ui_pixel_scale
         sidebar = self.sidebar_pixels
-        inspector = self.right_inspector_pixels
         navbar = int(panel.NAVBAR_HEIGHT * scale)
         status = int(panel.STATUS_BAR_HEIGHT * scale)
         return (
             sidebar,
             status,
-            max(1, width - sidebar - inspector),
+            max(1, width - sidebar),
             max(1, height - navbar - status),
         )
 
@@ -3615,12 +3806,19 @@ class MeshMapApp(mglw.WindowConfig):
         )
         if live_color is not None:
             self.preview_program["u_liveProjectorColor"].value = live_color
+        self._decal_mask_atlas.use(13)
+        self.preview_program["u_liveProjectorMaskCell"].value = (
+            self.decal_mask_cell(selected) if live and selected is not None else -1.0
+        )
 
         view_projectors = []
         for index, params in enumerate(self.decals):
             if params.projector_center is None or not params.active():
                 continue
-            if self._decal_transform_mode is not None and index == self.decal_index:
+            if (
+                (self._decal_transform_mode is not None or self.decal_placing)
+                and index == self.decal_index
+            ):
                 decal_texture = self.decal_textures.get(params.path)
                 if decal_texture is not None:
                     evaluated = self.decal_instances(self.live_decal_source(params))
@@ -3642,7 +3840,7 @@ class MeshMapApp(mglw.WindowConfig):
         if view_projectors:
             centers, rights, ups, forwards, sizes = [], [], [], [], []
             intensities, flips, falloffs = [], [], []
-            colors, use_colors = [], []
+            colors, use_colors, mask_cells = [], [], []
             for unit, (params, decal_texture) in enumerate(view_projectors, start=4):
                 decal_texture.use(unit)
                 centers.append(params.projector_center)
@@ -3656,10 +3854,11 @@ class MeshMapApp(mglw.WindowConfig):
                 color = self.decal_texture_color(params)
                 colors.append(color or (0.0, 0.0, 0.0))
                 use_colors.append(1.0 if color is not None else 0.0)
+                mask_cells.append(self.decal_mask_cell(params))
             program = self.preview_program
-            def padded(values, width=1):
+            def padded(values, width=1, fill=0.0):
                 shape = (MAX_VIEW_PROJECTORS,) if width == 1 else (MAX_VIEW_PROJECTORS, width)
-                result = np.zeros(shape, dtype="f4")
+                result = np.full(shape, fill, dtype="f4")
                 result[:len(values)] = np.asarray(values, dtype="f4")
                 return result.tobytes()
 
@@ -3675,6 +3874,7 @@ class MeshMapApp(mglw.WindowConfig):
             program["u_viewProjectorFalloffs"].write(padded(falloffs))
             program["u_viewProjectorColors"].write(padded(colors, 3))
             program["u_viewProjectorUseColors"].write(padded(use_colors))
+            program["u_viewProjectorMaskCells"].write(padded(mask_cells, fill=-1.0))
 
         # Anchored to the model, not to the camera: orbiting moves your view of
         # the lighting rather than the lighting itself, which is the only way
@@ -3699,6 +3899,7 @@ class MeshMapApp(mglw.WindowConfig):
         self._sync_texture()
         self._sync_mesh_texture()
         self._sync_decal()
+        self._sync_decal_masks()
         self._sync_projection()
         self._draw_scene()
 
@@ -4634,6 +4835,15 @@ class MeshMapApp(mglw.WindowConfig):
         self._decal_library_executor.shutdown(wait=False, cancel_futures=True)
         self.compositor.release()
         self.mesh_compositor.release()
+        for compositor in self.decal_mask_compositors.values():
+            compositor.release()
+        self.decal_mask_compositors.clear()
+        self._decal_mask_position.release()
+        self._decal_mask_curvature.release()
+        self._decal_mask_atlas_fbo.release()
+        self._decal_mask_atlas.release()
+        self._decal_mask_blit_vao.release()
+        self._decal_mask_blit_program.release()
         self.controller.release()
 
     # -- actions used by the panel ----------------------------------------
