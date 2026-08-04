@@ -54,6 +54,11 @@ SIDEBAR_GRAB_INSIDE = 6
 SIDEBAR_GRAB_OUTSIDE = 6
 #: Width of the vertical view switcher on the sidebar's left edge.
 SIDEBAR_ICON_RAIL = 44
+#: Width of the material inspector docked on the right. It is capped
+#: again by ``MeshMapApp.right_inspector_pixels`` on narrow windows.
+RIGHT_INSPECTOR_WIDTH = 360
+#: Backwards-compatible name for layout code and external theme experiments.
+MATERIAL_INSPECTOR_WIDTH = RIGHT_INSPECTOR_WIDTH
 #: Textures beyond which the picker grows a search box. Below it, a list this
 #: short is quicker to read than to filter.
 _SEARCHABLE_FROM = 5
@@ -252,6 +257,7 @@ def _muted_wrapped(text: str) -> None:
 def draw_panel(app: "MeshMapApp") -> None:
     _draw_navbar(app)
     _draw_parameters(app)
+    _draw_right_inspector_sidebar(app)
     _draw_status_bar(app)
     _draw_delete_confirmation(app)
     _pump_dialogs(app)
@@ -349,6 +355,27 @@ def _draw_file_menu(app: "MeshMapApp") -> None:
         imgui.end_popup()
 
 
+def _draw_decal_menu(app: "MeshMapApp") -> None:
+    """Creation actions for image and generated-text decals."""
+    if imgui.button("Decal"):
+        imgui.open_popup("##decal_menu")
+    corner = imgui.get_item_rect_min()
+    bottom = imgui.get_item_rect_max().y
+    imgui.set_next_window_pos(imgui.ImVec2(corner.x, bottom))
+
+    if imgui.begin_popup("##decal_menu"):
+        if imgui.menu_item_simple("Import decal..."):
+            app.decal_dialog = pfd.open_file(
+                "Import decal", str(Path.home()), DECAL_FILTERS
+            )
+        _tooltip("Import a normal map or height map as a decal.")
+
+        if imgui.menu_item_simple("Add text"):
+            app.add_text_decal()
+        _tooltip("Create a white text decal and place it on the mesh.")
+        imgui.end_popup()
+
+
 def _draw_navbar(app: "MeshMapApp") -> None:
     """The bar across the top: what to look at, and how it is drawn.
 
@@ -367,6 +394,9 @@ def _draw_navbar(app: "MeshMapApp") -> None:
     imgui.begin("##navbar", None, _CHROME_FLAGS | imgui.WindowFlags_.no_decoration)
 
     _draw_file_menu(app)
+    imgui.same_line()
+
+    _draw_decal_menu(app)
     imgui.same_line()
 
     imgui.set_next_item_width(220 * scale)
@@ -884,17 +914,15 @@ def _draw_bake_tab(app: "MeshMapApp") -> None:
 
 
 def _draw_texture_tab(app: "MeshMapApp") -> None:
-    """The texture: what it is made of, and what the selected piece looks like.
+    """Material collection and layer tree shown in the left tool pane.
 
     A texture starts as one flat colour. Changing its type to a mask grows two
     slots underneath -- white and black -- and either of those can be a colour
     or another mask, so the shape is a binary tree of unbounded depth.
 
-    Indenting all of that runs out of panel before it runs out of tree, so the
-    two halves do different jobs: the top edits whatever is *selected*, at a
-    fixed size no matter how deep it sits, and the bottom is the tree itself,
-    one line per slot, for selecting with. Depth costs a line rather than a
-    column, and the controls never move.
+    Indenting all of that runs out of panel before it runs out of tree, so this
+    pane is devoted to selection while the independent right sidebar edits the
+    selected layer. Depth costs a line rather than a column.
     """
 
     if app.texture is None:
@@ -925,24 +953,77 @@ def _draw_texture_tab(app: "MeshMapApp") -> None:
 
     _draw_texture_warnings(app)
 
-    # The persistent Explorer already consumes the upper half of the sidebar.
-    # Use tabs here so both material structures get all of the lower tool pane
-    # instead of dividing that remaining room into two cramped quarters.
-    if imgui.begin_tab_bar("##material_tabs"):
-        tree_open, _ = imgui.begin_tab_item("Material tree")
-        if tree_open:
-            _begin_panel("texture_tree", imgui.ImVec2(0, 0))
-            _draw_texture_tree(app)
-            _end_panel()
-            imgui.end_tab_item()
+    _begin_panel("texture_tree", imgui.ImVec2(0, 0))
+    _draw_texture_tree(app)
+    _end_panel()
 
-        inspector_open, _ = imgui.begin_tab_item("Inspector")
-        if inspector_open:
-            _begin_panel("texture_inspector", imgui.ImVec2(0, 0))
-            _draw_slot_params(app)
-            _end_panel()
-            imgui.end_tab_item()
-        imgui.end_tab_bar()
+
+def _draw_right_inspector_sidebar(app: "MeshMapApp") -> None:
+    """The selected material layer, docked on the window's right."""
+    kind = app.right_inspector_kind
+    if kind is None:
+        return
+
+    scale = app.ui_pixel_scale
+    window_width, window_height = app.wnd.buffer_size
+    top = NAVBAR_HEIGHT * scale
+    height = window_height - top - STATUS_BAR_HEIGHT * scale
+    if app.right_inspector_collapsed:
+        _draw_collapsed_right_inspector(app, window_width, top, height, scale)
+        return
+
+    inspector_width = app.right_inspector_pixels
+    if inspector_width <= 0:
+        return
+    imgui.set_next_window_pos(imgui.ImVec2(window_width - inspector_width, top))
+    imgui.set_next_window_size(imgui.ImVec2(inspector_width, height))
+    imgui.push_style_var(
+        imgui.StyleVar_.window_padding, imgui.ImVec2(3.0 * scale, 3.0 * scale)
+    )
+    imgui.begin(
+        "##right_inspector_sidebar", None,
+        _CHROME_FLAGS | imgui.WindowFlags_.no_title_bar,
+    )
+    if imgui.button(">##collapse_right_inspector"):
+        app.set_right_inspector_collapsed(True)
+    _tooltip("Collapse the properties sidebar to the right edge.")
+
+    _begin_panel(f"{kind}_right_inspector", imgui.ImVec2(0, 0))
+    if app.texture is None or app.selected_slot is None:
+        _muted_wrapped("Select a material layer from the tree on the left.")
+    else:
+        _draw_slot_params(app)
+    _end_panel()
+    imgui.end()
+    imgui.pop_style_var()
+
+
+def _draw_collapsed_right_inspector(
+    app: "MeshMapApp", window_width: float, top: float,
+    available_height: float, scale: float,
+) -> None:
+    """Small edge tab that restores a collapsed right inspector."""
+    width = 32.0 * scale
+    height = 42.0 * scale
+    imgui.set_next_window_pos(imgui.ImVec2(
+        window_width - width,
+        top + max(0.0, (available_height - height) * 0.5),
+    ))
+    imgui.set_next_window_size(imgui.ImVec2(width, height))
+    imgui.push_style_var(
+        imgui.StyleVar_.window_padding, imgui.ImVec2(3.0 * scale, 3.0 * scale)
+    )
+    imgui.begin(
+        "##collapsed_right_inspector", None,
+        _CHROME_FLAGS | imgui.WindowFlags_.no_title_bar
+        | imgui.WindowFlags_.no_scrollbar
+        | imgui.WindowFlags_.no_scroll_with_mouse,
+    )
+    if imgui.button("<##expand_right_inspector", imgui.ImVec2(-1, -1)):
+        app.set_right_inspector_collapsed(False)
+    _tooltip("Open the properties sidebar.")
+    imgui.end()
+    imgui.pop_style_var()
 
 
 def _draw_splitter(
@@ -1462,39 +1543,43 @@ def _draw_mask_params(app: "MeshMapApp", node) -> bool:
 
 
 def _draw_texture_tree(app: "MeshMapApp") -> None:
-    """Every project material, followed by all of its child slots.
+    """The selected material followed by all of its child slots.
 
-    Selection and naming -- the controls live above -- so it can afford to
-    indent: a line per node stays legible far deeper than a stack of sliders
-    would. Double-clicking a row renames it in place.
+    The picker above changes which material this tree represents. Showing the
+    other project materials here as well made the tree look like an assignment
+    list and duplicated the picker; this pane is only the selected material's
+    layer hierarchy.
     """
+    material = app.texture
+    material_index = app.texture_index
+    if material is None or not 0 <= material_index < len(app.textures):
+        return
+
     scale = app.ui_pixel_scale
-    for material_index, material in enumerate(app.textures):
-        for path, slot in walk(material):
-            imgui.push_id(f"material{material_index}/{'/'.join(path)}")
-            indent = len(path) * 12 * scale
-            if indent:
-                imgui.indent(indent)
+    for path, slot in walk(material):
+        imgui.push_id(f"material{material_index}/{'/'.join(path)}")
+        indent = len(path) * 12 * scale
+        if indent:
+            imgui.indent(indent)
 
-            active = material_index == app.texture_index
-            if active and app.renaming_path == path:
-                _draw_rename_field(app, slot)
+        if app.renaming_path == path:
+            _draw_rename_field(app, slot)
+        else:
+            if isinstance(slot, ColorSlot):
+                imgui.color_button("##swatch", imgui.ImVec4(*slot.color, 1.0))
             else:
-                if isinstance(slot, ColorSlot):
-                    imgui.color_button("##swatch", imgui.ImVec4(*slot.color, 1.0))
+                thumbnail = app.compositor.thumbnail(path)
+                size = imgui.get_frame_height()
+                if thumbnail is not None:
+                    imgui.image(imgui.ImTextureRef(thumbnail.glo), imgui.ImVec2(size, size))
                 else:
-                    thumbnail = app.compositor.thumbnail(path) if active else None
-                    size = imgui.get_frame_height()
-                    if thumbnail is not None:
-                        imgui.image(imgui.ImTextureRef(thumbnail.glo), imgui.ImVec2(size, size))
-                    else:
-                        imgui.dummy(imgui.ImVec2(size, size))
-                imgui.same_line()
-                _draw_tree_row(app, material_index, path, slot)
+                    imgui.dummy(imgui.ImVec2(size, size))
+            imgui.same_line()
+            _draw_tree_row(app, material_index, path, slot)
 
-            if indent:
-                imgui.unindent(indent)
-            imgui.pop_id()
+        if indent:
+            imgui.unindent(indent)
+        imgui.pop_id()
 
 
 def _draw_tree_row(app: "MeshMapApp", material_index, path, slot) -> None:
@@ -1552,7 +1637,14 @@ def _draw_rename_field(app: "MeshMapApp", slot) -> None:
 
 
 def _draw_decal_tab(app: "MeshMapApp") -> None:
-    """Details for the decal selected in the persistent Explorer or viewport."""
+    """The selected decal's complete inspector in the left tool pane."""
+    if app.selected_decal is None:
+        _muted_wrapped(
+            "Select a decal in the Explorer or viewport to edit it here. Use "
+            "Decal > Import decal or Decal > Add text to create one."
+        )
+        return
+
     _begin_panel("decal_inspector", imgui.ImVec2(0, 0))
     _draw_decal_inspector(app)
     _end_panel()
@@ -1586,15 +1678,15 @@ def _draw_mesh_inspector(app: "MeshMapApp") -> None:
 
     _section_heading("Appearance")
     if app.textures:
-        labels = [describe(material) for material in app.textures]
+        labels = ["None"] + [describe(material) for material in app.textures]
         current = (
-            app.mesh_material_index
-            if 0 <= app.mesh_material_index < len(labels)
-            else min(max(app.texture_index, 0), len(labels) - 1)
+            app.mesh_material_index + 1
+            if 0 <= app.mesh_material_index < len(app.textures)
+            else 0
         )
         changed, current = _labeled_combo("Material", current, labels)
         if changed:
-            app.assign_mesh_material(current)
+            app.assign_mesh_material(current - 1)
         _tooltip("Assign a material from the Material view to this mesh.")
     else:
         imgui.text_colored(MUTED_COLOR, "Material: none")
@@ -1866,13 +1958,32 @@ def _draw_decal_inspector(app: "MeshMapApp") -> None:
     )
 
     image = app.decal_image_for(decal)
-    origin = "height map, converted" if image and image.from_height else "normal map"
+    origin = (
+        "generated text"
+        if decal.source_type == "text"
+        else "height map, converted" if image and image.from_height else "normal map"
+    )
     imgui.text_colored(
         MUTED_COLOR,
         f"{decal.display_name()}\n"
         f"{decal.image_aspect:.2f} : 1  ({origin})\n"
         f"{app.decal_index + 1} of {len(app.decals)} on the mesh",
     )
+
+    if decal.source_type == "text":
+        _section_heading("Text")
+        if app.decal_text_edit_index != app.decal_index:
+            app.decal_text_edit_index = app.decal_index
+            app.decal_text_edit_value = decal.text
+        submitted, draft = imgui.input_text(
+            _left_label("Content"), app.decal_text_edit_value,
+            imgui.InputTextFlags_.enter_returns_true
+            | imgui.InputTextFlags_.auto_select_all,
+        )
+        app.decal_text_edit_value = draft[:128]
+        if submitted or imgui.is_item_deactivated_after_edit():
+            app.update_text_decal(decal, app.decal_text_edit_value)
+        _tooltip("Edit the text, then press Enter or click away to regenerate it.")
 
     dirty |= _draw_decal_transform(app, decal)
 

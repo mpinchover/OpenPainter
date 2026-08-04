@@ -133,8 +133,9 @@ class _Pool:
 class LayerCompositor:
     """Evaluates a :class:`~core.layers.MaskLayer` tree into a colour map."""
 
-    def __init__(self, ctx: moderngl.Context):
+    def __init__(self, ctx: moderngl.Context, *, make_thumbnails: bool = True):
         self.ctx = ctx
+        self.make_thumbnails = bool(make_thumbnails)
         self.program = ctx.program(
             vertex_shader=load_shader("fullscreen.vert"),
             fragment_shader=load_shader("layer.frag"),
@@ -362,6 +363,8 @@ class LayerCompositor:
     # -- thumbnails -------------------------------------------------------
 
     def _store_thumbnail(self, path: Path, source: moderngl.Texture) -> None:
+        if not self.make_thumbnails:
+            return
         texture = self._thumbnails.get(path)
         if texture is None:
             texture = self.ctx.texture((THUMBNAIL_SIZE, THUMBNAIL_SIZE), 4)

@@ -18,7 +18,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core.decal import decal_at_uv, library, outline_uvs  # noqa: E402
+from core.decal import decal_at_uv, library, make_text_decal, outline_uvs  # noqa: E402
 from core.decal_thumbnail import load_thumbnail, thumbnail_cache_key  # noqa: E402
 from core.params import DecalParams  # noqa: E402
 
@@ -104,6 +104,42 @@ def test_the_app_offers_that_shelf(app):
     assert [path.name for path in app.decal_library] == [
         path.name for path in library(METADATA.decals)
     ]
+
+
+def test_text_decals_are_transparent_generated_height_maps():
+    text = make_text_decal("Text")
+    same = make_text_decal("Text")
+    changed = make_text_decal("Another label")
+
+    assert text.path == same.path
+    assert text.path != changed.path
+    assert text.from_height
+    assert text.aspect > 1.0
+    assert text.alpha.min() == 0.0 and text.alpha.max() == 1.0
+    assert np.any(np.abs(text.normals - FLAT) > 0.01)
+
+
+def test_add_text_creates_selected_placeable_white_decal(app):
+    from core.layers import ColorSlot
+
+    index = app.add_text_decal()
+    decal = app.decals[index]
+
+    assert app.selected_decal is decal
+    assert decal.source_type == "text"
+    assert decal.text == "Text"
+    assert decal.path in app.decal_images
+    assert decal.path in app.decal_textures
+    assert isinstance(app.textures[decal.texture_index], ColorSlot)
+    assert app.textures[decal.texture_index].color == (1.0, 1.0, 1.0)
+    assert app.decal_placing, "the button picks the generated decal up for placement"
+
+    previous_path = decal.path
+    assert app.update_text_decal(decal, "Label")
+    assert decal.text == "Label"
+    assert decal.path != previous_path
+    assert decal.path in app.decal_images
+    assert decal.path in app.decal_textures
 
 
 def test_library_thumbnails_are_small_and_persisted(tmp_path):

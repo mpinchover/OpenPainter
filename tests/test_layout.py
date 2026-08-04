@@ -53,6 +53,50 @@ def test_the_view_starts_where_the_chrome_ends(app):
     )
 
 
+def test_material_view_reserves_a_right_inspector(app):
+    """The inspector is docked beside the viewport rather than laid over it."""
+    window_width = app.wnd.buffer_size[0]
+    app.set_right_inspector_collapsed(False)
+    app.sidebar_view = 1
+
+    x, _, view_width, _ = app.viewport_rect
+    inspector_width = app.right_inspector_pixels
+    assert inspector_width > 0
+    assert x + view_width + inspector_width == window_width
+
+    app.sidebar_view = 0
+    assert app.right_inspector_pixels == 0
+    assert app.viewport_rect[0] + app.viewport_rect[2] == window_width
+
+
+def test_decal_inspector_never_reserves_a_right_sidebar(app):
+    from core.params import DecalParams
+
+    app.set_right_inspector_collapsed(False)
+    app.sidebar_view = 2
+    assert app.right_inspector_kind is None
+    assert app.right_inspector_pixels == 0
+
+    app.decals.append(DecalParams(path="vent.png"))
+    app.select_decal(0)
+    assert app.right_inspector_kind is None
+    assert app.right_inspector_pixels == 0
+
+    app.select_decal(None)
+    assert app.right_inspector_kind is None
+    assert app.right_inspector_pixels == 0
+
+
+def test_right_inspector_can_collapse_without_reserving_viewport_space(app):
+    app.sidebar_view = 1
+    app.set_right_inspector_collapsed(False)
+    assert app.right_inspector_pixels > 0
+
+    app.set_right_inspector_collapsed(True)
+    assert app.right_inspector_pixels == 0
+    assert app.viewport_rect[0] + app.viewport_rect[2] == app.wnd.buffer_size[0]
+
+
 def test_the_sidebar_never_takes_more_than_half_the_window(app):
     """A panel wider than the thing it describes is not a layout to honour."""
     app.set_ui_scale(3.0)
@@ -160,13 +204,34 @@ def test_the_app_opens_with_a_texture_to_work_on(starter_app):
     assert starter_app.texture.name == "Texture 01"
 
 
-def test_new_material_joins_the_project_and_is_assigned(starter_app):
+def test_new_material_joins_the_project_without_changing_assignment(starter_app):
     before = len(starter_app.textures)
+    assigned = starter_app.mesh_material_index
     starter_app.create_texture()
 
     assert len(starter_app.textures) == before + 1
     assert starter_app.texture_index == before
-    assert starter_app.mesh_material_index == before
+    assert starter_app.mesh_material_index == assigned
+
+
+def test_selecting_a_material_does_not_assign_it_to_the_mesh(starter_app):
+    assigned = starter_app.mesh_material_index
+    starter_app.create_texture()
+    starter_app.select_texture(len(starter_app.textures) - 1)
+
+    assert starter_app.mesh_material_index == assigned
+
+
+def test_mesh_material_changes_only_through_explicit_assignment(starter_app):
+    starter_app.create_texture()
+    new_material = starter_app.texture_index
+    starter_app.select_scene_mesh(0)
+    starter_app.assign_mesh_material(new_material)
+
+    assert starter_app.mesh_material_index == new_material
+
+    starter_app.assign_mesh_material(-1)
+    assert starter_app.mesh_material_index == -1
 
 
 def test_scene_mesh_selection_has_a_viewport_outline(starter_app):
@@ -391,6 +456,7 @@ def test_the_layout_is_remembered_between_runs(starter_app, isolated_settings):
     starter_app.set_mesh_split(0.43)
     starter_app.set_explorer_split(0.37)
     starter_app.set_sidebar_width(512.0)
+    starter_app.set_right_inspector_collapsed(True)
     starter_app.save_prefs()
 
     stored = json.loads((isolated_settings / "prefs.json").read_text())
@@ -398,6 +464,7 @@ def test_the_layout_is_remembered_between_runs(starter_app, isolated_settings):
     assert stored["mesh_split"] == pytest.approx(0.43)
     assert stored["explorer_split"] == pytest.approx(0.37)
     assert stored["sidebar_width"] == pytest.approx(512.0)
+    assert stored["right_inspector_collapsed"] is True
 
     from render.viewport import _load_prefs
 
@@ -458,14 +525,13 @@ def test_scene_explorer_nests_materials_and_decals_under_the_mesh(monkeypatch):
     ]
 
 
-def test_material_view_has_tree_and_layer_inspector_tabs(monkeypatch):
-    """Both material tasks get the whole lower pane rather than half of it."""
+def test_material_view_shows_only_the_material_tree(monkeypatch):
+    """Layer details live in the independent right sidebar."""
     from types import SimpleNamespace
 
     from core.layers import ColorSlot
     from ui import panel
 
-    tabs = []
     drawn = []
     material = ColorSlot(name="Steel")
     app = SimpleNamespace(texture=material, textures=[material])
@@ -475,22 +541,128 @@ def test_material_view_has_tree_and_layer_inspector_tabs(monkeypatch):
     monkeypatch.setattr(panel, "_begin_panel", lambda name, _size: drawn.append(name))
     monkeypatch.setattr(panel, "_end_panel", lambda: None)
     monkeypatch.setattr(panel, "_draw_texture_tree", lambda _app: drawn.append("tree"))
-    monkeypatch.setattr(panel, "_draw_slot_params", lambda _app: drawn.append("inspector"))
     monkeypatch.setattr(panel.imgui, "text_colored", lambda *args: None)
-    monkeypatch.setattr(panel.imgui, "begin_tab_bar", lambda _name: True)
-
-    def begin_tab(label, *_args):
-        tabs.append(label)
-        return True, None
-
-    monkeypatch.setattr(panel.imgui, "begin_tab_item", begin_tab)
-    monkeypatch.setattr(panel.imgui, "end_tab_item", lambda: None)
-    monkeypatch.setattr(panel.imgui, "end_tab_bar", lambda: None)
 
     panel._draw_texture_tab(app)
 
-    assert tabs == ["Material tree", "Inspector"]
-    assert drawn == ["texture_tree", "tree", "texture_inspector", "inspector"]
+    assert drawn == ["texture_tree", "tree"]
+
+
+def test_material_tree_draws_only_the_selected_material(monkeypatch):
+    """The picker owns material selection; the tree owns only its layers."""
+    from types import SimpleNamespace
+
+    from core.layers import ColorSlot
+    from ui import panel
+
+    steel = ColorSlot(name="Steel")
+    paint = ColorSlot(name="Paint")
+    rows = []
+    app = SimpleNamespace(
+        texture=paint,
+        texture_index=1,
+        textures=[steel, paint],
+        texture_path=(),
+        renaming_path=None,
+        ui_pixel_scale=1.0,
+    )
+
+    monkeypatch.setattr(panel.imgui, "push_id", lambda _value: None)
+    monkeypatch.setattr(panel.imgui, "pop_id", lambda: None)
+    monkeypatch.setattr(panel.imgui, "color_button", lambda *_args: None)
+    monkeypatch.setattr(panel.imgui, "same_line", lambda *args: None)
+    monkeypatch.setattr(
+        panel, "_draw_tree_row",
+        lambda _app, material_index, path, slot: rows.append(
+            (material_index, path, slot.name)
+        ),
+    )
+
+    panel._draw_texture_tree(app)
+
+    assert rows == [(1, (), "Paint")]
+
+
+def test_decal_menu_has_a_direct_import_action(monkeypatch):
+    """Import lives in the top-level Decal menu beside File."""
+    from types import SimpleNamespace
+
+    from ui import panel
+
+    opened = []
+    dialog = object()
+    app = SimpleNamespace(
+        decal_dialog=None,
+    )
+
+    monkeypatch.setattr(panel.imgui, "button", lambda *_args: False)
+    monkeypatch.setattr(panel.imgui, "get_item_rect_min", lambda: panel.imgui.ImVec2(0, 0))
+    monkeypatch.setattr(panel.imgui, "get_item_rect_max", lambda: panel.imgui.ImVec2(0, 20))
+    monkeypatch.setattr(panel.imgui, "set_next_window_pos", lambda *_args: None)
+    monkeypatch.setattr(panel.imgui, "begin_popup", lambda *_args: True)
+    monkeypatch.setattr(panel.imgui, "end_popup", lambda: None)
+    monkeypatch.setattr(
+        panel.imgui, "menu_item_simple",
+        lambda label, *_args: label == "Import decal...",
+    )
+    monkeypatch.setattr(panel, "_tooltip", lambda _text: None)
+    monkeypatch.setattr(
+        panel.pfd, "open_file",
+        lambda title, start, filters: opened.append((title, start, filters)) or dialog,
+    )
+
+    panel._draw_decal_menu(app)
+
+    assert app.decal_dialog is dialog
+    assert opened and opened[0][0] == "Import decal"
+
+
+def test_decal_menu_has_a_direct_add_text_action(monkeypatch):
+    """Text creation is the second action in the top-level Decal menu."""
+    from types import SimpleNamespace
+
+    from ui import panel
+
+    created = []
+    app = SimpleNamespace(
+        decal_dialog=None,
+        add_text_decal=lambda: created.append("Text"),
+    )
+
+    monkeypatch.setattr(panel.imgui, "button", lambda *_args: False)
+    monkeypatch.setattr(panel.imgui, "get_item_rect_min", lambda: panel.imgui.ImVec2(0, 0))
+    monkeypatch.setattr(panel.imgui, "get_item_rect_max", lambda: panel.imgui.ImVec2(0, 20))
+    monkeypatch.setattr(panel.imgui, "set_next_window_pos", lambda *_args: None)
+    monkeypatch.setattr(panel.imgui, "begin_popup", lambda *_args: True)
+    monkeypatch.setattr(panel.imgui, "end_popup", lambda: None)
+    monkeypatch.setattr(
+        panel.imgui, "menu_item_simple",
+        lambda label, *_args: label == "Add text",
+    )
+    monkeypatch.setattr(panel, "_tooltip", lambda _text: None)
+
+    panel._draw_decal_menu(app)
+
+    assert created == ["Text"]
+
+
+def test_decal_view_draws_selected_details_on_the_left(monkeypatch):
+    """The Decal tool owns its inspector instead of delegating it rightward."""
+    from types import SimpleNamespace
+
+    from ui import panel
+
+    drawn = []
+    app = SimpleNamespace(selected_decal=object())
+    monkeypatch.setattr(
+        panel, "_begin_panel", lambda name, _size: drawn.append(("begin", name))
+    )
+    monkeypatch.setattr(panel, "_draw_decal_inspector", lambda _app: drawn.append("details"))
+    monkeypatch.setattr(panel, "_end_panel", lambda: drawn.append("end"))
+
+    panel._draw_decal_tab(app)
+
+    assert drawn == [("begin", "decal_inspector"), "details", "end"]
 
 
 def test_a_rename_cannot_get_stuck(starter_app):

@@ -238,6 +238,12 @@ class DecalParams:
     name: str = ""
     """Editable scene name; ``path`` remains the source image identity."""
 
+    source_type: str = "image"
+    """Where the decal came from: an imported ``image`` or generated ``text``."""
+
+    text: str = ""
+    """Editable source string for a generated text decal."""
+
     def display_name(self) -> str:
         return self.name.strip() or Path(self.path).name or "Decal"
 
@@ -321,6 +327,8 @@ class DecalParams:
         return (
             self.enabled,
             self.path,
+            self.source_type,
+            self.text,
             round(self.center_u, 6),
             round(self.center_v, 6),
             self.surface_face,

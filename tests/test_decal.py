@@ -1404,6 +1404,8 @@ def test_every_field_changes_the_key():
     variants = (
         DecalParams(path="a.png", enabled=False),
         DecalParams(path="b.png"),
+        DecalParams(path="a.png", source_type="text"),
+        DecalParams(path="a.png", text="Text"),
         DecalParams(path="a.png", center_u=0.1),
         DecalParams(path="a.png", center_v=0.1),
         DecalParams(path="a.png", scale=0.9),

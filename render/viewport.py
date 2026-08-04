@@ -28,6 +28,7 @@ from core.decal import (
     contains as decal_contains,
     library as decal_library,
     load_decal,
+    make_text_decal,
     outline_uvs,
     uv_aspect,
 )
@@ -724,10 +725,9 @@ class MeshMapApp(mglw.WindowConfig):
         self.controller.unwrap_params.use_source_uvs = not self.initial_auto_unwrap
         if self.initial_bevel is not None:
             self.controller.bevel_params = self.initial_bevel
-        #: Every texture made this session. A texture is a colour, or a mask
-        #: deciding between two more of them, recursively. One is active at a
-        #: time -- that is the one shown, edited and exported -- and the rest
-        #: are kept so a variant can be gone back to.
+        #: Every material made this session. A material is a colour, or a mask
+        #: deciding between two more of them, recursively. One is selected in
+        #: the editor at a time; mesh and decal assignment remain independent.
         self.textures: list[Slot] = []
         self.texture_index: int = -1
         #: Material assigned to the scene mesh. The current renderer owns one
@@ -743,6 +743,7 @@ class MeshMapApp(mglw.WindowConfig):
         #: colour or a mask, either way.
         self.texture_path: tuple[str, ...] = ()
         self._texture_dirty = True
+        self._mesh_texture_dirty = True
         self._full_texture_render_requested = False
         #: Counts textures made this session, so each gets its own name.
         self._texture_serial = 0
@@ -758,6 +759,10 @@ class MeshMapApp(mglw.WindowConfig):
         #: What the compositor last drew, so an edit anywhere in the tree is
         #: noticed without every control having to say so.
         self._composited_key: Optional[tuple] = None
+        #: What the material assigned to the mesh last drew. This is separate
+        #: from ``_composited_key`` because selecting a material for editing
+        #: must not silently assign it to the mesh.
+        self._mesh_composited_key: Optional[tuple] = None
         #: Every decal stamped on the mesh, in the order they were placed --
         #: which is the order they are drawn, so the last one is on top.
         self.decals: list[DecalParams] = []
@@ -770,6 +775,10 @@ class MeshMapApp(mglw.WindowConfig):
         self.decal_transform_edit_opened = False
         self.decal_transform_pressed_field: Optional[str] = None
         self.decal_transform_field_dragged = False
+        #: Draft text is committed when its inspector field loses focus or the
+        #: user presses Enter, avoiding a new GPU texture for every keystroke.
+        self.decal_text_edit_index: int = -1
+        self.decal_text_edit_value: str = ""
         #: Images and their GL textures, cached by path. Several placements of
         #: one picture share both.
         self.decal_images: dict[str, DecalImage] = {}
@@ -883,6 +892,10 @@ class MeshMapApp(mglw.WindowConfig):
         self._shift_down = False
 
         self._prefs = _load_prefs()
+        #: Collapse state for the material property dock.
+        self.right_inspector_collapsed = bool(
+            self._prefs.get("right_inspector_collapsed", False)
+        )
         self.console_messages: list[tuple[str, str]] = []
         self._console_notices: dict[str, str] = {}
         self.navigation = NavigationPrefs.from_dict(self._prefs.get("navigation", {}))
@@ -1011,7 +1024,12 @@ class MeshMapApp(mglw.WindowConfig):
         self.tonemap_program["u_bloom"].value = 1
         self.tonemap_program["u_bloomStrength"].value = BLOOM_STRENGTH
 
+        # ``compositor`` belongs to the material editor and provides its layer
+        # thumbnails. ``mesh_compositor`` belongs to the scene mesh. Keeping
+        # them separate is what lets a material be selected and edited without
+        # changing the material that is actually assigned and rendered.
         self.compositor = LayerCompositor(self.ctx)
+        self.mesh_compositor = LayerCompositor(self.ctx, make_thumbnails=False)
         self._registered_thumbnails: set = set()
 
         self.bright_vao = self.ctx.vertex_array(self.bright_program, [])
@@ -1104,6 +1122,10 @@ class MeshMapApp(mglw.WindowConfig):
         # Something to work on the moment the window opens, at both ends of the
         # pipeline: a mesh to bake, and a texture to put on it.
         self.create_texture()
+        # The starter material is an explicit part of the starter scene. Later
+        # materials created through New remain unassigned until the user picks
+        # them in a mesh or decal Material control.
+        self.mesh_material_index = self.texture_index
 
         if self.initial_mesh:
             self.open_mesh(self.initial_mesh)
@@ -1172,6 +1194,11 @@ class MeshMapApp(mglw.WindowConfig):
         """Widen or narrow the sidebar, in unscaled reference pixels."""
         self.sidebar_width = _clamp_sidebar(value)
 
+    def set_right_inspector_collapsed(self, collapsed: bool) -> None:
+        """Collapse or restore the material properties dock."""
+        self.right_inspector_collapsed = bool(collapsed)
+        self.save_prefs()
+
     def over_sidebar_edge(self, mouse: tuple[float, float]) -> bool:
         """Whether a cursor position is on the sidebar's right edge.
 
@@ -1207,10 +1234,41 @@ class MeshMapApp(mglw.WindowConfig):
         return int(min(self.sidebar_width * self.ui_pixel_scale,
                        self.wnd.buffer_size[0] * 0.5))
 
+    @property
+    def right_inspector_kind(self) -> Optional[str]:
+        """The material properties shown in the optional right dock."""
+        if self.sidebar_view == 1 and self.texture is not None:
+            return "material"
+        return None
+
+    @property
+    def right_inspector_pixels(self) -> int:
+        """Width of the active right inspector, or zero while collapsed.
+
+        On narrow windows it takes at most 45% of the room left after the main
+        sidebar, so opening properties can never squeeze the 3D view completely
+        out of existence. The collapsed restore tab overlays the right edge and
+        therefore reserves no viewport space.
+        """
+        if self.right_inspector_kind is None or self.right_inspector_collapsed:
+            return 0
+        remaining = max(0, self.wnd.buffer_size[0] - self.sidebar_pixels)
+        wanted = panel.RIGHT_INSPECTOR_WIDTH * self.ui_pixel_scale
+        return int(min(wanted, remaining * 0.45))
+
+    @property
+    def material_inspector_pixels(self) -> int:
+        """Compatibility alias for the material dock's former name."""
+        return (
+            self.right_inspector_pixels
+            if self.right_inspector_kind == "material" else 0
+        )
+
     def save_prefs(self) -> None:
         """Persist the interface and navigation settings."""
         self._prefs["ui_scale"] = round(self.ui_scale, 3)
         self._prefs["sidebar_width"] = round(self.sidebar_width, 1)
+        self._prefs["right_inspector_collapsed"] = self.right_inspector_collapsed
         self._prefs["explorer_split"] = round(self.explorer_split, 3)
         self._prefs["texture_split"] = round(self.texture_split, 3)
         self._prefs["decal_split"] = round(self.decal_split, 3)
@@ -1230,7 +1288,10 @@ class MeshMapApp(mglw.WindowConfig):
         :meth:`export` refuses on it -- one answer, so none of the three can
         promise something the others do not.
         """
-        textured = self.texture is not None and self.controller.curvature_map is not None
+        textured = (
+            0 <= self.mesh_material_index < len(self.textures)
+            and self.controller.curvature_map is not None
+        )
         exists = {
             COLOR_NAME: textured,
             NORMAL_NAME: self.any_decal_active(),
@@ -1360,10 +1421,12 @@ class MeshMapApp(mglw.WindowConfig):
         if self._decal_transform_mode is not None:
             self.end_decal_transform(keep=False)
         self.decal_index = -1 if index is None else int(index)
+        self.decal_text_edit_index = -1
         if not (0 <= self.decal_index < len(self.decals)):
             self.decal_index = -1
         else:
             self.mesh_selected_index = -1
+            self.sidebar_view = 2
 
     def begin_decal_rename(self, index: int) -> None:
         if not 0 <= index < len(self.decals):
@@ -1529,11 +1592,80 @@ class MeshMapApp(mglw.WindowConfig):
             params.surface_face = int(face)
         self._record_decal_undo()
         self.decals.append(params)
-        self.decal_index = len(self.decals) - 1
+        self.select_decal(len(self.decals) - 1)
         self.refresh_decal_aspect()
         self.mark_normal_dirty()
         self.set_status(f"Placed {Path(image.path).name}")
         return self.decal_index
+
+    def _white_material_index(self) -> int:
+        """Return a reusable plain-white material for generated text."""
+        for index, material in enumerate(self.textures):
+            if isinstance(material, ColorSlot) and np.allclose(
+                material.color, (1.0, 1.0, 1.0), atol=1e-6
+            ):
+                return index
+        self.textures.append(ColorSlot((1.0, 1.0, 1.0), name="White"))
+        self.mark_texture_dirty()
+        return len(self.textures) - 1
+
+    def add_text_decal(self, text: str = "Text") -> int:
+        """Create a selected text decal and pick it up for placement."""
+        text = str(text)[:128]
+        image = make_text_decal(text)
+        self.decal_images.setdefault(image.path, image)
+        self._upload_decal(image)
+        params = DecalParams(
+            path=image.path,
+            name="Text",
+            source_type="text",
+            text=text,
+            image_aspect=image.aspect,
+            texture_index=self._white_material_index(),
+        )
+        self._record_decal_undo()
+        self.decals.append(params)
+        self.select_decal(len(self.decals) - 1)
+        self.refresh_decal_aspect()
+        self.mark_normal_dirty()
+        self.set_status("Text decal ready to place")
+        if self.mesh is not None:
+            self.begin_decal_placement()
+        return self.decal_index
+
+    def update_text_decal(self, params: DecalParams, text: str) -> bool:
+        """Regenerate one text decal while preserving its scene transform."""
+        if params.source_type != "text":
+            return False
+        text = str(text)[:128]
+        if text == params.text:
+            return False
+
+        image = make_text_decal(text)
+        self.decal_images.setdefault(image.path, image)
+        self._upload_decal(image)
+        params.text = text
+        params.path = image.path
+        params.image_aspect = image.aspect
+
+        base = max(
+            (self.mesh_info.scale if self.mesh_info else 1.0) * params.scale,
+            1e-6,
+        )
+        size = (
+            base * max(params.scale_x, 1e-6),
+            base * max(params.scale_y, 1e-6) / max(image.aspect, 1e-6),
+        )
+        if params.projector_center is not None:
+            params.projector_size = size
+        if self.selected_decal is params and self._live_decal_projector is not None:
+            self._live_decal_projector["path"] = image.path
+            self._live_decal_projector["size"] = size
+
+        self.decal_text_edit_value = text
+        self.mark_normal_dirty()
+        self.set_status("Updated text decal")
+        return True
 
     def load_decal_image(self, path: str | Path) -> Optional[DecalImage]:
         """Read an image, or hand back the one already read for that path."""
@@ -1820,7 +1952,7 @@ class MeshMapApp(mglw.WindowConfig):
         self.camera.orthographic = snapshot["camera_orthographic"]
         self.camera._update_clip()
         self._live_decal_projector = None
-        self._texture_dirty = True
+        self.mark_texture_dirty()
         self.mark_normal_dirty()
 
     def _history_transaction_active(self) -> bool:
@@ -2312,7 +2444,7 @@ class MeshMapApp(mglw.WindowConfig):
         params = self.selected_decal
         self._trace_action("decal_placement_begin")
         if params is None or not params.loaded():
-            self.set_status("Import a normal map first", error=True)
+            self.set_status("Select or create a decal first", error=True)
             return
         if self.mesh is None:
             self.set_status("Load a mesh to place a decal on", error=True)
@@ -2750,10 +2882,11 @@ class MeshMapApp(mglw.WindowConfig):
         return float(point[0]), float(point[1])
 
     def read_color_map(self) -> Optional[np.ndarray]:
-        """The mask tree resolved to colour, or None if it has never rendered.
+        """The selected editor material resolved to colour, if available.
 
-        Read back off the GPU rather than recomputed, so the PNG is exactly the
-        pixels the viewport is showing.
+        This remains the editor readback used by material tests and previews.
+        Scene export uses :meth:`read_mesh_color_map`, which follows the mesh's
+        explicit material assignment instead of the editor selection.
         """
         self._full_texture_render_requested = True
         try:
@@ -2763,6 +2896,19 @@ class MeshMapApp(mglw.WindowConfig):
         finally:
             self._full_texture_render_requested = False
             self._texture_dirty = True
+
+    def read_mesh_color_map(self) -> Optional[np.ndarray]:
+        """The colour map explicitly assigned to the mesh, if there is one."""
+        if not 0 <= self.mesh_material_index < len(self.textures):
+            return None
+        self._full_texture_render_requested = True
+        try:
+            self._mesh_texture_dirty = True
+            self._sync_mesh_texture()
+            return self.mesh_compositor.read()
+        finally:
+            self._full_texture_render_requested = False
+            self._mesh_texture_dirty = True
 
     def read_normal_map(self) -> Optional[np.ndarray]:
         """The composited normal map as an (n, n, 3) array, or None if flat.
@@ -2907,7 +3053,7 @@ class MeshMapApp(mglw.WindowConfig):
                         np.ascontiguousarray(controller.position_map, dtype="f4").tobytes()
                     )
                 self._uploaded_maps_version = controller.maps_version
-                self._texture_dirty = True  # the tree reads the new bake
+                self.mark_texture_dirty()  # the material trees read the new bake
 
                 if PREVIEW_MODES[self.preview_index].texture is None:
                     self.preview_index = 0
@@ -3001,19 +3147,20 @@ class MeshMapApp(mglw.WindowConfig):
 
     def mark_texture_dirty(self) -> None:
         self._texture_dirty = True
+        self._mesh_texture_dirty = True
 
     @property
     def texture(self) -> Optional[Slot]:
-        """The active texture: the one shown, edited and exported."""
+        """The material currently selected in the editor."""
         if 0 <= self.texture_index < len(self.textures):
             return self.textures[self.texture_index]
         return None
 
     def create_texture(self) -> None:
-        """Add a texture: one flat colour, named, and made active.
+        """Add an unassigned material and select it in the editor.
 
-        Added rather than swapped in, so an earlier one is still there to go
-        back to through the picker.
+        Added rather than swapped in, so an earlier one is still available in
+        the picker. Assignment changes only through a mesh or decal inspector.
         """
         self._texture_serial += 1
         name = f"Material {self._texture_serial:02d}"
@@ -3022,14 +3169,10 @@ class MeshMapApp(mglw.WindowConfig):
         self.set_status(f"{name} - pick a colour, or turn it into a mask")
 
     def select_texture(self, index: int) -> None:
-        """Make one of the textures the active one."""
+        """Make one material active in the editor without assigning it."""
         if not 0 <= index < len(self.textures):
             return
         self.texture_index = index
-        # One renderable mesh currently means the material being inspected is
-        # also the one assigned to it. The explicit field prevents this
-        # relationship being buried in the UI when multi-mesh rendering lands.
-        self.mesh_material_index = index
         self.texture_path = ()
         self.end_rename()
         self.mark_texture_dirty()
@@ -3046,7 +3189,7 @@ class MeshMapApp(mglw.WindowConfig):
             elif decal.texture_index > removed:
                 decal.texture_index -= 1
         if self.mesh_material_index == removed:
-            self.mesh_material_index = min(removed, len(self.textures) - 1)
+            self.mesh_material_index = -1
         elif self.mesh_material_index > removed:
             self.mesh_material_index -= 1
         self.texture_index = min(self.texture_index, len(self.textures) - 1)
@@ -3055,6 +3198,8 @@ class MeshMapApp(mglw.WindowConfig):
         if not self.textures:
             self.compositor.clear()
             self._sync_texture_thumbnails()
+        if self.mesh_material_index < 0:
+            self._clear_mesh_compositor()
         self.mark_texture_dirty()
         self.set_status(f"Removed {name}")
 
@@ -3076,11 +3221,20 @@ class MeshMapApp(mglw.WindowConfig):
         self.mesh_renaming_opened = False
 
     def assign_mesh_material(self, index: int) -> None:
-        """Assign a project material to the selected scene mesh."""
-        if self.mesh_selected_index != 0 or not 0 <= index < len(self.textures):
+        """Explicitly assign a project material, or ``-1`` for none."""
+        if self.mesh_selected_index != 0:
+            return
+        if index == -1:
+            self.mesh_material_index = -1
+            self._mesh_texture_dirty = True
+            self._clear_mesh_compositor()
+            self.set_status("Cleared the mesh material")
+            return
+        if not 0 <= index < len(self.textures):
             return
         self.mesh_material_index = int(index)
         self.select_texture(index)
+        self._mesh_texture_dirty = True
         self.set_status(f"Assigned {describe(self.textures[index])} to the mesh")
 
     def mesh_selection_outline(self):
@@ -3184,6 +3338,47 @@ class MeshMapApp(mglw.WindowConfig):
         self._sync_texture_thumbnails()
         self._check_texture_variation()
 
+    def _clear_mesh_compositor(self) -> None:
+        """Drop the scene material and release its non-ImGui thumbnails."""
+        self.mesh_compositor.clear()
+        self._mesh_composited_key = None
+        for texture in self.mesh_compositor.reclaim():
+            texture.release()
+
+    def _sync_mesh_texture(self) -> None:
+        """Composite only the material explicitly assigned to the mesh."""
+        if not 0 <= self.mesh_material_index < len(self.textures):
+            if self.mesh_compositor.texture is not None:
+                self._clear_mesh_compositor()
+            self._mesh_texture_dirty = False
+            return
+        if self.tex_curvature is None or self.tex_position is None:
+            return
+
+        material = self.textures[self.mesh_material_index]
+        render_resolution = int(self._texture_resolution)
+        if not self._full_texture_render_requested:
+            render_resolution = min(render_resolution, DECAL_INTERACTIVE_RESOLUTION)
+        key = (
+            self.mesh_material_index,
+            texture_key(material),
+            render_resolution,
+            self._uploaded_maps_version,
+        )
+        if not self._mesh_texture_dirty and key == self._mesh_composited_key:
+            return
+
+        self.mesh_compositor.render(
+            material, render_resolution,
+            self.tex_curvature, self.tex_position,
+        )
+        self._mesh_composited_key = key
+        self._mesh_texture_dirty = False
+        # These thumbnails are never registered with ImGui; only the selected
+        # editor compositor owns visible tree previews.
+        for texture in self.mesh_compositor.reclaim():
+            texture.release()
+
     def _check_texture_variation(self) -> None:
         """Notice a texture that has come out one flat colour.
 
@@ -3222,7 +3417,7 @@ class MeshMapApp(mglw.WindowConfig):
         return {
             "curvature": self.tex_curvature,
             "normal": self.tex_normal,
-            "composite": self.compositor.texture,
+            "composite": self.mesh_compositor.texture,
         }.get(name or "")
 
     # -- layout -----------------------------------------------------------
@@ -3231,8 +3426,9 @@ class MeshMapApp(mglw.WindowConfig):
     def viewport_rect(self) -> tuple[int, int, int, int]:
         """Where the 3D view sits, in GL terms: ``(x, y, width, height)``.
 
-        The window is a navigation bar across the top, a sidebar down the left
-        and a status bar along the bottom; what is left over is the model's.
+        The window is a navigation bar across the top, a sidebar down the left,
+        an optional material inspector on the right, and a status bar
+        along the bottom; what is left over is the model's.
         GL measures y from the bottom, so the status bar is the offset.
 
         The sidebar is capped at half the window: a panel wider than the thing
@@ -3241,12 +3437,13 @@ class MeshMapApp(mglw.WindowConfig):
         width, height = self.wnd.buffer_size
         scale = self.ui_pixel_scale
         sidebar = self.sidebar_pixels
+        inspector = self.right_inspector_pixels
         navbar = int(panel.NAVBAR_HEIGHT * scale)
         status = int(panel.STATUS_BAR_HEIGHT * scale)
         return (
             sidebar,
             status,
-            max(1, width - sidebar),
+            max(1, width - sidebar - inspector),
             max(1, height - navbar - status),
         )
 
@@ -3368,9 +3565,9 @@ class MeshMapApp(mglw.WindowConfig):
         (self.tex_normal if decal_lit else self._flat_normal).use(1)
 
         # The surface channels the texture carries: metal, rough, alpha, glow.
-        material = self.compositor.material_texture
+        material = self.mesh_compositor.material_texture
         (material or self._flat_material).use(2)
-        material_ao = self.compositor.ambient_occlusion_texture
+        material_ao = self.mesh_compositor.ambient_occlusion_texture
         (material_ao or self._flat_material_ao).use(12)
 
         view = self.camera.matrix
@@ -3500,6 +3697,7 @@ class MeshMapApp(mglw.WindowConfig):
         self._pump_decal_wraps()
 
         self._sync_texture()
+        self._sync_mesh_texture()
         self._sync_decal()
         self._sync_projection()
         self._draw_scene()
@@ -4434,6 +4632,8 @@ class MeshMapApp(mglw.WindowConfig):
 
     def on_close(self) -> None:
         self._decal_library_executor.shutdown(wait=False, cancel_futures=True)
+        self.compositor.release()
+        self.mesh_compositor.release()
         self.controller.release()
 
     # -- actions used by the panel ----------------------------------------
@@ -4470,8 +4670,8 @@ class MeshMapApp(mglw.WindowConfig):
         """
         controller = self.controller
         normal = self.read_normal_map()
-        color = self.read_color_map()
-        material = self.compositor.read_channels() if color is not None else None
+        color = self.read_mesh_color_map()
+        material = self.mesh_compositor.read_channels() if color is not None else None
         occlusion = controller.occlusion_map
 
         if not self.exportable():

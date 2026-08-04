@@ -30,11 +30,12 @@ just makes the bump steeper, which is what the control is for.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from .params import MAX_FALLOFF, DecalParams
 
@@ -255,6 +256,73 @@ def height_to_normals(height: np.ndarray) -> np.ndarray:
     normals = np.stack([-du, -dv, np.ones_like(du)], axis=-1)
     normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
     return (normals * 0.5 + 0.5).astype(np.float32)
+
+
+def _text_font(size: int):
+    """A scalable font supplied by Pillow, with native platform fallbacks."""
+    candidates = (
+        "DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+    )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def make_text_decal(text: str) -> DecalImage:
+    """Render editable text into an in-memory height/coverage decal.
+
+    The content hash is its source identity. Equal strings therefore share one
+    CPU image and one GPU texture just like two placements of the same imported
+    image, while editing one decal naturally gives it a new source.
+    """
+    text = str(text)[:128]
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
+    path = f"text-decal:{digest}"
+
+    if not text:
+        alpha = np.zeros((32, 32), dtype=np.float32)
+    else:
+        font_size = 192
+        font = _text_font(font_size)
+        probe = Image.new("L", (1, 1))
+        bounds = ImageDraw.Draw(probe).textbbox((0, 0), text, font=font)
+        width = max(bounds[2] - bounds[0], 1)
+        height = max(bounds[3] - bounds[1], 1)
+        available = MAX_EDGE - 48
+        if width > available:
+            font_size = max(12, int(font_size * available / width))
+            font = _text_font(font_size)
+            bounds = ImageDraw.Draw(probe).textbbox((0, 0), text, font=font)
+            width = max(bounds[2] - bounds[0], 1)
+            height = max(bounds[3] - bounds[1], 1)
+
+        padding = max(8, round(font_size * 0.12))
+        mask = Image.new("L", (width + padding * 2, height + padding * 2), 0)
+        ImageDraw.Draw(mask).text(
+            (padding - bounds[0], padding - bounds[1]), text,
+            fill=255, font=font,
+        )
+        alpha = np.asarray(mask, dtype=np.float32) / 255.0
+        # The rest of the decal system stores row zero at texture v=0.
+        alpha = np.ascontiguousarray(np.flipud(alpha))
+
+    normals = height_to_normals(alpha)
+    normals = np.where(
+        alpha[..., None] > 0.0,
+        normals,
+        np.array([0.5, 0.5, 1.0], dtype=np.float32),
+    )
+    return DecalImage(
+        path=path,
+        normals=np.ascontiguousarray(normals, dtype=np.float32),
+        alpha=np.ascontiguousarray(alpha, dtype=np.float32),
+        from_height=True,
+    )
 
 
 def load_decal(path: str | Path) -> DecalImage:

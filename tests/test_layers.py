@@ -763,6 +763,23 @@ def test_textures_are_kept_and_can_be_switched_between(baked_app):
     assert np.array_equal(baked_app.read_color_map(), speckled)
 
 
+def test_editor_selection_does_not_change_the_mesh_material(baked_app):
+    """New/selected materials stay off the mesh until explicitly assigned."""
+    baked_app.set_texture(ColorSlot(RED, name="Assigned red"))
+    baked_app.on_render(0.0, 1 / 60.0)
+    assigned = baked_app.read_mesh_color_map()
+    assert np.allclose(assigned, RED, atol=2e-3)
+
+    baked_app.create_texture()
+    baked_app.set_texture(ColorSlot(GREEN, name="Unassigned green"))
+    assert np.allclose(baked_app.read_color_map(), GREEN, atol=2e-3)
+    assert np.allclose(baked_app.read_mesh_color_map(), RED, atol=2e-3)
+
+    baked_app.select_scene_mesh(0)
+    baked_app.assign_mesh_material(baked_app.texture_index)
+    assert np.allclose(baked_app.read_mesh_color_map(), GREEN, atol=2e-3)
+
+
 def test_removing_one_texture_falls_back_to_a_neighbour(baked_app):
     baked_app.create_texture()
     second = describe(baked_app.textures[1])
@@ -883,7 +900,7 @@ def test_the_shaded_view_is_the_texture(baked_app):
     assert PREVIEW_MODES[SHADED_INDEX].texture == "composite"
     baked_app.preview_index = SHADED_INDEX
     baked_app.on_render(0.0, 1 / 60.0)
-    assert baked_app._current_texture() is baked_app.compositor.texture
+    assert baked_app._current_texture() is baked_app.mesh_compositor.texture
 
 
 def test_a_fresh_mask_reads_as_black_and_white(baked_app):
